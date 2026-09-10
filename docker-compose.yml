@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  campusgo-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: campusgo-lpu-app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - CAMPUSGO_UPI_VPA=campusgo.lpu@okhdfcbank
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-rzp_test_campusgo_demo}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-demo_secret_campusgo_2026}
+      - FAST2SMS_API_KEY=${FAST2SMS_API_KEY:-}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER:-}
+    volumes:
+      - campusgo-db-data:/app/backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/campus/landmarks"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  campusgo-db-data:
+    driver: local

@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>CampusGo - LPU Community Transit</title>
+  
+  <!-- Leaflet Map CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <!-- Google Fonts: Inter for sharp modern typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  
+  <!-- App Styles -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app-root" class="app-container">
+
+    <!-- Top App Bar -->
+    <header class="top-bar">
+      <div class="brand-section">
+        <div class="brand-logo">
+          <span class="logo-dot"></span>
+          <span class="brand-title">Campus<span class="brand-accent">Go</span></span>
+        </div>
+        <span class="campus-pill">LPU CAMPUS</span>
+      </div>
+
+      <div class="user-header-actions">
+        <!-- Teacher / Priority Badge -->
+        <div id="header-badge" class="user-badge-pill hidden">
+          <svg class="badge-icon" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+          </svg>
+          <span id="header-badge-text">Faculty Priority</span>
+        </div>
+
+        <!-- Wallet Balance Pill -->
+        <button id="header-wallet-btn" class="wallet-pill" title="View Wallet">
+          <svg class="wallet-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="4" width="20" height="16" rx="3"/>
+            <path d="M16 12h.01"/>
+            <path d="M2 10h20"/>
+          </svg>
+          <span class="currency-symbol">₹</span>
+          <span id="header-wallet-amount">0.00</span>
+        </button>
+
+        <!-- Persona Switcher Menu -->
+        <button id="persona-switch-btn" class="persona-avatar-btn" title="Switch User Persona">
+          <img id="header-avatar" src="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120" alt="Avatar">
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Views Container -->
+    <main class="main-content">
+      
+      <!-- ================= VIEW 1: RIDE (HOME) ================= -->
+      <section id="view-ride" class="app-view active-view">
+        <!-- Live Half-Screen Campus Map -->
+        <div class="map-wrapper">
+          <div id="campus-map" class="map-canvas"></div>
+          
+          <!-- Map Overlay Controls -->
+          <div class="map-overlay-controls">
+            <button id="recenter-map-btn" class="map-float-btn" title="Recenter to Uni-Mall">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="3 11 22 2 13 21 11 13 3 11"/>
+              </svg>
+            </button>
+            <div class="zone-badge" id="current-zone-badge">
+              <span class="live-pulse"></span>
+              <span id="current-zone-text">Central Zone</span>
+            </div>
+          </div>
+
+          <!-- Peak Rush / Class Change Banner -->
+          <div id="rush-indicator" class="rush-indicator">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+            <span>Class-Change Rush Active • Queue indexed by zone</span>
+          </div>
+        </div>
+
+        <!-- Bottom Sheet Booking Container -->
+        <div class="bottom-sheet" id="booking-sheet">
+          <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
+
+          <!-- Scope Switcher: Campus Hop vs CityLink -->
+          <div class="scope-toggle-group">
+            <button class="scope-tab active" data-scope="campus_hop">
+              <span class="scope-title">Campus Hop</span>
+              <span class="scope-sub">Flat-rate intra-campus</span>
+            </button>
+            <button class="scope-tab" data-scope="citylink">
+              <span class="scope-title">CityLink</span>
+              <span class="scope-sub">Dynamic inter-city commute</span>
+            </button>
+          </div>
+
+          <!-- Origin & Destination Inputs -->
+          <div class="route-selector-card">
+            <!-- Pickup Field -->
+            <div class="route-field pickup-field">
+              <div class="dot-indicator pickup-dot"></div>
+              <div class="field-content">
+                <div class="field-label-row">
+                  <span class="field-label">PICKUP POINT</span>
+                  <span class="auto-badge" id="auto-detected-badge">Auto-detected</span>
+                </div>
+                <select id="pickup-select" class="location-dropdown"></select>
+              </div>
+            </div>
+
+            <div class="route-divider">
+              <button id="swap-locations-btn" class="swap-btn" title="Swap locations">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <polyline points="19 12 12 19 5 12"/>
+                </svg>
+              </button>
+            </div>
+
+            <!-- Destination Field -->
+            <div class="route-field drop-field">
+              <div class="dot-indicator drop-dot"></div>
+              <div class="field-content">
+                <span class="field-label">DESTINATION</span>
+                <select id="drop-select" class="location-dropdown"></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Service Selection: EXACTLY 3 Services (Bike, Scooty, Car) -->
+          <div class="services-container">
+            <div class="section-label-row">
+              <span class="section-label">CHOOSE VEHICLE SERVICE</span>
+              <span class="pricing-mode-pill" id="pricing-mode-tag">Flat Fare</span>
+            </div>
+
+            <div class="services-grid">
+              <!-- Service 1: Bike -->
+              <div class="service-card active" data-service="bike">
+                <div class="service-header">
+                  <div class="service-icon-box bike-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="5.5" cy="17.5" r="3.5"/>
+                      <circle cx="18.5" cy="17.5" r="3.5"/>
+                      <path d="M15 6a1 1 0 1 0 0-2 1 1 0 0 0 0 2zm-3 11.5L9 9l3-3 4 3 3 8.5"/>
+                      <path d="M9 9h4"/>
+                    </svg>
+                  </div>
+                  <div class="service-fare-badge">
+                    <span class="fare-currency">₹</span>
+                    <span class="fare-val" id="fare-bike">15</span>
+                  </div>
+                </div>
+                <div class="service-meta">
+                  <span class="service-name">Bike</span>
+                  <span class="service-desc">Single Rider • Quickest</span>
+                </div>
+                <div class="service-footer">
+                  <span class="service-eta" id="eta-bike">~3 min</span>
+                  <span class="service-driver-avail" id="avail-bike">1 Driver near</span>
+                </div>
+              </div>
+
+              <!-- Service 2: Scooty -->
+              <div class="service-card" data-service="scooty">
+                <div class="service-header">
+                  <div class="service-icon-box scooty-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="6" cy="18" r="3"/>
+                      <circle cx="18" cy="18" r="3"/>
+                      <path d="M6 15h7l3-7h3"/>
+                      <path d="M11 15v-4"/>
+                    </svg>
+                  </div>
+                  <div class="service-fare-badge">
+                    <span class="fare-currency">₹</span>
+                    <span class="fare-val" id="fare-scooty">20</span>
+                  </div>
+                </div>
+                <div class="service-meta">
+                  <span class="service-name">Scooty</span>
+                  <span class="service-desc">Single Rider • Spacious</span>
+                </div>
+                <div class="service-footer">
+                  <span class="service-eta" id="eta-scooty">~4 min</span>
+                  <span class="service-driver-avail" id="avail-scooty">1 Driver near</span>
+                </div>
+              </div>
+
+              <!-- Service 3: Car -->
+              <div class="service-card" data-service="car">
+                <div class="service-header">
+                  <div class="service-icon-box car-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9C2.1 11.2 2 11.6 2 12v4c0 .6.4 1 1 1h2"/>
+                      <circle cx="7" cy="17" r="2"/>
+                      <path d="M9 17h6"/>
+                      <circle cx="17" cy="17" r="2"/>
+                    </svg>
+                  </div>
+                  <div class="service-fare-badge">
+                    <span class="fare-currency">₹</span>
+                    <span class="fare-val" id="fare-car">35</span>
+                  </div>
+                </div>
+                <div class="service-meta">
+                  <span class="service-name">Car</span>
+                  <span class="service-desc">Shared Pool • AC Comfort</span>
+                </div>
+                <div class="service-footer">
+                  <span class="service-eta" id="eta-car">~5 min</span>
+                  <span class="service-driver-avail" id="avail-car">1 Driver near</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Wallet Balance Warning Banner (if insufficient) -->
+          <div id="wallet-warning-banner" class="wallet-warning-banner hidden">
+            <div class="warning-left">
+              <svg class="warning-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <div>
+                <div class="warning-text">Insufficient balance for selected ride</div>
+                <div class="warning-sub">Top up ₹<span id="banner-deficit-amount">10</span> to proceed</div>
+              </div>
+            </div>
+            <button id="quick-topup-btn" class="quick-topup-btn">Top Up</button>
+          </div>
+
+          <!-- Primary CTA Button -->
+          <button id="find-ride-btn" class="btn-primary-cta">
+            <span class="btn-text" id="find-ride-text">Find Ride</span>
+            <span class="btn-subtext" id="selected-service-summary">Bike • Flat ₹15</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 2: DURING-RIDE COCKPIT DASHBOARD ================= -->
+      <!-- Starts ONLY after someone confirms/starts a ride -->
+      <section id="view-active-ride" class="app-view">
+        <div class="active-ride-container">
+          <!-- During-Ride Map Canvas -->
+          <div class="active-map-wrapper">
+            <div id="active-tracking-map" class="map-canvas"></div>
+            
+            <!-- Cockpit Status Floating Pill -->
+            <div class="cockpit-live-pill">
+              <span class="pulse-indicator"></span>
+              <span id="cockpit-live-status-text">TRIP IN PROGRESS</span>
+            </div>
+
+            <!-- Persistent SOS Button Overlay -->
+            <button id="persistent-sos-btn" class="persistent-sos-btn" title="Emergency SOS Beacon">
+              <span class="sos-beacon-ring"></span>
+              <span class="sos-text">SOS</span>
+            </button>
+
+            <!-- Share Live Location Floating Button -->
+            <button id="share-live-btn" class="share-live-float-btn" title="Share Live Ride with Emergency Contacts">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="18" cy="5" r="3"/>
+                <circle cx="6" cy="12" r="3"/>
+                <circle cx="18" cy="19" r="3"/>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+              </svg>
+              <span>Share Trip</span>
+            </button>
+          </div>
+
+          <!-- During-Ride Cockpit Dashboard Card -->
+          <div class="active-status-card">
+            <!-- Cockpit Route Header -->
+            <div class="status-header">
+              <div>
+                <div class="cockpit-tag">DURING-RIDE COCKPIT</div>
+                <h3 id="cockpit-route-title" class="status-title">Uni-Mall ➔ Jalandhar City</h3>
+                <p id="cockpit-telemetry-sub" class="status-sub">Distance remaining: Calculating...</p>
+              </div>
+              <div class="trip-fare-pill">
+                <span>Fare: ₹</span>
+                <span id="active-trip-fare">85.00</span>
+              </div>
+            </div>
+
+            <!-- Host / Driver Profile Card -->
+            <div class="driver-profile-card">
+              <img id="active-driver-avatar" class="driver-avatar" src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=120" alt="Host">
+              <div class="driver-info">
+                <div class="driver-name-row">
+                  <span id="active-driver-name" class="driver-name">Harpreet Singh (Host)</span>
+                  <span class="verified-tag">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2l2.4 2.8 3.7-.4 1.3 3.4 3.4 1.3-.4 3.7 2.8 2.4-2.8 2.4.4 3.7-3.4 1.3-1.3 3.4-3.7-.4L12 22l-2.4-2.8-3.7.4-1.3-3.4-3.4-1.3.4-3.7L1 12l2.8-2.4-.4-3.7 3.4-1.3 1.3-3.4 3.7.4L12 2z"/>
+                    </svg>
+                    Verified LPU
+                  </span>
+                </div>
+                <div class="vehicle-details">
+                  <span id="active-vehicle-model" class="vehicle-model">Maruti Dzire</span>
+                  <span class="vehicle-bullet">•</span>
+                  <span id="active-vehicle-plate" class="vehicle-plate">PB08-CR-9912</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Passenger Manifest Section (Shows all booked passengers) -->
+            <div class="cockpit-manifest-box">
+              <div class="manifest-header">
+                <span class="manifest-title">PASSENGER MANIFEST</span>
+                <span id="manifest-count-badge" class="manifest-badge">3 Passengers Onboard</span>
+              </div>
+              <div id="cockpit-passenger-list" class="passenger-chips-row">
+                <!-- Dynamically populated passenger chips -->
+              </div>
+            </div>
+
+            <!-- Route Waypoints -->
+            <div class="trip-waypoints">
+              <div class="waypoint-item">
+                <div class="waypoint-dot origin"></div>
+                <div class="waypoint-text">
+                  <span class="waypoint-label">ORIGIN PICKUP</span>
+                  <span id="active-pickup-name" class="waypoint-name">Uni-Mall Plaza</span>
+                </div>
+              </div>
+              <div class="waypoint-line"></div>
+              <div class="waypoint-item">
+                <div class="waypoint-dot destination"></div>
+                <div class="waypoint-text">
+                  <span class="waypoint-label">DESTINATION DROP</span>
+                  <span id="active-drop-name" class="waypoint-name">Jalandhar City Bus Stand</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- During-Ride Live Actions -->
+            <div class="active-actions-row">
+              <button id="sim-telemetry-btn" class="btn-secondary-action">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+                <span>Advance Simulation</span>
+              </button>
+              <button id="complete-ride-btn" class="btn-primary-action">
+                <span>🏁 Complete Trip & Reset</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 3: SCHEDULED ROUTE PLANNER & PINNED CARPOOLS ================= -->
+      <section id="view-citylink" class="app-view">
+        <div class="view-header">
+          <div>
+            <h2 class="view-title">Scheduled Carpools</h2>
+            <p class="view-sub">Plan routes, reserve seats & pin full scheduled commutes</p>
+          </div>
+          <button id="open-plan-route-btn" class="btn-sm-primary">+ Plan a Route</button>
+        </div>
+
+        <div class="citylink-content">
+          <!-- SECTION 1: PINNED FULL RIDES (Ready to Depart) -->
+          <div class="scheduled-section">
+            <div class="section-label-row">
+              <span class="section-label">📌 PINNED & FULL RIDES (READY TO DEPART)</span>
+              <span class="pinned-tag">Seats Full</span>
+            </div>
+            <div id="pinned-routes-container" class="routes-list">
+              <!-- Dynamically populated pinned routes -->
+            </div>
+          </div>
+
+          <!-- SECTION 2: OPEN SCHEDULED RIDES (Seats Available) -->
+          <div class="scheduled-section" style="margin-top: 16px;">
+            <div class="section-label-row">
+              <span class="section-label">AVAILABLE SCHEDULED RIDES</span>
+              <span class="pricing-mode-pill">Select Seats</span>
+            </div>
+            <div id="citylink-routes-container" class="routes-list">
+              <!-- Dynamically populated open routes -->
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 4: ACTIVITY / QUEUE ================= -->
+      <section id="view-activity" class="app-view">
+        <div class="view-header">
+          <h2 class="view-title">Ride Activity</h2>
+          <p class="view-sub">Your live matching queues and ride history</p>
+        </div>
+
+        <div class="activity-content">
+          <div id="queue-status-card" class="queue-status-card hidden">
+            <div class="queue-spinner-ring"></div>
+            <div class="queue-details">
+              <div class="queue-title-row">
+                <span class="queue-title">Matching with Nearest Driver</span>
+                <span id="queue-pos-badge" class="queue-pos-badge">Position #1</span>
+              </div>
+              <p class="queue-text">Heavy class-change rush in this zone. Your request is indexed and queued gracefully without timing out.</p>
+              <div id="queue-priority-note" class="priority-note hidden">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+                <span>Teacher Priority Matching Applied</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="recent-trips-section">
+            <h3 class="section-heading">Transaction & Trip History</h3>
+            <div id="transactions-list" class="transactions-list">
+              <!-- Rendered via JS -->
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 5: PROFILE & DRIVER DASHBOARD ================= -->
+      <section id="view-profile" class="app-view">
+        <div class="profile-container">
+          <!-- User Profile Card -->
+          <div class="profile-header-card">
+            <img id="profile-card-avatar" class="profile-card-avatar" src="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120" alt="Avatar">
+            <div class="profile-card-info">
+              <div class="profile-name-row">
+                <h3 id="profile-card-name" class="profile-user-name">Aarav Mehta</h3>
+                <span id="profile-verified-badge" class="verified-pill">Verified LPU</span>
+              </div>
+              <p id="profile-card-department" class="profile-department">B.Tech Computer Science & Engg</p>
+              <p id="profile-card-id" class="profile-lpu-id">Reg: 12204592</p>
+            </div>
+          </div>
+
+          <!-- Role Switcher & Selector -->
+          <div class="setting-card">
+            <h4 class="setting-title">Campus Role</h4>
+            <div class="role-selector-pills">
+              <button class="role-pill-btn active" data-role="rider">Rider</button>
+              <button class="role-pill-btn" data-role="driver">Driver</button>
+              <button class="role-pill-btn" data-role="both">Both</button>
+            </div>
+          </div>
+
+          <!-- Driver Controls & Earnings Section -->
+          <div id="driver-dashboard-section" class="driver-dashboard-section hidden">
+            <div class="section-header-flex">
+              <h4 class="section-title">Driver Control & Earnings</h4>
+              <label class="online-toggle-label">
+                <span id="online-status-text">Online</span>
+                <input type="checkbox" id="driver-online-toggle" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <!-- Earnings Metrics Grid -->
+            <div class="earnings-grid">
+              <div class="metric-card">
+                <span class="metric-label">Total Earned</span>
+                <div class="metric-val-row">
+                  <span class="metric-currency">₹</span>
+                  <span id="driver-total-earned" class="metric-val">0.00</span>
+                </div>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Trips Completed</span>
+                <span id="driver-total-trips" class="metric-val">0</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Driver Rating</span>
+                <div class="metric-val-row">
+                  <span id="driver-rating-val" class="metric-val">5.0</span>
+                  <svg class="star-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                  </svg>
+                </div>
+              </div>
+            </div>
+
+            <!-- Vehicle Details Box -->
+            <div class="vehicle-info-box">
+              <div class="vehicle-info-header">
+                <span class="box-title">Registered Vehicle</span>
+                <button id="edit-vehicle-btn" class="btn-link">Edit</button>
+              </div>
+              <div class="vehicle-display-details">
+                <div id="veh-model-plate" class="veh-title">Honda Activa 6G • PB08-DA-4821</div>
+                <div id="veh-specs" class="veh-sub">Pearl White • Helmet Included</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mandatory Trusted Emergency Contacts -->
+          <div class="setting-card">
+            <div class="section-header-flex">
+              <div>
+                <h4 class="setting-title">Emergency Contacts (Mandatory)</h4>
+                <p class="setting-sub">Alerted automatically when SOS is pressed or trip is shared</p>
+              </div>
+              <button id="add-emergency-btn" class="btn-sm-outline">+ Add</button>
+            </div>
+            <div id="emergency-contacts-list" class="contacts-list">
+              <!-- Contacts rendered via JS -->
+            </div>
+          </div>
+
+          <!-- LPU Persona Switcher for Quick Evaluation -->
+          <div class="setting-card">
+            <h4 class="setting-title">Switch LPU Test Persona</h4>
+            <p class="setting-sub">Quickly test Teacher Priority, Driver View, or Low Balance Alert</p>
+            <div id="persona-selector-list" class="persona-chips-grid">
+              <!-- Persona chips rendered via JS -->
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Navigation Bar -->
+    <nav class="bottom-nav-bar">
+      <button class="nav-tab active" data-view="view-ride">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/>
+          <path d="M2 12h20"/>
+        </svg>
+        <span class="nav-label">Ride</span>
+      </button>
+
+      <button class="nav-tab" data-view="view-citylink">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/>
+          <line x1="4" y1="22" x2="4" y2="15"/>
+        </svg>
+        <span class="nav-label">CityLink</span>
+      </button>
+
+      <button class="nav-tab" data-view="view-activity">
+        <div class="nav-icon-wrapper">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <polyline points="10 9 9 9 8 9"/>
+          </svg>
+          <span id="nav-queue-dot" class="badge-dot hidden"></span>
+        </div>
+        <span class="nav-label">Activity</span>
+      </button>
+
+      <button class="nav-tab" data-view="view-profile">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+        <span class="nav-label">Profile</span>
+      </button>
+    </nav>
+
+    <!-- ================= MODALS & POPUPS ================= -->
+
+    <!-- Enhanced Wallet Top-Up Modal (UPI QR & Razorpay) -->
+    <div id="modal-topup" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Top Up CampusGo Wallet</h3>
+          <button class="modal-close-btn" data-modal="modal-topup">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="current-bal-banner">
+            <span>Current Balance:</span>
+            <strong>₹<span id="modal-current-bal">0.00</span></strong>
+          </div>
+
+          <!-- Payment Method Selector -->
+          <div class="payment-method-tabs">
+            <button class="pay-method-tab active" data-method="upi">
+              <span class="tab-badge">⚡ Instant</span>
+              <span class="tab-label">UPI QR Code</span>
+            </button>
+            <button class="pay-method-tab" data-method="razorpay">
+              <span class="tab-label">Razorpay / Cards</span>
+            </button>
+          </div>
+
+          <!-- Amount Selectors -->
+          <div class="topup-amount-chips">
+            <button class="amount-chip" data-amount="50">+ ₹50</button>
+            <button class="amount-chip active" data-amount="100">+ ₹100</button>
+            <button class="amount-chip" data-amount="250">+ ₹250</button>
+            <button class="amount-chip" data-amount="500">+ ₹500</button>
+          </div>
+
+          <div class="input-group">
+            <label>Amount (₹)</label>
+            <input type="number" id="topup-custom-input" min="10" max="5000" value="100">
+          </div>
+
+          <!-- TAB 1: UPI QR Scanner Container -->
+          <div id="pay-panel-upi" class="pay-panel">
+            <div class="upi-qr-card">
+              <div class="qr-wrapper" id="upi-qr-container">
+                <div class="qr-loading-spinner">Generating UPI QR...</div>
+              </div>
+              <div class="upi-info-col">
+                <span class="upi-vpa-label">Scan with Google Pay, PhonePe, Paytm or BHIM</span>
+                <span class="upi-vpa-val" id="upi-vpa-text">campusgo.lpu@okhdfcbank</span>
+              </div>
+            </div>
+
+            <div class="upi-actions-row">
+              <a id="open-upi-intent-btn" href="#" class="btn-sm-outline" target="_blank" style="text-align:center; text-decoration:none;">
+                📱 Open UPI App
+              </a>
+              <button id="confirm-upi-paid-btn" class="btn-primary-cta" style="flex:1;">
+                Simulate App Payment (₹<span id="qr-pay-amount-label">100</span>)
+              </button>
+            </div>
+          </div>
+
+          <!-- TAB 2: Razorpay Gateway Container -->
+          <div id="pay-panel-razorpay" class="pay-panel hidden">
+            <div class="razorpay-preview-card">
+              <div class="razorpay-logo-row">
+                <span class="rzp-badge">RAZORPAY TEST GATEWAY</span>
+                <span class="rzp-shield">🔒 256-bit SSL</span>
+              </div>
+              <p class="rzp-desc">Pay securely via Credit/Debit Cards, NetBanking, or Digital Wallets with automatic signature verification.</p>
+            </div>
+            <button id="razorpay-checkout-btn" class="btn-primary-cta">
+              Pay via Razorpay (₹<span id="rzp-pay-amount-label">100</span>)
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SOS Emergency Alert Modal with Real SMS Dispatch Feed -->
+    <div id="modal-sos" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card sos-modal-card">
+        <div class="sos-modal-header">
+          <div class="sos-alert-icon">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2L1 21h22L12 2zm0 3.99L19.53 19H4.47L12 5.99zM11 10h2v4h-2zm0 6h2v2h-2z"/>
+            </svg>
+          </div>
+          <h2>EMERGENCY SOS BROADCAST</h2>
+          <p class="sos-subtitle">Multi-Channel SMS & Campus Security Alerted</p>
+        </div>
+        <div class="modal-body">
+          <div class="sos-details-box">
+            <div class="sos-row">
+              <span class="label">Location:</span>
+              <strong id="sos-display-location">Near Uni-Mall, LPU Campus</strong>
+            </div>
+            <div class="sos-row">
+              <span class="label">Campus Control Room:</span>
+              <strong class="highlight-text">+91 1824 517000 (Block 30)</strong>
+            </div>
+            <div class="sos-row">
+              <span class="label">SMS Broadcast:</span>
+              <span id="sos-contacts-count">2 Emergency Contacts Dispatched</span>
+            </div>
+          </div>
+
+          <!-- Real SMS Dispatch Preview Box -->
+          <div class="sos-sms-preview-card">
+            <div class="sms-preview-header">
+              <span class="sms-badge">DISPATCHED SMS PAYLOAD</span>
+              <span class="sms-gateway-tag" id="sos-gateway-tag">Gateway: Fast2SMS / Twilio</span>
+            </div>
+            <pre class="sms-text-box" id="sos-sms-text">Alerting contacts...</pre>
+          </div>
+
+          <div id="sos-dispatched-recipients" class="sos-recipients-list">
+            <!-- Rendered dynamically -->
+          </div>
+
+          <p class="sos-advice">Stay in a well-lit campus area. Campus security and your emergency contacts have received your live coordinates.</p>
+          <button id="dismiss-sos-btn" class="btn-secondary-action">Acknowledge & Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Share Trip Modal -->
+    <div id="modal-share-trip" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Share Live Location</h3>
+          <button class="modal-close-btn" data-modal="modal-share-trip">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-desc">Anyone with this trusted link can track your live location and vehicle details until you safely reach your destination.</p>
+          
+          <div class="share-link-box">
+            <input type="text" id="share-link-input" readonly value="https://campusgo.lpu.in/track/share_xyz">
+            <button id="copy-share-btn" class="btn-sm-primary">Copy</button>
+          </div>
+
+          <div class="share-contacts-status">
+            <span class="check-circle">✓</span>
+            <span>Live trip link sent via SMS to your primary emergency contact.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Mutual Rating Modal -->
+    <div id="modal-rating" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Ride Completed</h3>
+        </div>
+        <div class="modal-body text-center">
+          <div class="completion-success-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+          <h4>How was your ride?</h4>
+          <p class="modal-desc">Fare has been automatically deducted from your CampusGo wallet.</p>
+
+          <div class="star-rating-row" id="star-rating-picker">
+            <span class="star-btn active" data-val="1">★</span>
+            <span class="star-btn active" data-val="2">★</span>
+            <span class="star-btn active" data-val="3">★</span>
+            <span class="star-btn active" data-val="4">★</span>
+            <span class="star-btn active" data-val="5">★</span>
+          </div>
+
+          <div class="rating-tags-row">
+            <button class="tag-pill active">Safe Ride</button>
+            <button class="tag-pill active">Punctual</button>
+            <button class="tag-pill">Clean Helmet</button>
+            <button class="tag-pill">Polite Behavior</button>
+          </div>
+
+          <button id="submit-rating-btn" class="btn-primary-cta">Submit Feedback</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Plan Route & Scheduled Carpool Modal -->
+    <div id="modal-post-route" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Plan Scheduled Route</h3>
+          <button class="modal-close-btn" data-modal="modal-post-route">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-desc">Plan a scheduled commute. Offer seats to fellow students & faculty; once all seats fill up, your ride automatically gets pinned!</p>
+
+          <div class="input-group">
+            <label>Origin Pickup (Campus)</label>
+            <select id="route-origin-select">
+              <option value="LPU Uni-Mall Plaza">Uni-Mall & Student Plaza</option>
+              <option value="Block 34 (Computer Science)">Block 34 (Computer Science & Engg)</option>
+              <option value="BH-1 & BH-2 (Boys Hostels)">BH-1 & BH-2 (Boys Hostels)</option>
+              <option value="BH-3 & BH-4 (Boys Hostels)">BH-3 & BH-4 (Boys Hostels)</option>
+              <option value="GH-1 & GH-3 (Girls Hostels)">GH-1 & GH-3 (Girls Hostels)</option>
+              <option value="LPU Main Gate (GT Road Highway)">LPU Main Gate (Highway)</option>
+              <option value="Law Gate (PG Hub)">Law Gate (PG Hub)</option>
+            </select>
+          </div>
+
+          <div class="input-group">
+            <label>Destination Hub (CityLink)</label>
+            <select id="route-dest-select">
+              <option value="Jalandhar City Bus Stand">Jalandhar City Bus Stand</option>
+              <option value="Phagwara Railway Station">Phagwara Railway Station</option>
+              <option value="Rama Mandi Chowk, Jalandhar">Rama Mandi Chowk, Jalandhar</option>
+              <option value="Jalandhar Cantt Railway Station">Jalandhar Cantt Railway Station</option>
+            </select>
+          </div>
+
+          <div class="input-row">
+            <div class="input-group">
+              <label>Departure Time</label>
+              <input type="text" id="route-time-input" placeholder="e.g., 17:30 Today" value="17:30 Today">
+            </div>
+            <div class="input-group">
+              <label>Number of Seats Offered</label>
+              <select id="route-seats-input">
+                <option value="1">1 Seat</option>
+                <option value="2">2 Seats</option>
+                <option value="3" selected>3 Seats</option>
+                <option value="4">4 Seats</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="input-group">
+            <label>Fare Per Passenger Seat (₹)</label>
+            <input type="number" id="route-price-input" min="20" max="400" value="80">
+          </div>
+
+          <div class="input-group">
+            <label>Trip Notes (Optional)</label>
+            <input type="text" id="route-notes-input" placeholder="e.g., AC Carpool via GT Road • Trunk space available">
+          </div>
+
+          <button id="submit-post-route-btn" class="btn-primary-cta">Publish & Plan Route</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Emergency Contact Modal -->
+    <div id="modal-add-contact" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Add Trusted Emergency Contact</h3>
+          <button class="modal-close-btn" data-modal="modal-add-contact">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="input-group">
+            <label>Full Name</label>
+            <input type="text" id="emg-name-input" placeholder="Parent / Hostel Warden">
+          </div>
+          <div class="input-group">
+            <label>Relationship</label>
+            <input type="text" id="emg-rel-input" placeholder="e.g. Mother, Roommate, Warden">
+          </div>
+          <div class="input-group">
+            <label>Phone Number</label>
+            <input type="tel" id="emg-phone-input" placeholder="+91 98765 00000">
+          </div>
+          <button id="submit-contact-btn" class="btn-primary-cta">Save Contact</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Leaflet Map JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <!-- Application Script -->
+  <script src="app.js"></script>
+</body>
+</html>
