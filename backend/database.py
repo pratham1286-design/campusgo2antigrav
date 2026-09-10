@@ -167,6 +167,24 @@ def init_db():
     );
     """)
 
+    # Upgrade databases created before scheduled route telemetry was added.
+    route_columns = {
+        "origin": "TEXT NOT NULL DEFAULT 'LPU Uni-Mall'",
+        "origin_lat": "REAL NOT NULL DEFAULT 31.2536",
+        "origin_lng": "REAL NOT NULL DEFAULT 75.7038",
+        "share_token": "TEXT",
+        "current_lat": "REAL",
+        "current_lng": "REAL",
+        "started_at": "REAL",
+        "completed_at": "REAL"
+    }
+    existing_route_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(driver_routes)").fetchall()
+    }
+    for column, definition in route_columns.items():
+        if column not in existing_route_columns:
+            cursor.execute(f"ALTER TABLE driver_routes ADD COLUMN {column} {definition}")
+
     # Route Bookings (riders joining driver routes)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS route_bookings (

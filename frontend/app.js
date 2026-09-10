@@ -20,7 +20,8 @@ const AppState = {
   activeMap: null,
   homeMarkers: {},
   activeMarkers: {},
-  activePolyline: null
+  activePolyline: null,
+  mapAvailable: false
 };
 
 // --- Initialization ---
@@ -37,6 +38,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 // --- Map Initialization (Centered at LPU Punjab) ---
 function initMaps() {
   const LPU_COORDS = [31.2536, 75.7037]; // LPU GT Road Campus Center
+
+  if (typeof L === 'undefined') {
+    renderMapFallback('campus-map', 'Campus map preview');
+    renderMapFallback('active-tracking-map', 'Live tracking map');
+    return;
+  }
+
+  AppState.mapAvailable = true;
 
   // 1. Home Screen Half-Screen Map (100% Free OpenStreetMap - No API key needed)
   AppState.homeMap = L.map('campus-map', {
@@ -61,6 +70,23 @@ function initMaps() {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(AppState.activeMap);
+}
+
+function renderMapFallback(elementId, label) {
+  const mapElement = document.getElementById(elementId);
+  if (!mapElement || mapElement.querySelector('.map-fallback')) return;
+
+  mapElement.innerHTML = `
+    <div class="map-fallback" role="img" aria-label="${label}">
+      <div class="map-fallback-road road-horizontal"></div>
+      <div class="map-fallback-road road-vertical"></div>
+      <div class="map-fallback-area area-academic">Academic Blocks</div>
+      <div class="map-fallback-area area-mall">Uni-Mall</div>
+      <div class="map-fallback-area area-hostels">Hostels</div>
+      <div class="map-fallback-pin pin-campus">LPU</div>
+      <div class="map-fallback-caption">${label} • LPU Campus</div>
+    </div>
+  `;
 }
 
 // --- Load Landmarks from API ---
@@ -115,7 +141,10 @@ function populateLocationDropdowns() {
 
 // --- Render Map Pins & Drivers on Home Map ---
 function renderMapLandmarks() {
-  if (!AppState.homeMap) return;
+  if (!AppState.homeMap) {
+    renderMapFallback('campus-map', 'Campus map preview');
+    return;
+  }
 
   // Clear existing markers
   Object.values(AppState.homeMarkers).forEach(m => AppState.homeMap.removeLayer(m));
@@ -478,6 +507,41 @@ function renderQueueStatus(ride) {
     prioNote.classList.remove('hidden');
   } else {
     prioNote.classList.add('hidden');
+  }
+}
+
+async function loadActivityHistory() {
+  if (!AppState.currentUser) return;
+
+  const container = document.getElementById('transactions-list');
+  try {
+    const res = await fetch(`/api/wallet?user_id=${AppState.currentUser.id}`);
+    const data = await res.json();
+    container.innerHTML = '';
+
+    if (!data.transactions || data.transactions.length === 0) {
+      container.innerHTML = '<p class="empty-state">No transactions or completed rides yet.</p>';
+      return;
+    }
+
+    data.transactions.forEach(transaction => {
+      const item = document.createElement('div');
+      item.className = 'tx-item';
+      const amount = Number(transaction.amount || 0);
+      const date = new Date(transaction.created_at * 1000).toLocaleDateString();
+      item.innerHTML = `
+        <div>
+          <span class="tx-desc"></span>
+          <span class="tx-date">${date}</span>
+        </div>
+        <strong class="tx-amount ${amount < 0 ? 'negative' : ''}">${amount < 0 ? '-' : '+'}₹${Math.abs(amount).toFixed(2)}</strong>
+      `;
+      item.querySelector('.tx-desc').textContent = transaction.description || transaction.type;
+      container.appendChild(item);
+    });
+  } catch (err) {
+    container.innerHTML = '<p class="empty-state">Activity is temporarily unavailable.</p>';
+    console.error('Failed to load activity history:', err);
   }
 }
 
@@ -1162,12 +1226,6 @@ async function openDuringRideCockpit(routeId) {
     console.error('Failed to open during-ride cockpit:', err);
   }
 }
-      alert('Your CityLink carpool route has been posted for other LPU riders!');
-    }
-  } catch (err) {
-    console.error('Failed to post route:', err);
-  }
-}
 
 // --- Navigation View Switcher ---
 function initNavigation() {
@@ -1194,6 +1252,8 @@ function switchView(viewId) {
 
   if (viewId === 'view-citylink') {
     loadCityLinkRoutes();
+  } else if (viewId === 'view-activity') {
+    loadActivityHistory();
   } else if (viewId === 'view-ride' && AppState.homeMap) {
     setTimeout(() => AppState.homeMap.invalidateSize(), 150);
   } else if (viewId === 'view-active-ride' && AppState.activeMap) {
@@ -1314,7 +1374,10 @@ function initEventHandlers() {
   // Quick Top-up Button
   document.getElementById('quick-topup-btn').addEventListener('click', () => openModal('modal-topup'));
   document.getElementById('header-wallet-btn').addEventListener('click', () => openModal('modal-topup'));
-  document.getElementById('confirm-topup-btn').addEventListener('click', handleWalletTopup);
+  const confirmTopupButton = document.getElementById('confirm-topup-btn');
+  if (confirmTopupButton) {
+    confirmTopupButton.addEventListener('click', handleWalletTopup);
+  }
 
   // Persona quick menu
   document.getElementById('persona-switch-btn').addEventListener('click', () => switchView('view-profile'));
@@ -1346,7 +1409,7 @@ function initEventHandlers() {
   document.getElementById('submit-rating-btn').addEventListener('click', submitRating);
 
   // CityLink Post Route
-  document.getElementById('post-route-trigger-btn').addEventListener('click', () => openModal('modal-post-route'));
+  document.getElementById('open-plan-route-btn').addEventListener('click', () => openModal('modal-post-route'));
   document.getElementById('submit-post-route-btn').addEventListener('click', postCityLinkRoute);
 
   // Emergency contact modal

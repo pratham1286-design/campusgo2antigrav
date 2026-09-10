@@ -848,15 +848,6 @@ def get_driver_earnings():
         "recent_transactions": [dict(t) for t in txs]
     })
 
-# --- CityLink Scheduled Future Routes (Post & Join) ---
-@app.route("/api/driver/routes", methods=["GET"])
-def get_routes():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT dr.*, u.name as driver_name, u.phone as driver_phone, u.avatar_url as driver_avatar,
-           v.model as vehicle_model, v.category as vehicle_category, v.plate_number as vehicle_plate
-    FROM driver_routes dr
 # --- CityLink Scheduled Future Routes (Plan, Pin, Cockpit & Reset) ---
 @app.route("/api/driver/routes", methods=["GET"])
 @app.route("/api/routes/scheduled", methods=["GET"])
