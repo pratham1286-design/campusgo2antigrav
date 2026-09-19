@@ -29,11 +29,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initModals();
   initMaps();
+  initializeCustomLocationDropdowns();
   await loadLandmarks();
   await loadPersonas();
   initEventHandlers();
   await checkActiveRide();
 });
+
+window.initializeCustomLocationDropdowns = initializeCustomLocationDropdowns;
+window.syncCustomLocationDropdowns = syncCustomLocationDropdowns;
 
 // --- Map Initialization (Centered at LPU Punjab) ---
 function initMaps() {
@@ -96,6 +100,7 @@ async function loadLandmarks() {
     const data = await res.json();
     AppState.landmarks = data.landmarks;
     populateLocationDropdowns();
+    populatePlannedRouteDropdowns();
     renderMapLandmarks();
   } catch (err) {
     console.error('Failed to load landmarks:', err);
@@ -103,7 +108,127 @@ async function loadLandmarks() {
 }
 
 // --- Populate Dropdowns based on Scope ---
+function syncCustomLocationDropdowns() {
+  document.querySelectorAll('.location-dropdown').forEach((select) => {
+    const wrapper = select.parentElement?.querySelector('.custom-location-picker');
+    const selectedOption = Array.from(select.options).find(option => option.value === select.value);
+    const label = selectedOption ? selectedOption.textContent : 'Select a location';
+
+    if (wrapper) {
+      const triggerValue = wrapper.querySelector('.custom-location-value');
+      if (triggerValue) triggerValue.textContent = label;
+
+      wrapper.querySelectorAll('.custom-location-option').forEach((optionButton) => {
+        optionButton.classList.toggle('active', optionButton.dataset.value === select.value);
+      });
+    }
+  });
+}
+
+function initializeCustomLocationDropdowns() {
+  if (!document || !document.querySelectorAll) return;
+
+  document.querySelectorAll('.location-dropdown').forEach((select) => {
+    if (select.dataset.customized === 'true') return;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'custom-location-picker';
+    wrapper.style.zIndex = select.id === 'pickup-select' || select.id === 'route-origin-select' ? '80' : '70';
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'custom-location-trigger';
+    trigger.innerHTML = '<span class="custom-location-value"></span><span class="custom-location-chevron">▾</span>';
+
+    const menu = document.createElement('div');
+    menu.className = 'custom-location-menu';
+
+    const buildMenu = () => {
+      menu.innerHTML = '';
+      Array.from(select.options).forEach((option) => {
+        const optionButton = document.createElement('button');
+        optionButton.type = 'button';
+        optionButton.className = 'custom-location-option';
+        optionButton.dataset.value = option.value;
+        optionButton.textContent = option.textContent;
+        optionButton.classList.toggle('active', option.value === select.value);
+
+        optionButton.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          select.value = option.value;
+          syncCustomLocationDropdowns();
+          menu.classList.remove('open');
+          trigger.classList.remove('open');
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+
+        menu.appendChild(optionButton);
+      });
+
+      const selectedOption = Array.from(select.options).find(option => option.value === select.value);
+      trigger.querySelector('.custom-location-value').textContent = selectedOption ? selectedOption.textContent : 'Select a location';
+    };
+
+    const positionMenu = () => {
+      const triggerRect = trigger.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - triggerRect.bottom - 20;
+      const spaceAbove = triggerRect.top - 20;
+
+      if (spaceBelow < 220 && spaceAbove > 220) {
+        menu.style.top = 'auto';
+        menu.style.bottom = 'calc(100% + 8px)';
+      } else {
+        menu.style.top = 'calc(100% + 8px)';
+        menu.style.bottom = 'auto';
+      }
+
+      const maxMenuHeight = Math.min(280, Math.max(180, spaceBelow > 220 ? spaceBelow : spaceAbove));
+      menu.style.maxHeight = `${maxMenuHeight}px`;
+    };
+
+    trigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const shouldOpen = !menu.classList.contains('open');
+      document.querySelectorAll('.custom-location-menu').forEach((openMenu) => {
+        openMenu.classList.remove('open');
+        const otherTrigger = openMenu.parentElement?.querySelector('.custom-location-trigger');
+        if (otherTrigger) otherTrigger.classList.remove('open');
+      });
+
+      menu.classList.toggle('open', shouldOpen);
+      trigger.classList.toggle('open', shouldOpen);
+      if (shouldOpen) positionMenu();
+    });
+
+    document.addEventListener('click', (event) => {
+      if (!wrapper.contains(event.target)) {
+        menu.classList.remove('open');
+        trigger.classList.remove('open');
+      }
+    });
+
+    if (select.parentElement) {
+      select.parentElement.insertBefore(wrapper, select);
+    }
+    wrapper.appendChild(trigger);
+    wrapper.appendChild(menu);
+    select.style.display = 'none';
+    select.dataset.customized = 'true';
+
+    buildMenu();
+  });
+}
+
 function populateLocationDropdowns() {
+  document.querySelectorAll('.custom-location-picker').forEach((menuWrapper) => menuWrapper.remove());
+  document.querySelectorAll('.location-dropdown').forEach((select) => {
+    select.dataset.customized = 'false';
+    select.style.display = 'none';
+  });
+
   const pickupSelect = document.getElementById('pickup-select');
   const dropSelect = document.getElementById('drop-select');
 
@@ -127,7 +252,6 @@ function populateLocationDropdowns() {
     }
   });
 
-  // Set defaults
   pickupSelect.value = AppState.pickupKey || 'uni_mall';
   if (isHop) {
     dropSelect.value = AppState.dropKey || 'block_34';
@@ -136,7 +260,49 @@ function populateLocationDropdowns() {
     AppState.dropKey = 'jalandhar_bus_stand';
   }
 
+  setTimeout(() => {
+    initializeCustomLocationDropdowns();
+    syncCustomLocationDropdowns();
+  }, 0);
   fetchFareQuotes();
+}
+
+function populatePlannedRouteDropdowns() {
+  const originSelect = document.getElementById('route-origin-select');
+  const destinationSelect = document.getElementById('route-dest-select');
+  if (!originSelect || !destinationSelect || !Object.keys(AppState.landmarks).length) return;
+
+  const currentOrigin = originSelect.value;
+  const currentDestination = destinationSelect.value;
+  originSelect.innerHTML = '';
+  destinationSelect.innerHTML = '';
+
+  Object.entries(AppState.landmarks).forEach(([key, location]) => {
+    const option = document.createElement('option');
+    option.value = location.name;
+    option.textContent = `${location.name} (${location.zone})`;
+
+    if (location.zone.startsWith('CityLink')) {
+      destinationSelect.appendChild(option);
+    } else {
+      originSelect.appendChild(option);
+    }
+  });
+
+  if (Array.from(originSelect.options).some(option => option.value === currentOrigin)) {
+    originSelect.value = currentOrigin;
+  }
+  if (Array.from(destinationSelect.options).some(option => option.value === currentDestination)) {
+    destinationSelect.value = currentDestination;
+  }
+
+  originSelect.dataset.customized = 'false';
+  destinationSelect.dataset.customized = 'false';
+  originSelect.style.display = 'none';
+  destinationSelect.style.display = 'none';
+  document.querySelectorAll('#modal-post-route .custom-location-picker').forEach((picker) => picker.remove());
+  initializeCustomLocationDropdowns();
+  syncCustomLocationDropdowns();
 }
 
 // --- Render Map Pins & Drivers on Home Map ---
@@ -1288,6 +1454,13 @@ function openModal(id) {
       const amt = parseFloat(document.getElementById('topup-custom-input').value) || 100;
       fetchUpiQr(amt);
     }
+    if (id === 'modal-post-route') {
+      setTimeout(() => {
+        populatePlannedRouteDropdowns();
+        initializeCustomLocationDropdowns();
+        syncCustomLocationDropdowns();
+      }, 0);
+    }
   }
 }
 
@@ -1368,6 +1541,7 @@ function initEventHandlers() {
     const temp = p.value;
     p.value = d.value;
     d.value = temp;
+    syncCustomLocationDropdowns();
     fetchFareQuotes();
   });
 
