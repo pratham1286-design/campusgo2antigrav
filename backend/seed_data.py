@@ -1,6 +1,10 @@
 import time
 import uuid
+from werkzeug.security import generate_password_hash
 from database import init_db, get_db_connection
+
+# Shared password for every seeded demo persona (documented in README for reviewers/testers).
+DEMO_PASSWORD = "CampusGo@2026"
 
 def seed():
     init_db()
@@ -115,11 +119,13 @@ def seed():
         }
     ]
 
+    demo_password_hash = generate_password_hash(DEMO_PASSWORD)
+
     for u in users:
         cur.execute("""
-        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, is_verified, is_teacher_priority, department, avatar_url, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (u["id"], u["lpu_id"], u["name"], u["email"], u["phone"], u["user_type"], u["role"], u["is_verified"], u["is_teacher_priority"], u["department"], u["avatar_url"], now))
+        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified, is_teacher_priority, department, avatar_url, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (u["id"], u["lpu_id"], u["name"], u["email"], u["phone"], u["user_type"], u["role"], demo_password_hash, u["is_verified"], u["is_teacher_priority"], u["department"], u["avatar_url"], now))
 
         # Wallet
         cur.execute("""
@@ -256,6 +262,7 @@ def seed():
     conn.commit()
     conn.close()
     print("Database seeded with realistic LPU community test data!")
+    print(f"Demo login password for every seeded persona: {DEMO_PASSWORD}")
 
 if __name__ == "__main__":
     seed()

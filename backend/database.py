@@ -3,7 +3,7 @@ import os
 import json
 import time
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "campusgo.db")
+DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "campusgo.db")
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -25,6 +25,7 @@ def init_db():
         phone TEXT NOT NULL,
         user_type TEXT NOT NULL CHECK(user_type IN ('student', 'teacher')),
         role TEXT NOT NULL CHECK(role IN ('rider', 'driver', 'both')),
+        password_hash TEXT NOT NULL DEFAULT '',
         is_verified INTEGER NOT NULL DEFAULT 1,
         is_teacher_priority INTEGER NOT NULL DEFAULT 0,
         department TEXT,
@@ -32,6 +33,13 @@ def init_db():
         created_at REAL NOT NULL
     );
     """)
+
+    # Upgrade databases created before password-based login was added.
+    existing_user_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "password_hash" not in existing_user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
 
     # Vehicles table (for drivers)
     cursor.execute("""

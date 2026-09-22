@@ -9,8 +9,11 @@ import qrcode.image.svg
 from database import get_db_connection
 
 # Environment variables for payment gateways
+DEFAULT_RAZORPAY_SECRET = "demo_secret_campusgo_2026"
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_campusgo_demo")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "demo_secret_campusgo_2026")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", DEFAULT_RAZORPAY_SECRET)
+# True only while no real Razorpay secret has been configured via env var.
+DEMO_MODE = RAZORPAY_KEY_SECRET == DEFAULT_RAZORPAY_SECRET
 LPU_CAMPUSGO_VPA = os.environ.get("CAMPUSGO_UPI_VPA", "campusgo.lpu@okhdfcbank")
 MERCHANT_NAME = "CampusGo LPU"
 
@@ -83,9 +86,11 @@ def create_razorpay_order(user_id: str, amount: float) -> dict:
 def verify_razorpay_payment(order_id: str, payment_id: str, signature: str) -> bool:
     """
     Verifies Razorpay payment signature using HMAC SHA256.
-    Accepts valid HMAC or test mode signature 'simulated_test_signature'.
+    The demo bypass signatures only work while DEMO_MODE is on (no real
+    RAZORPAY_KEY_SECRET configured) so a real deployment can't be credited
+    with fake wallet top-ups by replaying the hardcoded demo signature.
     """
-    if signature in ("simulated_test_signature", "demo_signature_valid"):
+    if DEMO_MODE and signature in ("simulated_test_signature", "demo_signature_valid"):
         return True
 
     generated_signature = hmac.new(

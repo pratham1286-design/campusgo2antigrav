@@ -2,15 +2,28 @@ import unittest
 import json
 import time
 from app import app
-from seed_data import seed
+from seed_data import seed, DEMO_PASSWORD
 from payments import generate_upi_qr, create_razorpay_order, verify_razorpay_payment, credit_wallet_after_payment
 from emergency_dispatch import format_sos_message, dispatch_emergency_alert
+
+LPU_IDS = {
+    "usr_student_aarav": "12204592",
+    "usr_student_kavya": "12301982",
+}
 
 class TestEnhancements(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         seed()
         cls.client = app.test_client()
+
+    def auth_headers(self, user_id):
+        res = self.client.post("/api/auth/login", json={
+            "lpu_id": LPU_IDS[user_id],
+            "password": DEMO_PASSWORD
+        })
+        token = res.get_json()["token"]
+        return {"Authorization": f"Bearer {token}"}
 
     def test_01_upi_qr_generation(self):
         """Test NPCI UPI URI and SVG QR code generation."""
@@ -34,9 +47,9 @@ class TestEnhancements(unittest.TestCase):
 
     def test_03_payment_api_endpoints(self):
         """Test /api/payments/upi/create-qr and /api/payments/upi/confirm."""
+        headers = self.auth_headers("usr_student_kavya")
         # 1. Create QR
-        res_qr = self.client.post("/api/payments/upi/create-qr", json={
-            "user_id": "usr_student_kavya",
+        res_qr = self.client.post("/api/payments/upi/create-qr", headers=headers, json={
             "amount": 75.0
         })
         self.assertEqual(res_qr.status_code, 200)
@@ -45,8 +58,7 @@ class TestEnhancements(unittest.TestCase):
         ref_id = qr_data["reference_id"]
 
         # 2. Confirm UPI payment
-        res_confirm = self.client.post("/api/payments/upi/confirm", json={
-            "user_id": "usr_student_kavya",
+        res_confirm = self.client.post("/api/payments/upi/confirm", headers=headers, json={
             "amount": 75.0,
             "reference_id": ref_id
         })
@@ -73,8 +85,8 @@ class TestEnhancements(unittest.TestCase):
 
     def test_05_sos_trigger_with_multi_channel_dispatch(self):
         """Test /api/sos/trigger returns SMS message payload and delivery records."""
-        res = self.client.post("/api/sos/trigger", json={
-            "user_id": "usr_student_aarav",
+        headers = self.auth_headers("usr_student_aarav")
+        res = self.client.post("/api/sos/trigger", headers=headers, json={
             "lat": 31.2536,
             "lng": 75.7037,
             "location_name": "Block 34 (Computer Science)"

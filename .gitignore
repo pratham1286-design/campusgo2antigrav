@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# SQLite database (seeded fresh on every build/deploy)
+backend/campusgo.db
+backend/campusgo.db-journal
+
+# Environment secrets
+.env
+
+# OS / editor
+.DS_Store

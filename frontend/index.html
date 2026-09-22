@@ -18,6 +18,45 @@
 <body>
   <div id="app-root" class="app-container">
 
+    <!-- ================= LOGIN SCREEN ================= -->
+    <div id="login-screen" class="login-screen">
+      <div class="login-card">
+        <div class="brand-section" style="justify-content:center; margin-bottom:18px;">
+          <div class="brand-logo">
+            <span class="logo-dot"></span>
+            <span class="brand-title">Campus<span class="brand-accent">Go</span></span>
+          </div>
+        </div>
+        <p class="login-subtitle">Sign in with your LPU ID to continue</p>
+
+        <div class="input-group">
+          <label>LPU ID</label>
+          <input type="text" id="login-lpu-id-input" placeholder="e.g. 12204592" autocomplete="username">
+        </div>
+        <div class="input-group">
+          <label>Password</label>
+          <input type="password" id="login-password-input" placeholder="Password" autocomplete="current-password">
+        </div>
+
+        <p id="login-error-text" class="login-error hidden"></p>
+
+        <button id="login-submit-btn" class="btn-primary-cta">Log In</button>
+
+        <div class="login-demo-hint">
+          <strong>Reviewer / demo access:</strong> log in with any LPU ID below and password
+          <code>CampusGo@2026</code>
+          <ul>
+            <li>FAC-10822 &mdash; Dr. Raman Sharma (Teacher)</li>
+            <li>12204592 &mdash; Aarav Mehta (Student Rider)</li>
+            <li>12301982 &mdash; Kavya Patel (Low Balance)</li>
+            <li>12108843 &mdash; Simran Kaur (Driver)</li>
+            <li>12019934 &mdash; Vikram Singh (Driver)</li>
+            <li>11904421 &mdash; Harpreet Singh (Driver)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
     <!-- Top App Bar -->
     <header class="top-bar">
       <div class="brand-section">
@@ -49,7 +88,7 @@
         </button>
 
         <!-- Persona Switcher Menu -->
-        <button id="persona-switch-btn" class="persona-avatar-btn" title="Switch User Persona">
+        <button id="persona-switch-btn" class="persona-avatar-btn" title="Profile">
           <img id="header-avatar" src="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120" alt="Avatar">
         </button>
       </div>
@@ -517,13 +556,11 @@
             </div>
           </div>
 
-          <!-- LPU Persona Switcher for Quick Evaluation -->
+          <!-- Account -->
           <div class="setting-card">
-            <h4 class="setting-title">Switch LPU Test Persona</h4>
-            <p class="setting-sub">Quickly test Teacher Priority, Driver View, or Low Balance Alert</p>
-            <div id="persona-selector-list" class="persona-chips-grid">
-              <!-- Persona chips rendered via JS -->
-            </div>
+            <h4 class="setting-title">Account</h4>
+            <p class="setting-sub" id="profile-account-lpu">Signed in</p>
+            <button id="logout-btn" class="btn-sm-outline" style="width:100%; margin-top:10px;">Log Out</button>
           </div>
         </div>
       </section>

@@ -4,11 +4,22 @@ services:
     env: python
     region: singapore
     plan: free
+    # NOTE: Render's free plan does not support persistent disks, so the
+    # SQLite file lives in the ephemeral container filesystem and resets to
+    # seed data on every deploy/restart. Fine for a demo. For real
+    # persistence, upgrade this service to a paid plan (Starter+), add:
+    #   disk:
+    #     name: campusgo-data
+    #     mountPath: /var/data
+    #     sizeGB: 1
+    # and set DATABASE_PATH=/var/data/campusgo.db as an env var below.
     buildCommand: pip install -r requirements.txt && python backend/seed_data.py
-    startCommand: python backend/app.py
+    startCommand: gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
     envVars:
       - key: PORT
         value: 5000
+      - key: SECRET_KEY
+        generateValue: true
       - key: CAMPUSGO_UPI_VPA
         value: campusgo.lpu@okhdfcbank
       - key: RAZORPAY_KEY_ID

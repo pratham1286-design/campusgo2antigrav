@@ -2558,3 +2558,68 @@ body {
   cursor: pointer;
   margin-top: 10px;
 }
+
+/* --- Login Screen --- */
+.login-screen {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2000;
+  background-color: var(--bg-canvas);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 360px;
+}
+
+.login-subtitle {
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.login-error {
+  background-color: var(--status-danger-light);
+  color: var(--status-danger);
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 12px;
+}
+
+.login-demo-hint {
+  margin-top: 20px;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.login-demo-hint code {
+  font-family: var(--font-mono);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.login-demo-hint ul {
+  margin: 8px 0 0 18px;
+  padding: 0;
+}
+
+.login-demo-hint li {
+  margin-bottom: 2px;
+}

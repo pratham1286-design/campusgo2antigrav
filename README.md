@@ -79,9 +79,20 @@ python backend/app.py
 Open [http://127.0.0.1:5000](http://127.0.0.1:5000) in your web browser.
 
 ### 3. Demo Personas Available for Testing
-- **Dr. Raman Sharma** (`usr_teacher_raman`): Teacher Rider, Faculty Priority Badge ⭐, ₹350 balance.
-- **Aarav Mehta** (`usr_student_aarav`): Student Rider, B.Tech CSE, ₹150 balance.
-- **Kavya Patel** (`usr_student_kavya`): Low-balance Student (₹10) to test the Top-Up prompt.
-- **Simran Kaur** (`usr_driver_simran`): Student Driver, Honda Activa 6G Scooty, Uni-Mall.
-- **Vikram Singh** (`usr_driver_vikram`): Student Driver, Royal Enfield Hunter 350 Bike, Block 34.
-- **Harpreet Singh** (`usr_driver_harpreet`): Driver, Maruti Swift Dzire Car, Main Gate.
+Every seeded account uses the same demo password: **`CampusGo@2026`**. Log in with the LPU ID below and that password.
+
+- **Dr. Raman Sharma** (`FAC-10822`): Teacher Rider, Faculty Priority Badge ⭐, ₹350 balance.
+- **Aarav Mehta** (`12204592`): Student Rider, B.Tech CSE, ₹150 balance.
+- **Kavya Patel** (`12301982`): Low-balance Student (₹10) to test the Top-Up prompt.
+- **Simran Kaur** (`12108843`): Student Driver, Honda Activa 6G Scooty, Uni-Mall.
+- **Vikram Singh** (`12019934`): Student Driver, Royal Enfield Hunter 350 Bike, Block 34.
+- **Harpreet Singh** (`11904421`): Driver, Maruti Swift Dzire Car, Main Gate.
+
+---
+
+## 🔐 Authentication & Deployment Notes
+
+- **Login is real, not a demo switcher.** Every API call (other than the campus landmark map, the public share-a-trip link, and login itself) requires a signed `Authorization: Bearer <token>` session header. The server always derives "who is acting" from that token, never from a client-supplied `user_id` - so one logged-in user cannot act as another by editing request bodies.
+- **Set `SECRET_KEY`** as a real environment variable in any deployment. Without it, a random key is generated per-process and every session is invalidated on restart. `render.yaml` auto-generates and persists one for you; for Docker/self-hosting, set it explicitly.
+- **SQLite persistence:** on Render's free plan the database resets to seed data on every deploy/restart (free instances can't attach a persistent disk). This is fine for a demo/portfolio deployment. For real persistence, upgrade to a paid Render plan, attach a disk, and set `DATABASE_PATH` to a path on that disk (see the comment in `render.yaml`). The Docker Compose setup already persists data via a named volume.
+- **Payments/SMS are simulated by default.** UPI/Razorpay top-ups and SOS SMS dispatch work out of the box in a safe simulated mode (no real money moves, no real SMS sends) unless you configure real `RAZORPAY_KEY_SECRET` / `FAST2SMS_API_KEY` / Twilio credentials as environment variables.

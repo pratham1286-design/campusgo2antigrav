@@ -1,5 +1,5 @@
 # Multi-stage production Dockerfile for CampusGo
-FROM python:3.14-slim AS base
+FROM python:3.12-slim AS base
 
 # Prevent Python from writing .pyc and buffer stdout
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -34,5 +34,8 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/api/campus/landmarks || exit 1
 
-# Start production server
-CMD ["python", "backend/app.py"]
+# Start production server.
+# Set SECRET_KEY via env var (e.g. `docker run -e SECRET_KEY=...`) so login
+# sessions survive container restarts - without it a random key is generated
+# per-process and every session is invalidated on restart.
+CMD ["gunicorn", "--chdir", "backend", "--workers", "1", "--threads", "4", "--bind", "0.0.0.0:5000", "app:app"]

@@ -2,8 +2,11 @@ import os
 import time
 import uuid
 import json
+import secrets
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.security import check_password_hash
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from database import get_db_connection, init_db
 from pricing_and_queue import (
     CAMPUS_LANDMARKS,
@@ -23,6 +26,45 @@ from emergency_dispatch import dispatch_emergency_alert
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 
+# --- Session Token Authentication ---
+# SECRET_KEY should be set via env var in production so tokens survive
+# restarts/redeploys and work across multiple worker processes. Without it,
+# a random key is generated per-process (dev convenience only) and every
+# session is invalidated whenever the process restarts.
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_hex(32)
+    print("WARNING: SECRET_KEY env var not set. Using a random ephemeral key - "
+          "all sessions will be invalidated on restart. Set SECRET_KEY in production.")
+
+SESSION_SERIALIZER = URLSafeTimedSerializer(SECRET_KEY, salt="campusgo-session-v1")
+SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7  # 7 days
+
+def generate_session_token(user_id):
+    return SESSION_SERIALIZER.dumps(user_id)
+
+def verify_session_token(token):
+    try:
+        return SESSION_SERIALIZER.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
+    except (BadSignature, SignatureExpired):
+        return None
+
+def require_auth(f):
+    """Requires a valid 'Authorization: Bearer <token>' header and exposes the
+    authenticated user's id as request.auth_user_id. Endpoints must derive the
+    acting user's identity from this, never from a client-supplied user_id."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
+        user_id = verify_session_token(auth_header[7:])
+        if not user_id:
+            return jsonify({"error": "Session expired or invalid, please log in again", "code": "AUTH_INVALID"}), 401
+        request.auth_user_id = user_id
+        return f(*args, **kwargs)
+    return wrapped
+
 # In-memory rate limiter dictionary: ip_address -> [timestamps]
 RATE_LIMIT_STORE = {}
 
@@ -36,12 +78,19 @@ def rate_limit(max_requests=15, window_seconds=60):
             # Filter out timestamps older than window
             timestamps = [t for t in timestamps if now - t < window_seconds]
             if len(timestamps) >= max_requests:
+                RATE_LIMIT_STORE[ip] = timestamps
                 return jsonify({
                     "error": "Rate limit exceeded. Please wait a moment before trying again.",
                     "code": "RATE_LIMITED"
                 }), 429
             timestamps.append(now)
             RATE_LIMIT_STORE[ip] = timestamps
+            # Opportunistically purge IPs with no recent activity so the dict
+            # doesn't grow unbounded over the life of the process.
+            if len(RATE_LIMIT_STORE) > 1000:
+                stale = [k for k, v in RATE_LIMIT_STORE.items() if not v or now - v[-1] > window_seconds]
+                for k in stale:
+                    RATE_LIMIT_STORE.pop(k, None)
             return f(*args, **kwargs)
         return wrapped
     return decorator
@@ -51,72 +100,88 @@ def rate_limit(max_requests=15, window_seconds=60):
 def index():
     return send_from_directory("../frontend", "index.html")
 
-# --- Auth & User Persona Endpoints ---
+# --- Auth Endpoints ---
 @app.route("/api/auth/personas", methods=["GET"])
 def get_personas():
+    """Public, non-sensitive listing used only to show which demo LPU IDs
+    exist for reviewers/testers on the login screen. No wallet/phone/vehicle
+    data is exposed here - that requires a real login."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-    SELECT u.*, w.balance as wallet_balance,
-           (SELECT category FROM vehicles WHERE user_id = u.id AND is_active = 1 LIMIT 1) as vehicle_category,
-           (SELECT model FROM vehicles WHERE user_id = u.id AND is_active = 1 LIMIT 1) as vehicle_model,
-           (SELECT plate_number FROM vehicles WHERE user_id = u.id AND is_active = 1 LIMIT 1) as vehicle_plate
-    FROM users u
-    LEFT JOIN wallets w ON u.id = w.user_id
-    ORDER BY u.is_teacher_priority DESC, u.created_at ASC
+    SELECT id, lpu_id, name, user_type, is_teacher_priority, department, avatar_url
+    FROM users
+    ORDER BY is_teacher_priority DESC, created_at ASC
     """)
     rows = cur.fetchall()
     conn.close()
     personas = [dict(row) for row in rows]
     return jsonify({"personas": personas})
 
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    data = request.json or {}
-    user_id = data.get("user_id")
-    lpu_id = data.get("lpu_id")
+def _build_user_dict(cur, user_row):
+    user_dict = dict(user_row)
+    del user_dict["password_hash"]
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    if user_id:
-        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    elif lpu_id:
-        cur.execute("SELECT * FROM users WHERE lpu_id = ?", (lpu_id,))
-    else:
-        # Default to student Aarav if nothing specified
-        cur.execute("SELECT * FROM users WHERE id = 'usr_student_aarav'")
-
-    user = cur.fetchone()
-    if not user:
-        conn.close()
-        return jsonify({"error": "User not found with provided LPU credentials"}), 404
-
-    # Fetch wallet
-    cur.execute("SELECT balance, currency FROM wallets WHERE user_id = ?", (user["id"],))
+    cur.execute("SELECT balance, currency FROM wallets WHERE user_id = ?", (user_row["id"],))
     wallet = cur.fetchone()
 
-    # Fetch emergency contacts count
-    cur.execute("SELECT COUNT(*) as count FROM emergency_contacts WHERE user_id = ?", (user["id"],))
+    cur.execute("SELECT COUNT(*) as count FROM emergency_contacts WHERE user_id = ?", (user_row["id"],))
     contacts_count = cur.fetchone()["count"]
 
-    # Fetch active vehicle if any
-    cur.execute("SELECT * FROM vehicles WHERE user_id = ? AND is_active = 1", (user["id"],))
+    cur.execute("SELECT * FROM vehicles WHERE user_id = ? AND is_active = 1", (user_row["id"],))
     vehicle = cur.fetchone()
 
-    conn.close()
-
-    user_dict = dict(user)
     user_dict["wallet_balance"] = wallet["balance"] if wallet else 0.0
     user_dict["has_emergency_contacts"] = contacts_count > 0
     user_dict["vehicle"] = dict(vehicle) if vehicle else None
+    return user_dict
 
+@app.route("/api/auth/login", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=60)
+def login():
+    data = request.json or {}
+    lpu_id = data.get("lpu_id")
+    password = data.get("password")
+
+    if not lpu_id or not password:
+        return jsonify({"error": "LPU ID and password are required"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE lpu_id = ?", (lpu_id,))
+    user = cur.fetchone()
+
+    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
+        conn.close()
+        return jsonify({"error": "Invalid LPU ID or password"}), 401
+
+    user_dict = _build_user_dict(cur, user)
+    conn.close()
+
+    token = generate_session_token(user["id"])
+    return jsonify({"user": user_dict, "token": token})
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def get_current_user():
+    """Resumes a session from a stored token (e.g. on page reload) without
+    requiring the password again."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (request.auth_user_id,))
+    user = cur.fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+    user_dict = _build_user_dict(cur, user)
+    conn.close()
     return jsonify({"user": user_dict})
 
 @app.route("/api/user/role", methods=["POST"])
+@require_auth
 def update_role():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     role = data.get("role")
 
     if role not in ("rider", "driver", "both"):
@@ -130,9 +195,10 @@ def update_role():
     return jsonify({"success": True, "role": role})
 
 @app.route("/api/user/vehicle", methods=["POST"])
+@require_auth
 def save_vehicle():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     category = data.get("category")
     model = data.get("model")
     plate_number = data.get("plate_number")
@@ -175,10 +241,9 @@ def save_vehicle():
 
 # --- Mandatory Trusted Emergency Contacts ---
 @app.route("/api/user/emergency-contacts", methods=["GET"])
+@require_auth
 def get_emergency_contacts():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+    user_id = request.auth_user_id
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -188,9 +253,10 @@ def get_emergency_contacts():
     return jsonify({"contacts": [dict(r) for r in rows]})
 
 @app.route("/api/user/emergency-contacts", methods=["POST"])
+@require_auth
 def add_emergency_contact():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     name = data.get("name")
     relationship = data.get("relationship", "Family/Friend")
     phone = data.get("phone")
@@ -225,9 +291,10 @@ def locate():
 
 # --- Ride Quotes & 100% Server-Side Fare Calculation ---
 @app.route("/api/rides/quote", methods=["POST"])
+@require_auth
 def get_ride_quote():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     pickup_key = data.get("pickup_key")
     drop_key = data.get("drop_key")
     scope = data.get("scope", "campus_hop") # 'campus_hop' or 'citylink'
@@ -291,10 +358,11 @@ def get_ride_quote():
 
 # --- Ride Booking with Peak-Time Zone Scoped Matching ---
 @app.route("/api/rides/book", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=20, window_seconds=60)
 def book_ride():
     data = request.json or {}
-    rider_id = data.get("user_id")
+    rider_id = request.auth_user_id
     pickup_key = data.get("pickup_key")
     drop_key = data.get("drop_key")
     service_type = data.get("service_type")
@@ -446,10 +514,9 @@ def book_ride():
 
 # --- Active Ride Telemetry & Status ---
 @app.route("/api/rides/active", methods=["GET"])
+@require_auth
 def get_active_ride():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+    user_id = request.auth_user_id
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -494,6 +561,7 @@ def get_active_ride():
 
 # --- Live Ride Telemetry Step Simulation ---
 @app.route("/api/rides/<ride_id>/telemetry-step", methods=["POST"])
+@require_auth
 def telemetry_step(ride_id):
     """
     Advances driver simulation smoothly:
@@ -509,6 +577,10 @@ def telemetry_step(ride_id):
     if not ride:
         conn.close()
         return jsonify({"error": "Ride not found"}), 404
+
+    if request.auth_user_id not in (ride["rider_id"], ride["driver_id"]):
+        conn.close()
+        return jsonify({"error": "You are not part of this ride"}), 403
 
     status = ride["status"]
     driver_id = ride["driver_id"]
@@ -566,6 +638,7 @@ def telemetry_step(ride_id):
 
 # --- Complete Ride & Server-Side Wallet Auto-Deduction ---
 @app.route("/api/rides/<ride_id>/complete", methods=["POST"])
+@require_auth
 def complete_ride(ride_id):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -575,6 +648,10 @@ def complete_ride(ride_id):
     if not ride:
         conn.close()
         return jsonify({"error": "Ride not found"}), 404
+
+    if request.auth_user_id not in (ride["rider_id"], ride["driver_id"]):
+        conn.close()
+        return jsonify({"error": "You are not part of this ride"}), 403
 
     if ride["status"] == "completed":
         conn.close()
@@ -626,14 +703,15 @@ def complete_ride(ride_id):
 
 # --- Mutual Ratings & Reviews ---
 @app.route("/api/rides/<ride_id>/rate", methods=["POST"])
+@require_auth
 def rate_ride(ride_id):
     data = request.json or {}
-    reviewer_id = data.get("reviewer_id")
+    reviewer_id = request.auth_user_id
     rating = int(data.get("rating", 5))
     tags = data.get("tags", "")
     comment = data.get("comment", "")
 
-    if not reviewer_id or not (1 <= rating <= 5):
+    if not (1 <= rating <= 5):
         return jsonify({"error": "Valid rating between 1 and 5 is required"}), 400
 
     conn = get_db_connection()
@@ -644,6 +722,10 @@ def rate_ride(ride_id):
     if not ride:
         conn.close()
         return jsonify({"error": "Ride not found"}), 404
+
+    if reviewer_id not in (ride["rider_id"], ride["driver_id"]):
+        conn.close()
+        return jsonify({"error": "You are not part of this ride"}), 403
 
     reviewee_id = ride["driver_id"] if reviewer_id == ride["rider_id"] else ride["rider_id"]
 
@@ -658,17 +740,15 @@ def rate_ride(ride_id):
 
 # --- SOS Emergency Alert System ---
 @app.route("/api/sos/trigger", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=10, window_seconds=60)
 def trigger_sos():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     ride_id = data.get("ride_id")
     lat = float(data.get("lat", 31.2536))
     lng = float(data.get("lng", 75.7037))
     location_name = data.get("location_name", "Near LPU Campus")
-
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -749,9 +829,10 @@ def get_shared_ride(share_token):
 
 # --- Driver Actions: Queue Acceptance & Future CityLink Routes ---
 @app.route("/api/driver/toggle-online", methods=["POST"])
+@require_auth
 def toggle_driver_online():
     data = request.json or {}
-    driver_id = data.get("driver_id")
+    driver_id = request.auth_user_id
     is_online = 1 if data.get("is_online", True) else 0
     zone = data.get("zone", "Zone-Central")
 
@@ -767,9 +848,9 @@ def toggle_driver_online():
     return jsonify({"success": True, "is_online": bool(is_online)})
 
 @app.route("/api/driver/requests", methods=["GET"])
+@require_auth
 def get_driver_requests():
     """Lists queued ride requests in the driver's zone, prioritizing teachers."""
-    driver_id = request.args.get("driver_id")
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -785,9 +866,10 @@ def get_driver_requests():
     return jsonify({"requests": [dict(r) for r in rows]})
 
 @app.route("/api/driver/accept", methods=["POST"])
+@require_auth
 def driver_accept_request():
     data = request.json or {}
-    driver_id = data.get("driver_id")
+    driver_id = request.auth_user_id
     ride_id = data.get("ride_id")
 
     conn = get_db_connection()
@@ -809,10 +891,9 @@ def driver_accept_request():
     return jsonify({"success": True, "ride_id": ride_id, "status": "arriving"})
 
 @app.route("/api/driver/earnings", methods=["GET"])
+@require_auth
 def get_driver_earnings():
-    driver_id = request.args.get("driver_id")
-    if not driver_id:
-        return jsonify({"error": "driver_id required"}), 400
+    driver_id = request.auth_user_id
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -851,8 +932,9 @@ def get_driver_earnings():
 # --- CityLink Scheduled Future Routes (Plan, Pin, Cockpit & Reset) ---
 @app.route("/api/driver/routes", methods=["GET"])
 @app.route("/api/routes/scheduled", methods=["GET"])
+@require_auth
 def get_scheduled_routes():
-    user_id = request.args.get("user_id")
+    user_id = request.auth_user_id
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -868,11 +950,13 @@ def get_scheduled_routes():
     routes = [dict(r) for r in cur.fetchall()]
 
     for r in routes:
-        # Fetch passenger manifest for each route
+        # Fetch passenger manifest for each route. This is a campus-wide browse
+        # listing (not gated to the route's host/passengers), so no contact PII
+        # (phone, LPU ID) is included here - only via the participant-gated
+        # /api/routes/<id>/live cockpit endpoint.
         cur.execute("""
         SELECT rb.id as booking_id, rb.seats, rb.fare_paid, rb.status as booking_status,
-               u.id as passenger_id, u.name as passenger_name, u.phone as passenger_phone,
-               u.avatar_url as passenger_avatar, u.lpu_id as passenger_lpu_id
+               u.id as passenger_id, u.name as passenger_name, u.avatar_url as passenger_avatar
         FROM route_bookings rb
         JOIN users u ON rb.rider_id = u.id
         WHERE rb.route_id = ? AND rb.status IN ('confirmed', 'in_progress')
@@ -886,9 +970,10 @@ def get_scheduled_routes():
 
 @app.route("/api/routes/plan", methods=["POST"])
 @app.route("/api/driver/routes", methods=["POST"])
+@require_auth
 def plan_future_route():
     data = request.json or {}
-    driver_id = data.get("driver_id")
+    driver_id = request.auth_user_id
     origin = data.get("origin", "LPU Uni-Mall Plaza")
     destination = data.get("destination")
     departure_time = data.get("departure_time")
@@ -940,9 +1025,10 @@ def plan_future_route():
     return jsonify({"success": True, "route_id": route_id, "status": "open", "total_seats": total_seats})
 
 @app.route("/api/routes/<route_id>/join", methods=["POST"])
+@require_auth
 def join_route(route_id):
     data = request.json or {}
-    rider_id = data.get("rider_id")
+    rider_id = request.auth_user_id
     seats = int(data.get("seats", 1))
 
     conn = get_db_connection()
@@ -1010,9 +1096,10 @@ def join_route(route_id):
 
 # --- During-Ride Cockpit Activation & Lifecycle ---
 @app.route("/api/routes/<route_id>/start", methods=["POST"])
+@require_auth
 def start_scheduled_route(route_id):
     """
-    Activates the During-Ride Cockpit Dashboard when confirmed by host/passenger.
+    Activates the During-Ride Cockpit Dashboard. Only the host driver may start it.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1022,6 +1109,10 @@ def start_scheduled_route(route_id):
     if not route:
         conn.close()
         return jsonify({"error": "Route not found"}), 404
+
+    if route["driver_id"] != request.auth_user_id:
+        conn.close()
+        return jsonify({"error": "Only the route host can start this trip"}), 403
 
     now = time.time()
     cur.execute("""
@@ -1040,9 +1131,11 @@ def start_scheduled_route(route_id):
     return jsonify({"success": True, "route_id": route_id, "status": "in_progress"})
 
 @app.route("/api/routes/<route_id>/live", methods=["GET"])
+@require_auth
 def get_live_cockpit(route_id):
     """
     Returns full telemetry, passenger manifest, and progress for During-Ride Dashboard.
+    Restricted to the host driver or a passenger who has actually booked a seat.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1060,6 +1153,15 @@ def get_live_cockpit(route_id):
     if not route:
         conn.close()
         return jsonify({"error": "Route not found"}), 404
+
+    if route["driver_id"] != request.auth_user_id:
+        cur.execute("""
+        SELECT id FROM route_bookings
+        WHERE route_id = ? AND rider_id = ? AND status IN ('confirmed', 'in_progress', 'completed')
+        """, (route_id, request.auth_user_id))
+        if not cur.fetchone():
+            conn.close()
+            return jsonify({"error": "You are not part of this route"}), 403
 
     route_dict = dict(route)
 
@@ -1087,6 +1189,7 @@ def get_live_cockpit(route_id):
     return jsonify({"cockpit": route_dict})
 
 @app.route("/api/routes/<route_id>/telemetry-step", methods=["POST"])
+@require_auth
 def route_telemetry_step(route_id):
     """Advances vehicle along scheduled route for the live cockpit."""
     conn = get_db_connection()
@@ -1097,6 +1200,15 @@ def route_telemetry_step(route_id):
     if not route or route["status"] != "in_progress":
         conn.close()
         return jsonify({"error": "Route is not active"}), 400
+
+    if route["driver_id"] != request.auth_user_id:
+        cur.execute("""
+        SELECT id FROM route_bookings
+        WHERE route_id = ? AND rider_id = ? AND status IN ('confirmed', 'in_progress', 'completed')
+        """, (route_id, request.auth_user_id))
+        if not cur.fetchone():
+            conn.close()
+            return jsonify({"error": "You are not part of this route"}), 403
 
     curr_lat = route["current_lat"] or route["origin_lat"]
     curr_lng = route["current_lng"] or route["origin_lng"]
@@ -1126,9 +1238,11 @@ def route_telemetry_step(route_id):
     })
 
 @app.route("/api/routes/<route_id>/complete", methods=["POST"])
+@require_auth
 def complete_scheduled_route(route_id):
     """
     Concludes scheduled ride, disburses earnings to host, and resets dashboard.
+    Only the host driver may conclude the trip and trigger payout.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1138,6 +1252,10 @@ def complete_scheduled_route(route_id):
     if not route:
         conn.close()
         return jsonify({"error": "Route not found"}), 404
+
+    if route["driver_id"] != request.auth_user_id:
+        conn.close()
+        return jsonify({"error": "Only the route host can complete this trip"}), 403
 
     now = time.time()
     driver_id = route["driver_id"]
@@ -1170,14 +1288,13 @@ def complete_scheduled_route(route_id):
     })
 
 @app.route("/api/user/active-session", methods=["GET"])
+@require_auth
 def get_user_active_session():
     """
     Detects if user is currently inside a during-ride cockpit (as host or passenger).
     Used for instant real-time sync and clean reset.
     """
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"active_session": None})
+    user_id = request.auth_user_id
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1219,10 +1336,9 @@ def get_user_active_session():
 
 # --- Server-Side Wallet Management ---
 @app.route("/api/wallet", methods=["GET"])
+@require_auth
 def get_wallet():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+    user_id = request.auth_user_id
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1243,13 +1359,14 @@ def get_wallet():
     })
 
 @app.route("/api/wallet/topup", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=10, window_seconds=60)
 def topup_wallet():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     amount = float(data.get("amount", 0.0))
 
-    if not user_id or amount <= 0:
+    if amount <= 0:
         return jsonify({"error": "Invalid topup amount. Must be greater than 0"}), 400
 
     if amount > 5000:
@@ -1277,25 +1394,27 @@ def topup_wallet():
 
 # --- Enhanced Payment Gateway Endpoints: UPI QR & Razorpay ---
 @app.route("/api/payments/upi/create-qr", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=15, window_seconds=60)
 def upi_create_qr():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     amount = float(data.get("amount", 100.0))
-    if not user_id or amount <= 0:
-        return jsonify({"error": "Invalid user_id or amount"}), 400
+    if amount <= 0:
+        return jsonify({"error": "Invalid amount"}), 400
     res = generate_upi_qr(user_id, amount)
     return jsonify(res)
 
 @app.route("/api/payments/upi/confirm", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=15, window_seconds=60)
 def upi_confirm():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     amount = float(data.get("amount", 0.0))
     reference_id = data.get("reference_id", f"UPI_{int(time.time())}")
-    if not user_id or amount <= 0:
-        return jsonify({"error": "Invalid user_id or amount"}), 400
+    if amount <= 0:
+        return jsonify({"error": "Invalid amount"}), 400
     try:
         result = credit_wallet_after_payment(user_id, amount, "upi", reference_id)
         return jsonify(result)
@@ -1303,27 +1422,29 @@ def upi_confirm():
         return jsonify({"error": str(e)}), 400
 
 @app.route("/api/payments/razorpay/create-order", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=15, window_seconds=60)
 def razorpay_create():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     amount = float(data.get("amount", 100.0))
-    if not user_id or amount <= 0:
-        return jsonify({"error": "Invalid user_id or amount"}), 400
+    if amount <= 0:
+        return jsonify({"error": "Invalid amount"}), 400
     res = create_razorpay_order(user_id, amount)
     return jsonify(res)
 
 @app.route("/api/payments/razorpay/verify", methods=["POST"])
+@require_auth
 @rate_limit(max_requests=15, window_seconds=60)
 def razorpay_verify():
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id = request.auth_user_id
     order_id = data.get("order_id")
     payment_id = data.get("payment_id", f"pay_{uuid.uuid4().hex[:10]}")
     signature = data.get("signature", "demo_signature_valid")
     amount = float(data.get("amount", 0.0))
 
-    if not user_id or not order_id or amount <= 0:
+    if not order_id or amount <= 0:
         return jsonify({"error": "Invalid payment verification parameters"}), 400
 
     is_valid = verify_razorpay_payment(order_id, payment_id, signature)

@@ -11,6 +11,9 @@ services:
       - "5000:5000"
     environment:
       - PORT=5000
+      # Override with a real random value for any non-local deployment -
+      # without it, sessions are invalidated whenever the container restarts.
+      - SECRET_KEY=${SECRET_KEY:-dev_only_change_me_in_production}
       - CAMPUSGO_UPI_VPA=campusgo.lpu@okhdfcbank
       - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-rzp_test_campusgo_demo}
       - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-demo_secret_campusgo_2026}

@@ -7,7 +7,7 @@
 // Global Application State
 const AppState = {
   currentUser: null,
-  personas: [],
+  authToken: null,
   landmarks: {},
   selectedScope: 'campus_hop', // 'campus_hop' | 'citylink'
   selectedService: 'bike',     // 'bike' | 'scooty' | 'car'
@@ -31,10 +31,159 @@ document.addEventListener('DOMContentLoaded', async () => {
   initMaps();
   initializeCustomLocationDropdowns();
   await loadLandmarks();
-  await loadPersonas();
   initEventHandlers();
-  await checkActiveRide();
+  initAuthHandlers();
+  await tryResumeSession();
 });
+
+// --- Authentication ---
+function getStoredToken() {
+  try {
+    return localStorage.getItem('campusgo_token');
+  } catch (err) {
+    return null;
+  }
+}
+
+function storeToken(token) {
+  try {
+    if (token) {
+      localStorage.setItem('campusgo_token', token);
+    } else {
+      localStorage.removeItem('campusgo_token');
+    }
+  } catch (err) {
+    // localStorage unavailable (private mode etc.) - session just won't persist across reloads
+  }
+}
+
+// Wraps fetch() to attach the bearer session token to every authenticated API call.
+async function apiFetch(url, options = {}) {
+  const headers = Object.assign({}, options.headers || {});
+  if (AppState.authToken) {
+    headers['Authorization'] = `Bearer ${AppState.authToken}`;
+  }
+  const res = await fetch(url, Object.assign({}, options, { headers }));
+  if (res.status === 401) {
+    handleLogout();
+  }
+  return res;
+}
+
+function showLoginScreen() {
+  document.getElementById('login-screen').classList.remove('hidden');
+}
+
+function hideLoginScreen() {
+  document.getElementById('login-screen').classList.add('hidden');
+}
+
+async function tryResumeSession() {
+  const token = getStoredToken();
+  if (!token) {
+    showLoginScreen();
+    return;
+  }
+  AppState.authToken = token;
+  try {
+    const res = await apiFetch('/api/auth/me');
+    if (!res.ok) {
+      handleLogout();
+      return;
+    }
+    const data = await res.json();
+    AppState.currentUser = data.user;
+    await onLoginSuccess();
+  } catch (err) {
+    console.error('Failed to resume session:', err);
+    handleLogout();
+  }
+}
+
+async function handleLogin() {
+  const lpuId = document.getElementById('login-lpu-id-input').value.trim();
+  const password = document.getElementById('login-password-input').value;
+  const errorEl = document.getElementById('login-error-text');
+  const btn = document.getElementById('login-submit-btn');
+  errorEl.classList.add('hidden');
+
+  if (!lpuId || !password) {
+    errorEl.textContent = 'Enter your LPU ID and password.';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Signing In...';
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lpu_id: lpuId, password })
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      errorEl.textContent = data.error || 'Login failed';
+      errorEl.classList.remove('hidden');
+      return;
+    }
+
+    AppState.authToken = data.token;
+    AppState.currentUser = data.user;
+    storeToken(data.token);
+    document.getElementById('login-password-input').value = '';
+    await onLoginSuccess();
+  } catch (err) {
+    console.error('Login failed:', err);
+    errorEl.textContent = 'Could not reach the server. Please try again.';
+    errorEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Log In';
+  }
+}
+
+function handleLogout() {
+  AppState.authToken = null;
+  AppState.currentUser = null;
+  AppState.activeRide = null;
+  AppState.activeCockpitRouteId = null;
+  storeToken(null);
+  showLoginScreen();
+}
+
+async function onLoginSuccess() {
+  hideLoginScreen();
+  updateUserUI();
+  await loadEmergencyContacts();
+  await loadDriverEarnings();
+  fetchFareQuotes();
+  await checkActiveRide();
+}
+
+// Re-fetches the current user's own record (wallet balance, role, etc.)
+// without requiring the password again - used after actions that change it.
+async function refreshCurrentUser() {
+  try {
+    const res = await apiFetch('/api/auth/me');
+    if (!res.ok) return;
+    const data = await res.json();
+    AppState.currentUser = data.user;
+    updateUserUI();
+  } catch (err) {
+    console.error('Failed to refresh current user:', err);
+  }
+}
+
+function initAuthHandlers() {
+  document.getElementById('login-submit-btn').addEventListener('click', handleLogin);
+  document.getElementById('login-password-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') handleLogin();
+  });
+  document.getElementById('logout-btn').addEventListener('click', handleLogout);
+}
 
 window.initializeCustomLocationDropdowns = initializeCustomLocationDropdowns;
 window.syncCustomLocationDropdowns = syncCustomLocationDropdowns;
@@ -373,11 +522,10 @@ async function fetchFareQuotes() {
   renderMapLandmarks();
 
   try {
-    const res = await fetch('/api/rides/quote', {
+    const res = await apiFetch('/api/rides/quote', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         pickup_key: pickupKey,
         drop_key: dropKey,
         scope: AppState.selectedScope
@@ -440,61 +588,6 @@ function updateServicesDisplay(data) {
   }
 }
 
-// --- Load Personas & Auth ---
-async function loadPersonas() {
-  try {
-    const res = await fetch('/api/auth/personas');
-    const data = await res.json();
-    AppState.personas = data.personas;
-
-    // Render persona selector in profile
-    const listEl = document.getElementById('persona-selector-list');
-    listEl.innerHTML = '';
-
-    AppState.personas.forEach(p => {
-      const chip = document.createElement('div');
-      chip.className = `persona-chip ${AppState.currentUser && AppState.currentUser.id === p.id ? 'active' : ''}`;
-      chip.innerHTML = `
-        <img src="${p.avatar_url || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120'}" alt="${p.name}">
-        <div>
-          <span class="chip-name">${p.name} ${p.is_teacher_priority ? '⭐' : ''}</span>
-          <span class="chip-role">${p.user_type.toUpperCase()} • ${p.role.toUpperCase()} (₹${p.wallet_balance})</span>
-        </div>
-      `;
-      chip.onclick = () => switchPersona(p.id);
-      listEl.appendChild(chip);
-    });
-
-    // Default to Aarav Mehta (Student Rider) or Raman Sharma (Teacher)
-    if (!AppState.currentUser) {
-      await switchPersona('usr_student_aarav');
-    }
-  } catch (err) {
-    console.error('Failed to load personas:', err);
-  }
-}
-
-// --- Switch Persona Handler ---
-async function switchPersona(userId) {
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: userId })
-    });
-
-    const data = await res.json();
-    AppState.currentUser = data.user;
-    updateUserUI();
-    await loadEmergencyContacts();
-    await loadDriverEarnings();
-    fetchFareQuotes();
-    await checkActiveRide();
-  } catch (err) {
-    console.error('Failed to login persona:', err);
-  }
-}
-
 // --- Update UI with Current User Context ---
 function updateUserUI() {
   const u = AppState.currentUser;
@@ -517,6 +610,7 @@ function updateUserUI() {
   document.getElementById('profile-card-avatar').src = u.avatar_url;
   document.getElementById('profile-card-department').textContent = u.department || 'Lovely Professional University';
   document.getElementById('profile-card-id').textContent = `LPU ID: ${u.lpu_id}`;
+  document.getElementById('profile-account-lpu').textContent = `Signed in as ${u.lpu_id} (${u.email})`;
 
   // Role Buttons
   document.querySelectorAll('.role-pill-btn').forEach(btn => {
@@ -540,7 +634,7 @@ function updateUserUI() {
 async function loadEmergencyContacts() {
   if (!AppState.currentUser) return;
   try {
-    const res = await fetch(`/api/user/emergency-contacts?user_id=${AppState.currentUser.id}`);
+    const res = await apiFetch('/api/user/emergency-contacts');
     const data = await res.json();
     const container = document.getElementById('emergency-contacts-list');
     container.innerHTML = '';
@@ -567,7 +661,7 @@ async function checkActiveRide() {
   if (!AppState.currentUser) return;
   try {
     // 1. Check for active scheduled carpool during-ride cockpit
-    const sessRes = await fetch(`/api/user/active-session?user_id=${AppState.currentUser.id}`);
+    const sessRes = await apiFetch('/api/user/active-session');
     const sessData = await sessRes.json();
 
     if (sessData.active_session && sessData.session_type === 'scheduled_route') {
@@ -579,7 +673,7 @@ async function checkActiveRide() {
     }
 
     // 2. Check for on-demand active ride
-    const res = await fetch(`/api/rides/active?user_id=${AppState.currentUser.id}`);
+    const res = await apiFetch('/api/rides/active');
     const data = await res.json();
 
     if (data.active_ride) {
@@ -620,11 +714,10 @@ async function handleBookRide() {
   document.getElementById('find-ride-text').textContent = 'Matching...';
 
   try {
-    const res = await fetch('/api/rides/book', {
+    const res = await apiFetch('/api/rides/book', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         pickup_key: AppState.pickupKey,
         drop_key: AppState.dropKey,
         service_type: AppState.selectedService,
@@ -681,7 +774,7 @@ async function loadActivityHistory() {
 
   const container = document.getElementById('transactions-list');
   try {
-    const res = await fetch(`/api/wallet?user_id=${AppState.currentUser.id}`);
+    const res = await apiFetch('/api/wallet');
     const data = await res.json();
     container.innerHTML = '';
 
@@ -795,7 +888,7 @@ function renderActiveRide(ride) {
 async function advanceTelemetryStep() {
   if (AppState.activeCockpitRouteId) {
     try {
-      const res = await fetch(`/api/routes/${AppState.activeCockpitRouteId}/telemetry-step`, { method: 'POST' });
+      const res = await apiFetch(`/api/routes/${AppState.activeCockpitRouteId}/telemetry-step`, { method: 'POST' });
       const data = await res.json();
       if (data.current_lat && AppState.activeMarkers.car) {
         AppState.activeMarkers.car.setLatLng([data.current_lat, data.current_lng]);
@@ -809,7 +902,7 @@ async function advanceTelemetryStep() {
 
   if (AppState.activeRide) {
     try {
-      const res = await fetch(`/api/rides/${AppState.activeRide.id}/telemetry-step`, { method: 'POST' });
+      const res = await apiFetch(`/api/rides/${AppState.activeRide.id}/telemetry-step`, { method: 'POST' });
       const data = await res.json();
       if (data.status) {
         AppState.activeRide.status = data.status;
@@ -831,7 +924,7 @@ async function handleCompleteRide() {
   // Case 1: Scheduled Carpool Cockpit
   if (AppState.activeCockpitRouteId) {
     try {
-      const res = await fetch(`/api/routes/${AppState.activeCockpitRouteId}/complete`, { method: 'POST' });
+      const res = await apiFetch(`/api/routes/${AppState.activeCockpitRouteId}/complete`, { method: 'POST' });
       const data = await res.json();
       if (data.success) {
         alert(`🏁 Carpool trip completed! Host payout of ₹${data.driver_payout} disbursed.\n\nDashboard is now reset to clean idle state for all passengers.`);
@@ -842,7 +935,7 @@ async function handleCompleteRide() {
         switchView('view-ride');
 
         // Refresh user context & scheduled routes
-        await switchPersona(AppState.currentUser.id);
+        await refreshCurrentUser();
         await loadCityLinkRoutes();
       }
     } catch (err) {
@@ -854,7 +947,7 @@ async function handleCompleteRide() {
   // Case 2: On-demand Ride
   if (AppState.activeRide) {
     try {
-      const res = await fetch(`/api/rides/${AppState.activeRide.id}/complete`, { method: 'POST' });
+      const res = await apiFetch(`/api/rides/${AppState.activeRide.id}/complete`, { method: 'POST' });
       const data = await res.json();
       if (data.success) {
         openModal('modal-rating');
@@ -876,11 +969,10 @@ async function handleCompleteRide() {
 async function submitRating() {
   if (!AppState.activeRide) return;
   try {
-    await fetch(`/api/rides/${AppState.activeRide.id}/rate`, {
+    await apiFetch(`/api/rides/${AppState.activeRide.id}/rate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        reviewer_id: AppState.currentUser.id,
         rating: 5,
         tags: 'Safe Ride, Punctual, Verified LPU',
         comment: 'Great campus ride!'
@@ -902,11 +994,10 @@ async function handleTriggerSOS() {
   const p = AppState.landmarks[AppState.pickupKey] || { lat: 31.2536, lng: 75.7037, name: 'LPU Campus' };
 
   try {
-    const res = await fetch('/api/sos/trigger', {
+    const res = await apiFetch('/api/sos/trigger', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         ride_id: AppState.activeRide ? AppState.activeRide.id : null,
         lat: p.lat,
         lng: p.lng,
@@ -966,13 +1057,10 @@ async function fetchUpiQr(amount) {
   document.getElementById('rzp-pay-amount-label').textContent = amount;
 
   try {
-    const res = await fetch('/api/payments/upi/create-qr', {
+    const res = await apiFetch('/api/payments/upi/create-qr', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: AppState.currentUser.id,
-        amount: amount
-      })
+      body: JSON.stringify({ amount: amount })
     });
 
     const data = await res.json();
@@ -996,11 +1084,10 @@ async function handleConfirmUpiPayment() {
   const amount = parseFloat(document.getElementById('topup-custom-input').value) || 100;
 
   try {
-    const res = await fetch('/api/payments/upi/confirm', {
+    const res = await apiFetch('/api/payments/upi/confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         amount: amount,
         reference_id: currentUpiRef || `UPI_${Date.now()}`
       })
@@ -1027,13 +1114,10 @@ async function handleRazorpayCheckout() {
 
   try {
     // 1. Create order
-    const orderRes = await fetch('/api/payments/razorpay/create-order', {
+    const orderRes = await apiFetch('/api/payments/razorpay/create-order', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: AppState.currentUser.id,
-        amount: amount
-      })
+      body: JSON.stringify({ amount: amount })
     });
     const orderData = await orderRes.json();
 
@@ -1043,11 +1127,10 @@ async function handleRazorpayCheckout() {
     }
 
     // 2. Verify payment (simulated / test mode)
-    const verifyRes = await fetch('/api/payments/razorpay/verify', {
+    const verifyRes = await apiFetch('/api/payments/razorpay/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         order_id: orderData.order_id,
         payment_id: `pay_${Date.now()}`,
         signature: 'demo_signature_valid',
@@ -1074,7 +1157,7 @@ async function handleRazorpayCheckout() {
 async function loadDriverEarnings() {
   if (!AppState.currentUser) return;
   try {
-    const res = await fetch(`/api/driver/earnings?driver_id=${AppState.currentUser.id}`);
+    const res = await apiFetch('/api/driver/earnings');
     const data = await res.json();
     document.getElementById('driver-total-earned').textContent = data.total_earnings.toFixed(2);
     document.getElementById('driver-total-trips').textContent = data.total_trips;
@@ -1088,7 +1171,7 @@ async function loadDriverEarnings() {
 async function loadCityLinkRoutes() {
   if (!AppState.currentUser) return;
   try {
-    const res = await fetch(`/api/routes/scheduled?user_id=${AppState.currentUser.id}`);
+    const res = await apiFetch('/api/routes/scheduled');
     const data = await res.json();
     const routes = data.routes || [];
 
@@ -1224,13 +1307,10 @@ async function joinCityLinkRoute(routeId, seats, totalFare) {
   }
 
   try {
-    const res = await fetch(`/api/routes/${routeId}/join`, {
+    const res = await apiFetch(`/api/routes/${routeId}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rider_id: AppState.currentUser.id,
-        seats: seats
-      })
+      body: JSON.stringify({ seats: seats })
     });
 
     const data = await res.json();
@@ -1263,11 +1343,10 @@ async function postCityLinkRoute() {
   const notes = document.getElementById('route-notes-input').value;
 
   try {
-    const res = await fetch('/api/routes/plan', {
+    const res = await apiFetch('/api/routes/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        driver_id: AppState.currentUser.id,
         origin,
         destination,
         departure_time,
@@ -1293,7 +1372,7 @@ AppState.activeCockpitRouteId = null;
 
 async function startConfirmedRoute(routeId) {
   try {
-    const res = await fetch(`/api/routes/${routeId}/start`, { method: 'POST' });
+    const res = await apiFetch(`/api/routes/${routeId}/start`, { method: 'POST' });
     const data = await res.json();
     if (data.success) {
       await openDuringRideCockpit(routeId);
@@ -1305,7 +1384,7 @@ async function startConfirmedRoute(routeId) {
 
 async function openDuringRideCockpit(routeId) {
   try {
-    const res = await fetch(`/api/routes/${routeId}/live`);
+    const res = await apiFetch(`/api/routes/${routeId}/live`);
     const data = await res.json();
     if (!data.cockpit) return;
 
@@ -1594,11 +1673,10 @@ function initEventHandlers() {
     const phone = document.getElementById('emg-phone-input').value;
     if (!name || !phone) return;
 
-    await fetch('/api/user/emergency-contacts', {
+    await apiFetch('/api/user/emergency-contacts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user_id: AppState.currentUser.id,
         name,
         relationship,
         phone,
@@ -1613,13 +1691,10 @@ function initEventHandlers() {
   document.querySelectorAll('.role-pill-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       const newRole = btn.dataset.role;
-      await fetch('/api/user/role', {
+      await apiFetch('/api/user/role', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_id: AppState.currentUser.id,
-          role: newRole
-        })
+        body: JSON.stringify({ role: newRole })
       });
       AppState.currentUser.role = newRole;
       updateUserUI();
