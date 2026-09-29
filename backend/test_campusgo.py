@@ -1,264 +1,129 @@
 import unittest
-import json
-import time
-from app import app, RATE_LIMIT_STORE
-from seed_data import seed, DEMO_PASSWORD
-from database import get_db_connection
 
-# LPU IDs for each seeded persona, used to log in and obtain a session token.
-LPU_IDS = {
-    "usr_teacher_raman": "FAC-10822",
-    "usr_student_aarav": "12204592",
-    "usr_student_kavya": "12301982",
-    "usr_driver_simran": "12108843",
-    "usr_driver_vikram": "12019934",
-    "usr_driver_harpreet": "11904421",
-}
+from test_support import ClientMixin, DEMO_PASSWORD, LPU_IDS
 
-class TestCampusGo(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        seed()
-        cls.client = app.test_client()
 
-    def auth_headers(self, user_id):
-        """Logs in as the given seeded persona and returns Authorization headers.
-        Clears the login rate-limit bucket first since the test suite legitimately
-        logs in as many different personas back-to-back from the same test-client
-        'IP', which the production rate limit (10 logins/min/IP) isn't meant to gate."""
-        RATE_LIMIT_STORE.clear()
-        res = self.client.post("/api/auth/login", json={
-            "lpu_id": LPU_IDS[user_id],
-            "password": DEMO_PASSWORD
-        })
-        token = res.get_json()["token"]
-        return {"Authorization": f"Bearer {token}"}
-
+class TestCampusGo(ClientMixin, unittest.TestCase):
     def test_00_login_requires_correct_password(self):
-        """Verify login is rejected without valid LPU ID + password, and a protected
-        endpoint can't be reached without a session token."""
-        bad_res = self.client.post("/api/auth/login", json={
-            "lpu_id": LPU_IDS["usr_student_aarav"],
-            "password": "wrong_password"
-        })
-        self.assertEqual(bad_res.status_code, 401)
+        bad = self.client.post("/api/auth/login", json={"lpu_id": LPU_IDS["usr_student_aarav"], "password": "wrong"})
+        self.assertEqual(bad.status_code, 401)
+        self.assertEqual(self.client.get("/api/wallet").status_code, 401)
 
-        unauth_res = self.client.get("/api/wallet")
-        self.assertEqual(unauth_res.status_code, 401)
-
-    def test_01_personas_and_teacher_badge(self):
-        """Verify the public personas listing exposes only non-sensitive fields,
-        and that the full login response carries the teacher verification badge & priority flag."""
-        res = self.client.get("/api/auth/personas")
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        personas = data["personas"]
-        self.assertGreater(len(personas), 0)
-
-        teacher = next(p for p in personas if p["id"] == "usr_teacher_raman")
-        self.assertEqual(teacher["user_type"], "teacher")
-        self.assertEqual(teacher["is_teacher_priority"], 1)
-        self.assertNotIn("wallet_balance", teacher)
-        self.assertNotIn("phone", teacher)
-
-        login_res = self.client.post("/api/auth/login", json={
-            "lpu_id": LPU_IDS["usr_teacher_raman"],
-            "password": DEMO_PASSWORD
-        })
-        teacher_user = login_res.get_json()["user"]
-        self.assertEqual(teacher_user["is_verified"], 1)
-        self.assertNotIn("password_hash", teacher_user)
+    def test_01_login_returns_teacher_badge_without_password_hash(self):
+        res = self.client.post("/api/auth/login", json={"lpu_id": LPU_IDS["usr_teacher_raman"], "password": DEMO_PASSWORD})
+        user = res.get_json()["user"]
+        self.assertEqual(user["is_teacher_priority"], 1)
+        self.assertNotIn("password_hash", user)
 
     def test_02_server_side_fare_quotes(self):
-        """Verify 100% server-side fare calculation: Flat rates for Campus Hop and dynamic for CityLink."""
         headers = self.auth_headers("usr_student_aarav")
-        # Campus Hop: Uni-Mall to Block 34
         res = self.client.post("/api/rides/quote", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "block_34",
-            "scope": "campus_hop"
-        })
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        quotes = data["quotes"]
+            "pickup_key": "uni_mall", "drop_key": "block_34", "scope": "campus_hop"})
+        quotes = res.get_json()["quotes"]
+        self.assertEqual((quotes["bike"]["total_fare"], quotes["scooty"]["total_fare"], quotes["car"]["total_fare"]),
+                         (15.0, 20.0, 35.0))
 
-        # Strict flat rates
-        self.assertEqual(quotes["bike"]["total_fare"], 15.0)
-        self.assertEqual(quotes["scooty"]["total_fare"], 20.0)
-        self.assertEqual(quotes["car"]["total_fare"], 35.0)
+        city = self.client.post("/api/rides/quote", headers=headers, json={
+            "pickup_key": "uni_mall", "drop_key": "chandigarh_isbt_43", "scope": "citylink"})
+        self.assertEqual(city.status_code, 200)
+        self.assertGreater(city.get_json()["quotes"]["car"]["total_fare"], 1000.0)
 
-        # CityLink: Uni-Mall to Jalandhar City Bus Stand
-        res_city = self.client.post("/api/rides/quote", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "jalandhar_bus_stand",
-            "scope": "citylink"
-        })
-        self.assertEqual(res_city.status_code, 200)
-        data_city = res_city.get_json()
-        quotes_city = data_city["quotes"]
-        self.assertGreater(quotes_city["car"]["total_fare"], 100.0)
-
-    def test_03_wallet_validation_blocks_insufficient_funds(self):
-        """Verify server strictly blocks booking if wallet balance is below fare."""
-        headers = self.auth_headers("usr_student_kavya")
-        # Kavya Patel has initial balance of ₹10.0
-        # Attempt to book a ₹20 scooty ride
-        res = self.client.post("/api/rides/book", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "block_34",
-            "service_type": "scooty",
-            "scope": "campus_hop"
-        })
+    def test_03_insufficient_balance_then_topup_then_book(self):
+        headers = self.auth_headers("usr_student_kavya")  # starts with ₹10
+        trip = {"pickup_key": "uni_mall", "drop_key": "block_34", "service_type": "scooty", "scope": "campus_hop"}
+        res = self.client.post("/api/rides/book", headers=headers, json=trip)
         self.assertEqual(res.status_code, 402)
-        err = res.get_json()
-        self.assertEqual(err["code"], "INSUFFICIENT_WALLET_BALANCE")
-        self.assertGreater(err["deficit"], 0)
+        self.assertEqual(res.get_json()["code"], "INSUFFICIENT_WALLET_BALANCE")
 
-        # Top-up Kavya's wallet by ₹100
-        topup_res = self.client.post("/api/wallet/topup", headers=headers, json={
-            "amount": 100.0
-        })
-        self.assertEqual(topup_res.status_code, 200)
-        topup_data = topup_res.get_json()
-        self.assertEqual(topup_data["new_balance"], 110.0)
+        self.assertEqual(self.topup_demo(headers, 100).get_json()["new_balance"], 110.0)
 
-        # Re-attempt booking -> Should now succeed!
-        book_res = self.client.post("/api/rides/book", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "block_34",
-            "service_type": "scooty",
-            "scope": "campus_hop"
-        })
-        self.assertEqual(book_res.status_code, 200)
-        book_data = book_res.get_json()
-        self.assertIn(book_data["status"], ("matched", "arriving", "queued"))
-        ride_id = book_data["ride_id"]
+        book = self.client.post("/api/rides/book", headers=headers, json=trip)
+        self.assertEqual(book.status_code, 200)
+        self.assertEqual(book.get_json()["wallet_balance"], 90.0)  # fare held at booking
+        cancel = self.client.post(f"/api/rides/{book.get_json()['ride_id']}/cancel", headers=headers)
+        self.assertEqual(cancel.get_json()["wallet_balance"], 110.0)  # refunded in full
 
-        # Clean up ride for subsequent tests
-        conn = get_db_connection()
-        conn.execute("UPDATE rides SET status = 'cancelled' WHERE id = ?", (ride_id,))
-        conn.commit()
-        conn.close()
-
-    def test_04_teacher_priority_matching(self):
-        """Verify that teacher rides receive priority matching flag."""
+    def test_04_teacher_priority_flag(self):
         headers = self.auth_headers("usr_teacher_raman")
         res = self.client.post("/api/rides/book", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "block_34",
-            "service_type": "car",
-            "scope": "campus_hop"
-        })
+            "pickup_key": "uni_mall", "drop_key": "block_34", "service_type": "car", "scope": "campus_hop"})
         self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        self.assertTrue(data["is_priority"])
+        self.assertTrue(res.get_json()["is_priority"])
+        self.client.post(f"/api/rides/{res.get_json()['ride_id']}/cancel", headers=headers)
 
-        # Clean up ride
-        ride_id = data["ride_id"]
-        conn = get_db_connection()
-        conn.execute("UPDATE rides SET status = 'cancelled' WHERE id = ?", (ride_id,))
-        conn.commit()
-        conn.close()
-
-    def test_05_active_ride_completion_and_wallet_deduction(self):
-        """Verify ride lifecycle from booking -> telemetry step -> auto-deduction on completion."""
-        headers = self.auth_headers("usr_student_aarav")
-        # 1. Aarav books bike ride
-        res = self.client.post("/api/rides/book", headers=headers, json={
-            "pickup_key": "uni_mall",
-            "drop_key": "block_34",
-            "service_type": "bike",
-            "scope": "campus_hop"
-        })
+    def test_05_ride_lifecycle_pays_driver_and_rating_once(self):
+        rider = self.auth_headers("usr_student_aarav")
+        before = self.balance(rider)
+        res = self.client.post("/api/rides/book", headers=rider, json={
+            "pickup_key": "uni_mall", "drop_key": "block_34", "service_type": "bike", "scope": "campus_hop"})
         self.assertEqual(res.status_code, 200)
-        ride_data = res.get_json()
-        ride_id = ride_data["ride_id"]
+        ride_id = res.get_json()["ride_id"]
+        self.assertEqual(self.balance(rider), before - 15.0)
 
-        # Fetch Aarav wallet before completion
-        wallet_res = self.client.get("/api/wallet", headers=headers)
-        bal_before = wallet_res.get_json()["balance"]
+        # Can't complete before pickup, and can't rate before completion.
+        self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)
+        self.assertEqual(self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 5}).status_code, 409)
+        step = {}
+        for _ in range(20):
+            step = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=rider).get_json()
+            if step["status"] == "in_progress":
+                break
+        self.assertEqual(step["status"], "in_progress")
 
-        # 2. Advance telemetry
-        step_res = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=headers)
-        self.assertEqual(step_res.status_code, 200)
+        comp = self.client.post(f"/api/rides/{ride_id}/complete", headers=rider)
+        self.assertEqual(comp.status_code, 200)
+        self.assertEqual(comp.get_json()["driver_payout"], 13.5)
+        self.assertEqual(self.balance(rider), before - 15.0)  # no second charge
+        self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)
 
-        # 3. Conclude ride
-        comp_res = self.client.post(f"/api/rides/{ride_id}/complete", headers=headers)
-        self.assertEqual(comp_res.status_code, 200)
-        comp_data = comp_res.get_json()
-        self.assertTrue(comp_data["success"])
+        rate = self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 4, "tags": "Punctual"})
+        self.assertEqual(rate.status_code, 200)
+        again = self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 1})
+        self.assertEqual(again.status_code, 409)
 
-        # Check that rider wallet was auto-deducted
-        wallet_res_after = self.client.get("/api/wallet", headers=headers)
-        bal_after = wallet_res_after.get_json()["balance"]
-        self.assertEqual(bal_after, bal_before - 15.0)
-
-        # Rate the ride
-        rate_res = self.client.post(f"/api/rides/{ride_id}/rate", headers=headers, json={
-            "rating": 5,
-            "tags": "Punctual,Safe Riding,Clean Helmet",
-            "comment": "Super smooth ride from Uni-Mall to Block 34!"
-        })
-        self.assertEqual(rate_res.status_code, 200)
-
-    def test_06_sos_emergency_dispatch(self):
-        """Verify persistent SOS button triggers emergency dispatch to trusted contacts and campus security."""
+    def test_06_sos_reports_delivery_honestly(self):
         headers = self.auth_headers("usr_student_aarav")
         res = self.client.post("/api/sos/trigger", headers=headers, json={
-            "lat": 31.2535,
-            "lng": 75.7038,
-            "location_name": "Uni-Mall Student Plaza"
-        })
+            "lat": 31.2535, "lng": 75.7038, "location_name": "Uni-Mall Student Plaza"})
         self.assertEqual(res.status_code, 200)
         data = res.get_json()
-        self.assertEqual(data["status"], "DISPATCHED")
         self.assertGreater(len(data["contacts_notified"]), 0)
-        self.assertIn("Block 30", data["campus_security_hotline"])
+        self.assertTrue(all(c["delivery"]["status"] == "not_sent" for c in data["contacts_notified"]))
+        self.assertEqual(data["campus_security_dispatch"]["status"], "not_connected")
 
-    def test_07_driver_actions_and_scheduled_routes(self):
-        """Verify driver toggle, earnings dashboard, and posting CityLink scheduled carpool."""
-        headers = self.auth_headers("usr_driver_vikram")
-        # Driver earnings
-        res = self.client.get("/api/driver/earnings", headers=headers)
-        self.assertEqual(res.status_code, 200)
-        earnings = res.get_json()
-        self.assertIn("total_earnings", earnings)
-
-        # Post CityLink route
-        route_res = self.client.post("/api/driver/routes", headers=headers, json={
-            "destination": "Rama Mandi Chowk",
-            "departure_time": "19:00 Today",
-            "available_seats": 1,
-            "price_per_seat": 45.0,
-            "notes": "Direct commute via GT Road"
-        })
-        self.assertEqual(route_res.status_code, 200)
-        route_id = route_res.get_json()["route_id"]
-
-        # List routes
-        list_res = self.client.get("/api/driver/routes", headers=headers)
-        routes = list_res.get_json()["routes"]
-        found = any(r["id"] == route_id for r in routes)
-        self.assertTrue(found)
+    def test_07_driver_posts_route_to_chandigarh(self):
+        headers = self.auth_headers("usr_driver_harpreet")
+        res = self.client.post("/api/routes/plan", headers=headers, json={
+            "origin": "Uni-Mall & Student Plaza", "destination": "Chandigarh ISBT Sector 43",
+            "departure_time": "19:00 Today", "total_seats": 3, "price_per_seat": 250})
+        self.assertEqual(res.status_code, 200, res.get_json())
+        route_id = res.get_json()["route_id"]
+        routes = self.client.get("/api/routes/scheduled", headers=headers).get_json()["routes"]
+        listed = next(r for r in routes if r["id"] == route_id)
+        self.assertTrue(listed["is_host"])
+        self.assertNotIn("driver_phone", listed)
 
     def test_08_cannot_act_as_another_user(self):
-        """Verify one logged-in user cannot spoof another user's identity via body fields."""
         headers = self.auth_headers("usr_student_kavya")
-        contacts_res = self.client.get("/api/user/emergency-contacts", headers=headers)
-        kavya_contact_phones = {c["phone"] for c in contacts_res.get_json()["contacts"]}
+        own = {c["phone"] for c in self.client.get("/api/user/emergency-contacts", headers=headers).get_json()["contacts"]}
+        res = self.client.post("/api/sos/trigger", headers=headers,
+                               json={"user_id": "usr_teacher_raman", "lat": 31.25, "lng": 75.70})
+        self.assertEqual({c["contact_phone"] for c in res.get_json()["contacts_notified"]}, own)
 
-        # Even if a malicious client sets user_id in the body, the server must
-        # only ever act on the token's identity (Kavya), never the impersonated one.
-        res = self.client.post("/api/sos/trigger", headers=headers, json={
-            "user_id": "usr_teacher_raman",
-            "lat": 31.25,
-            "lng": 75.70,
-            "location_name": "Spoofed Location"
-        })
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        notified_phones = {c["contact_phone"] for c in data["contacts_notified"]}
-        self.assertEqual(notified_phones, kavya_contact_phones)
+    def test_09_carpool_join_start_complete_pays_host(self):
+        host = self.auth_headers("usr_driver_harpreet")
+        rider = self.auth_headers("usr_teacher_raman")
+        route_id = self.client.post("/api/routes/plan", headers=host, json={
+            "origin": "uni_mall", "destination": "phagwara_station", "departure_time": "18:00",
+            "total_seats": 1, "price_per_seat": 100}).get_json()["route_id"]
+        join = self.client.post(f"/api/routes/{route_id}/join", headers=rider, json={"seats": 1})
+        self.assertEqual(join.status_code, 200)
+        self.assertTrue(join.get_json()["is_pinned"])
+        self.assertEqual(self.client.post(f"/api/routes/{route_id}/start", headers=host).status_code, 200)
+        done = self.client.post(f"/api/routes/{route_id}/complete", headers=host)
+        self.assertEqual(done.get_json()["driver_payout"], 90.0)
+        self.assertEqual(self.client.post(f"/api/routes/{route_id}/complete", headers=host).status_code, 409)
+
 
 if __name__ == "__main__":
     unittest.main()

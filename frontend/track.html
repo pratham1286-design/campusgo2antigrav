@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>CampusGo - Live Trip Tracking</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    body { background: #F8FAFC; }
+    .track-page { max-width: 480px; margin: 0 auto; padding: 16px; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
+    .track-map { height: 320px; border-radius: 14px; overflow: hidden; margin: 12px 0; }
+    .track-card { background: #fff; border: 1px solid #E2E8F0; border-radius: 14px; padding: 14px; }
+    .track-row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; font-size: 0.85rem; }
+    .track-label { color: #64748B; }
+    .track-status { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #FFF1E6; color: #C2410C; font-weight: 700; font-size: 0.75rem; }
+    .track-error { color: #B91C1C; }
+  </style>
+</head>
+<body>
+  <main class="track-page">
+    <h2>CampusGo Live Trip</h2>
+    <p id="track-message" class="track-label">Loading trip...</p>
+    <div id="track-map" class="track-map"></div>
+    <div id="track-details" class="track-card" hidden>
+      <div class="track-row"><span class="track-label">Status</span><span id="track-status" class="track-status"></span></div>
+      <div class="track-row"><span class="track-label">Rider</span><strong id="track-rider"></strong></div>
+      <div class="track-row"><span class="track-label">From</span><span id="track-pickup"></span></div>
+      <div class="track-row"><span class="track-label">To</span><span id="track-drop"></span></div>
+      <div class="track-row"><span class="track-label">Driver</span><span id="track-driver"></span></div>
+      <div class="track-row"><span class="track-label">Vehicle</span><span id="track-vehicle"></span></div>
+    </div>
+    <p class="track-label" style="font-size:0.75rem; margin-top:12px;">Updates every 15 seconds. This link stops working when the trip ends.</p>
+  </main>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="/track.js"></script>
+</body>
+</html>

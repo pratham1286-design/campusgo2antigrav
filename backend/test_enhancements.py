@@ -1,105 +1,46 @@
 import unittest
-import json
-import time
-from app import app
-from seed_data import seed, DEMO_PASSWORD
-from payments import generate_upi_qr, create_razorpay_order, verify_razorpay_payment, credit_wallet_after_payment
-from emergency_dispatch import format_sos_message, dispatch_emergency_alert
 
-LPU_IDS = {
-    "usr_student_aarav": "12204592",
-    "usr_student_kavya": "12301982",
-}
+from test_support import ClientMixin
+from emergency_dispatch import format_sos_message, normalize_phone
+from payments import generate_upi_qr
 
-class TestEnhancements(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        seed()
-        cls.client = app.test_client()
 
-    def auth_headers(self, user_id):
-        res = self.client.post("/api/auth/login", json={
-            "lpu_id": LPU_IDS[user_id],
-            "password": DEMO_PASSWORD
-        })
-        token = res.get_json()["token"]
-        return {"Authorization": f"Bearer {token}"}
-
+class TestEnhancements(ClientMixin, unittest.TestCase):
     def test_01_upi_qr_generation(self):
-        """Test NPCI UPI URI and SVG QR code generation."""
-        res = generate_upi_qr(user_id="usr_student_aarav", amount=150.0)
-        self.assertTrue(res["success"])
+        res = generate_upi_qr("pay_test", 150.0)
         self.assertIn("upi://pay?", res["upi_uri"])
-        self.assertIn("campusgo.lpu@okhdfcbank", res["upi_uri"])
-        self.assertIn("<svg", res["svg_qr"])
-        self.assertIn("data:image/svg+xml", res["qr_data_url"])
+        self.assertIn("am=150.00", res["upi_uri"])
+        self.assertTrue(res["qr_data_url"].startswith("data:image/svg+xml"))
 
-    def test_02_razorpay_order_and_signature_verification(self):
-        """Test Razorpay order creation and HMAC SHA256 signature verification."""
-        order = create_razorpay_order(user_id="usr_student_aarav", amount=250.0)
-        self.assertTrue(order["success"])
-        self.assertEqual(order["amount"], 25000) # in paise
-        self.assertIn("order_", order["order_id"])
-
-        # Test verification with demo signature
-        is_valid = verify_razorpay_payment(order["order_id"], "pay_test123", "demo_signature_valid")
-        self.assertTrue(is_valid)
-
-    def test_03_payment_api_endpoints(self):
-        """Test /api/payments/upi/create-qr and /api/payments/upi/confirm."""
-        headers = self.auth_headers("usr_student_kavya")
-        # 1. Create QR
-        res_qr = self.client.post("/api/payments/upi/create-qr", headers=headers, json={
-            "amount": 75.0
-        })
-        self.assertEqual(res_qr.status_code, 200)
-        qr_data = res_qr.get_json()
-        self.assertIn("svg_qr", qr_data)
-        ref_id = qr_data["reference_id"]
-
-        # 2. Confirm UPI payment
-        res_confirm = self.client.post("/api/payments/upi/confirm", headers=headers, json={
-            "amount": 75.0,
-            "reference_id": ref_id
-        })
-        self.assertEqual(res_confirm.status_code, 200)
-        conf_data = res_confirm.get_json()
-        self.assertTrue(conf_data["success"])
-        # Kavya had 10 + 75 = 85
-        self.assertEqual(conf_data["new_balance"], 85.0)
-
-    def test_04_emergency_sms_dispatch_formatting(self):
-        """Test format_sos_message contains required LPU ID, coordinates, and Block 30 hotline."""
-        msg = format_sos_message(
-            user_name="Dr. Raman Sharma",
-            lpu_id="FAC-10822",
-            location_name="Uni-Mall Student Plaza",
-            lat=31.2535,
-            lng=75.7038,
-            share_token="share_test_token"
-        )
-        self.assertIn("FAC-10822", msg)
-        self.assertIn("Uni-Mall", msg)
-        self.assertIn("+91 1824 517000", msg)
-        self.assertIn("share_test_token", msg)
-
-    def test_05_sos_trigger_with_multi_channel_dispatch(self):
-        """Test /api/sos/trigger returns SMS message payload and delivery records."""
+    def test_02_demo_razorpay_flow_credits_order_amount_once(self):
         headers = self.auth_headers("usr_student_aarav")
-        res = self.client.post("/api/sos/trigger", headers=headers, json={
-            "lat": 31.2536,
-            "lng": 75.7037,
-            "location_name": "Block 34 (Computer Science)"
-        })
+        before = self.balance(headers)
+        order = self.client.post("/api/payments/razorpay/create-order", headers=headers, json={"amount": 250}).get_json()
+        self.assertEqual(order["amount"], 25000)
+        verify = {"order_id": order["order_id"], "payment_id": "pay_demo_1",
+                  "signature": "demo_signature_valid", "amount": 5000}
+        res = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
         self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        self.assertEqual(data["status"], "DISPATCHED")
-        self.assertIn("sos_message", data)
-        self.assertIn("Block 34", data["sos_message"])
-        self.assertGreater(len(data["contacts_notified"]), 0)
-        for contact in data["contacts_notified"]:
-            self.assertIn("delivery", contact)
-            self.assertIn(contact["delivery"]["status"], ("DELIVERED_SIMULATED", "sent"))
+        self.assertEqual(self.balance(headers), before + 250)  # client "amount" is ignored
+        replay = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
+        self.assertEqual(replay.status_code, 400)
+        self.assertEqual(self.balance(headers), before + 250)
+
+    def test_03_sos_message_format(self):
+        msg = format_sos_message("Dr. Raman Sharma", "FAC-10822", "Uni-Mall", 31.2535, 75.7038, "https://x/track/abc")
+        self.assertIn("FAC-10822", msg)
+        self.assertIn("https://x/track/abc", msg)
+
+    def test_04_phone_validation(self):
+        self.assertEqual(normalize_phone("+91 98765 43210"), "+919876543210")
+        self.assertIsNone(normalize_phone("<script>"))
+        self.assertIsNone(normalize_phone("123"))
+
+    def test_05_new_landmarks_reach_chandigarh(self):
+        landmarks = self.client.get("/api/campus/landmarks").get_json()["landmarks"]
+        for key in ("ludhiana_bus_stand", "rajpura", "mohali", "chandigarh_isbt_43", "chandigarh_station"):
+            self.assertIn(key, landmarks)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,59 +7,65 @@
 ## 🚀 Key Features & Architectural Highlights
 
 ### 1. Onboarding & Roles
-- **Closed Campus Access**: Strictly for verified LPU students and faculty (`@lpu.in` verification).
+- **Closed Campus Access**: For verified LPU students and faculty.
 - **Teacher Priority**: Verified faculty receive a gold badge and priority matching in shared pools (`is_teacher_priority` flag).
-- **Role Selection**: Flexible role selection (`Rider`, `Driver`, or `Both`) with real-time switching.
-- **Mandatory Trusted Emergency Contacts**: Integrated safety contacts (parents, wardens, Block-30 Campus Security Control Room).
+- **Role Selection**: `Rider`, `Driver`, or `Both`. Driving requires registering a vehicle from the Profile tab.
+- **Trusted Emergency Contacts**: Up to 5 validated phone numbers per user.
 
 ### 2. 100% Server-Side Validated Pricing & Wallet
-- **Campus Hop (Flat Rates)**:
+- **Campus Hop (Flat Rates, on-campus trips only)**:
   - 🏍️ **Bike**: Flat ₹15.00
   - 🛵 **Scooty**: Flat ₹20.00
   - 🚗 **Car**: Flat ₹35.00
 - **CityLink (Dynamic Inter-City Commute)**:
-  - Base fare + Distance fare + Peak rush dynamic surge multiplier.
-  - Commute hubs: Jalandhar City Bus Stand, Phagwara Railway Station, Rama Mandi Chowk, Jalandhar Cantt.
+  - Base fare + distance fare + peak rush surge multiplier. At least one end must be off campus.
+  - Hubs from Kapurthala, Jalandhar and Phagwara along NH-44 through Goraya, Phillaur, Ludhiana, Khanna, Sirhind and Rajpura to Zirakpur, Kharar, Mohali and Chandigarh.
 - **Server-Side Wallet Authority**:
-  - Validates balances server-side *before* booking matching.
-  - Returns `402 Payment Required` with deficit if balance is insufficient.
-  - Instant top-up via UPI / LPU Pay.
-  - Automatic deduction and driver payout ledger upon ride completion.
+  - The fare is held from the wallet when a ride is booked and refunded in full if the rider cancels.
+  - Returns `402 Payment Required` with the deficit if the balance is insufficient.
+  - Every top-up is tied to a server-created payment order; the credited amount comes from that order, and each order or payment ID can be credited only once.
+  - The driver is paid 90% of the fare when the ride is completed.
 
 ### 3. Peak-Time Zone Queuing
 - Campus partitioned into 4 zones: `Zone-North` (Academic Blocks 30-38), `Zone-South` (Boys Hostels BH1-BH8), `Zone-Central` (Uni-Mall, Uni-Hospital), and `Zone-East` (Girls Hostels GH1-GH6, Law Gate, Main Gate).
-- Heavy class-change loads are queued gracefully without timing out.
+- When no driver is free the ride is queued. Riders can cancel from the Activity tab; drivers see matching requests in their Profile tab and accept them.
 - Priority queue evaluation: `(is_teacher_priority DESC, created_at ASC)`.
 
 ### 4. Safety Infrastructure
-- **Persistent SOS Beacon**: High-contrast `#FF7C00` button triggers immediate alert to campus security hotline (`+91 1824 517000`) and dispatches SMS alerts to all trusted contacts.
-- **Share Live Trip**: Real-time tracking link with share token for family and friends.
-- **Mutual Ratings**: Post-ride feedback and verification tags (e.g. *Clean Helmet*, *Punctual*, *Safe Ride*).
+- **SOS Button**: Records the alert with the phone's GPS position and texts the user's trusted contacts **if an SMS gateway (Fast2SMS or Twilio) is configured**. The app states plainly when nobody was texted. Campus security is **not** notified automatically; the SOS screen shows a one-tap call button for the hotline (`CAMPUS_SECURITY_PHONE`).
+- **Share Live Trip**: A `/track/<token>` page that shows the ride's live position with no phone numbers. The link stops working when the ride ends.
+- **Ratings**: One rating per person per completed ride, with selectable stars and tags.
 
 ### 5. Driver Control & Scheduled Carpooling
-- **Online/Offline Toggle**: Live telemetry and zone tracking.
-- **CityLink Route Posting**: Drivers post departure times and seat capacities for scheduled carpools.
-- **Earnings Dashboard**: Total trips, net earnings, average ratings, and transaction history.
+- **Online/Offline Toggle** and a list of queued requests the driver's vehicle can serve.
+- **CityLink Route Posting**: Hosts offer seats between listed locations. Passengers can leave before departure for a full refund; hosts can cancel and refund everyone.
+- **Earnings Dashboard**: Total trips, net earnings and average rating.
 
 ---
 
 ## 🛠️ Tech Stack & Directory Structure
 
-- **Backend**: Python 3.14, Flask, SQLite3, pure-Python modules.
-- **Frontend**: Mobile-first responsive web app, Leaflet.js with CartoDB tiles, modern transit utility design system (`#FF7C00` orange accents, sharp typography, `#FFFFFF` canvas).
+- **Backend**: Python 3, Flask, SQLite3.
+- **Frontend**: Mobile-first web app with Leaflet.js and OpenStreetMap tiles.
 
 ```
-campus go1/
+campusgo2antigrav/
 ├── backend/
-│   ├── app.py                # Flask REST API, rate limiting, matching & wallet
-│   ├── database.py           # SQLite database schema, indexes, and connection
-│   ├── pricing_and_queue.py  # Flat hop rules, CityLink pricing & zone queue logic
-│   ├── seed_data.py          # Realistic LPU test personas, vehicles & landmarks
-│   └── test_campusgo.py      # Automated unit & integration tests
+│   ├── app.py                 # Flask REST API, auth, rate limiting, matching & wallet
+│   ├── database.py            # SQLite schema, indexes and connection
+│   ├── payments.py            # UPI QR, Razorpay orders/signatures, one-time crediting
+│   ├── emergency_dispatch.py  # SOS message and SMS gateways
+│   ├── pricing_and_queue.py   # Landmarks, flat hop rules, CityLink pricing
+│   ├── seed_data.py           # Demo personas, vehicles & routes
+│   ├── test_support.py        # Test setup (temporary database)
+│   ├── test_campusgo.py       # Core flow tests
+│   ├── test_enhancements.py   # Payments / SOS / landmark tests
+│   └── test_security.py       # Regression tests for security fixes
 ├── frontend/
-│   ├── index.html            # Single Page Mobile App container
-│   ├── styles.css            # Custom transit design system (#FF7C00 palette)
-│   └── app.js                # Map engine, state machine, telemetry simulation & API
+│   ├── index.html             # Single-page mobile app
+│   ├── styles.css
+│   ├── app.js                 # Map, state, API calls
+│   ├── track.html / track.js  # Public live-tracking page
 └── README.md
 ```
 
@@ -67,32 +73,48 @@ campus go1/
 
 ## 🏃 Quick Start Guide
 
-### 1. Run Automated Test Suite
+### 1. Run the test suite
+The tests create their own temporary database, so they never touch `backend/campusgo.db`.
 ```bash
-python backend/test_campusgo.py
+cd backend
+python -m unittest test_campusgo test_enhancements test_security
 ```
 
-### 2. Start the Server
+### 2. Start the server locally
 ```bash
-python backend/app.py
+cd backend
+python seed_data.py          # wipes and loads demo data (use --if-empty to keep existing data)
+PAYMENTS_DEMO_MODE=1 python app.py
 ```
-Open [http://127.0.0.1:5000](http://127.0.0.1:5000) in your web browser.
+Open [http://127.0.0.1:5000](http://127.0.0.1:5000). `PAYMENTS_DEMO_MODE=1` lets you try top-ups with fake money.
 
-### 3. Demo Personas Available for Testing
-Every seeded account uses the same demo password: **`CampusGo@2026`**. Log in with the LPU ID below and that password.
+### 3. Demo personas
+Every seeded account uses the password in `DEMO_PASSWORD`, which defaults to **`CampusGo@2026`** for local use.
 
-- **Dr. Raman Sharma** (`FAC-10822`): Teacher Rider, Faculty Priority Badge ⭐, ₹350 balance.
-- **Aarav Mehta** (`12204592`): Student Rider, B.Tech CSE, ₹150 balance.
-- **Kavya Patel** (`12301982`): Low-balance Student (₹10) to test the Top-Up prompt.
-- **Simran Kaur** (`12108843`): Student Driver, Honda Activa 6G Scooty, Uni-Mall.
-- **Vikram Singh** (`12019934`): Student Driver, Royal Enfield Hunter 350 Bike, Block 34.
-- **Harpreet Singh** (`11904421`): Driver, Maruti Swift Dzire Car, Main Gate.
+- **Dr. Raman Sharma** (`FAC-10822`): Teacher rider, Faculty Priority badge ⭐, ₹350 balance.
+- **Aarav Mehta** (`12204592`): Student rider, B.Tech CSE, ₹150 balance.
+- **Kavya Patel** (`12301982`): Low-balance student (₹10) to test the top-up prompt.
+- **Simran Kaur** (`12108843`): Student driver, Honda Activa 6G scooty, Uni-Mall.
+- **Vikram Singh** (`12019934`): Student driver, Royal Enfield Hunter 350 bike, Block 34.
+- **Harpreet Singh** (`11904421`): Driver, Maruti Dzire car, Main Gate.
 
 ---
 
-## 🔐 Authentication & Deployment Notes
+## 🔐 Security & Deployment Notes
 
-- **Login is real, not a demo switcher.** Every API call (other than the campus landmark map, the public share-a-trip link, and login itself) requires a signed `Authorization: Bearer <token>` session header. The server always derives "who is acting" from that token, never from a client-supplied `user_id` - so one logged-in user cannot act as another by editing request bodies.
-- **Set `SECRET_KEY`** as a real environment variable in any deployment. Without it, a random key is generated per-process and every session is invalidated on restart. `render.yaml` auto-generates and persists one for you; for Docker/self-hosting, set it explicitly.
-- **SQLite persistence:** on Render's free plan the database resets to seed data on every deploy/restart (free instances can't attach a persistent disk). This is fine for a demo/portfolio deployment. For real persistence, upgrade to a paid Render plan, attach a disk, and set `DATABASE_PATH` to a path on that disk (see the comment in `render.yaml`). The Docker Compose setup already persists data via a named volume.
-- **Payments/SMS are simulated by default.** UPI/Razorpay top-ups and SOS SMS dispatch work out of the box in a safe simulated mode (no real money moves, no real SMS sends) unless you configure real `RAZORPAY_KEY_SECRET` / `FAST2SMS_API_KEY` / Twilio credentials as environment variables.
+- **Login is real.** Every API call except login, landmarks, config and the public share link needs a signed `Authorization: Bearer <token>` header. The acting user always comes from the token, never from the request body.
+- **`SECRET_KEY` is required** in any deployment. The app refuses to start with a known placeholder or a key shorter than 32 characters. `render.yaml` generates one. For Docker, `docker compose up` fails until you set it.
+- **Demo data is opt-in.** `SEED_DEMO_DATA=1` creates the demo personas only when the database is empty. Set `DEMO_PASSWORD` on any public deployment so the README password doesn't work there.
+- **Payments.**
+  - `PAYMENTS_DEMO_MODE=1` enables fake-money top-ups for demos. It is ignored whenever real Razorpay keys are configured.
+  - With `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` set, card top-ups use Razorpay Checkout and are credited only after the HMAC signature is verified.
+  - UPI has no automatic payment confirmation. When a user taps "I've Paid", the order waits for verification. With `ADMIN_API_KEY` set, list pending orders and approve or reject them after checking your bank statement:
+    ```bash
+    curl -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/pending
+    curl -X POST -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/<id>/approve
+    ```
+- **SMS.** Without `FAST2SMS_API_KEY` or Twilio credentials, SOS alerts are recorded but no one is texted, and the app tells the user so.
+- **Reverse proxies.** Set `TRUST_PROXY_HOPS` to the number of proxies in front of the app (1 on Render) so rate limits use the real client IP. Set `PUBLIC_BASE_URL` so SOS tracking links use your public domain.
+- **SQLite persistence.** On Render's free plan the database is lost on every deploy or restart. For real persistence use a paid plan with a disk and set `DATABASE_PATH` (see `render.yaml`). Docker Compose persists only the `/app/data` directory, so rebuilt images always run the new code.
+- **Headers.** Responses carry a strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff` and `no-referrer`. The frontend never inserts server data as raw HTML.
+- See `.env.example` for every setting.

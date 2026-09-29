@@ -6,7 +6,8 @@ import time
 DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "campusgo.db")
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: wait for a competing writer instead of failing instantly.
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
@@ -14,6 +15,8 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    # WAL lets readers proceed while a write is in progress.
+    cursor.execute("PRAGMA journal_mode=WAL;")
 
     # Users table
     cursor.execute("""
@@ -241,12 +244,36 @@ def init_db():
     );
     """)
 
+    # Payment orders: every top-up must match exactly one server-created order,
+    # and each order / provider payment id can only ever be credited once.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS payment_orders (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('upi', 'razorpay')),
+        provider_order_id TEXT UNIQUE,
+        provider_payment_id TEXT UNIQUE,
+        amount REAL NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('created', 'awaiting_verification', 'paid', 'rejected')),
+        created_at REAL NOT NULL,
+        paid_at REAL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """)
+
     # Indexes for peak-time scaling & zone lookups
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_rides_status_zone ON rides(status, pickup_zone);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_rides_rider ON rides(rider_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_rides_driver ON rides(driver_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_driver_locations_zone ON driver_locations(zone, is_online);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_transactions(user_id);")
+    # One review per person per ride (drop older duplicates from before this rule existed).
+    cursor.execute("""
+    DELETE FROM ride_reviews WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM ride_reviews GROUP BY ride_id, reviewer_id
+    );
+    """)
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_once ON ride_reviews(ride_id, reviewer_id);")
 
     conn.commit()
     conn.close()

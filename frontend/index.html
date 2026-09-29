@@ -393,8 +393,11 @@
                 </svg>
                 <span>Advance Simulation</span>
               </button>
+              <button id="cancel-ride-btn" class="btn-secondary-action hidden">
+                <span>Cancel Ride</span>
+              </button>
               <button id="complete-ride-btn" class="btn-primary-action">
-                <span>🏁 Complete Trip & Reset</span>
+                <span>🏁 Complete Trip</span>
               </button>
             </div>
           </div>
@@ -456,6 +459,7 @@
                 <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
                 <span>Teacher Priority Matching Applied</span>
               </div>
+              <button id="cancel-queued-ride-btn" class="btn-sm-outline" style="margin-top:10px;">Cancel Request (Full Refund)</button>
             </div>
           </div>
 
@@ -536,8 +540,19 @@
                 <button id="edit-vehicle-btn" class="btn-link">Edit</button>
               </div>
               <div class="vehicle-display-details">
-                <div id="veh-model-plate" class="veh-title">Honda Activa 6G • PB08-DA-4821</div>
-                <div id="veh-specs" class="veh-sub">Pearl White • Helmet Included</div>
+                <div id="veh-model-plate" class="veh-title">No vehicle registered</div>
+                <div id="veh-specs" class="veh-sub">Add your vehicle to start driving</div>
+              </div>
+            </div>
+
+            <!-- Queued ride requests this driver's vehicle can serve -->
+            <div class="vehicle-info-box" id="driver-requests-section">
+              <div class="vehicle-info-header">
+                <span class="box-title">Ride Requests</span>
+                <button id="refresh-requests-btn" class="btn-link">Refresh</button>
+              </div>
+              <div id="driver-requests-list" class="driver-requests-list">
+                <p class="empty-state">No waiting requests.</p>
               </div>
             </div>
           </div>
@@ -547,7 +562,7 @@
             <div class="section-header-flex">
               <div>
                 <h4 class="setting-title">Emergency Contacts (Mandatory)</h4>
-                <p class="setting-sub">Alerted automatically when SOS is pressed or trip is shared</p>
+                <p class="setting-sub">Texted when you press SOS (needs an SMS gateway on the server). Up to 5.</p>
               </div>
               <button id="add-emergency-btn" class="btn-sm-outline">+ Add</button>
             </div>
@@ -665,16 +680,17 @@
                 📱 Open UPI App
               </a>
               <button id="confirm-upi-paid-btn" class="btn-primary-cta" style="flex:1;">
-                Simulate App Payment (₹<span id="qr-pay-amount-label">100</span>)
+                <span id="confirm-upi-label">I've Paid</span> (₹<span id="qr-pay-amount-label">100</span>)
               </button>
             </div>
+            <p id="topup-status-text" class="modal-desc hidden"></p>
           </div>
 
           <!-- TAB 2: Razorpay Gateway Container -->
           <div id="pay-panel-razorpay" class="pay-panel hidden">
             <div class="razorpay-preview-card">
               <div class="razorpay-logo-row">
-                <span class="rzp-badge">RAZORPAY TEST GATEWAY</span>
+                <span class="rzp-badge" id="rzp-mode-badge">RAZORPAY</span>
                 <span class="rzp-shield">🔒 256-bit SSL</span>
               </div>
               <p class="rzp-desc">Pay securely via Credit/Debit Cards, NetBanking, or Digital Wallets with automatic signature verification.</p>
@@ -698,7 +714,7 @@
             </svg>
           </div>
           <h2>EMERGENCY SOS BROADCAST</h2>
-          <p class="sos-subtitle">Multi-Channel SMS & Campus Security Alerted</p>
+          <p class="sos-subtitle">Your alert has been recorded</p>
         </div>
         <div class="modal-body">
           <div class="sos-details-box">
@@ -708,7 +724,7 @@
             </div>
             <div class="sos-row">
               <span class="label">Campus Control Room:</span>
-              <strong class="highlight-text">+91 1824 517000 (Block 30)</strong>
+              <a id="sos-hotline-link" class="highlight-text" href="tel:+911824517000">Call +91 1824 517000</a>
             </div>
             <div class="sos-row">
               <span class="label">SMS Broadcast:</span>
@@ -719,8 +735,8 @@
           <!-- Real SMS Dispatch Preview Box -->
           <div class="sos-sms-preview-card">
             <div class="sms-preview-header">
-              <span class="sms-badge">DISPATCHED SMS PAYLOAD</span>
-              <span class="sms-gateway-tag" id="sos-gateway-tag">Gateway: Fast2SMS / Twilio</span>
+              <span class="sms-badge">SOS MESSAGE</span>
+              <span class="sms-gateway-tag" id="sos-gateway-tag"></span>
             </div>
             <pre class="sms-text-box" id="sos-sms-text">Alerting contacts...</pre>
           </div>
@@ -729,7 +745,7 @@
             <!-- Rendered dynamically -->
           </div>
 
-          <p class="sos-advice">Stay in a well-lit campus area. Campus security and your emergency contacts have received your live coordinates.</p>
+          <p class="sos-advice" id="sos-advice-text">Campus security is not notified automatically. Call the hotline above and stay in a well-lit, public area.</p>
           <button id="dismiss-sos-btn" class="btn-secondary-action">Acknowledge & Close</button>
         </div>
       </div>
@@ -747,13 +763,13 @@
           <p class="modal-desc">Anyone with this trusted link can track your live location and vehicle details until you safely reach your destination.</p>
           
           <div class="share-link-box">
-            <input type="text" id="share-link-input" readonly value="https://campusgo.lpu.in/track/share_xyz">
+            <input type="text" id="share-link-input" readonly value="">
             <button id="copy-share-btn" class="btn-sm-primary">Copy</button>
           </div>
 
           <div class="share-contacts-status">
-            <span class="check-circle">✓</span>
-            <span>Live trip link sent via SMS to your primary emergency contact.</span>
+            <span class="check-circle">ℹ</span>
+            <span>Send this link to someone you trust. It stops working when the ride ends.</span>
           </div>
         </div>
       </div>
@@ -773,19 +789,19 @@
             </svg>
           </div>
           <h4>How was your ride?</h4>
-          <p class="modal-desc">Fare has been automatically deducted from your CampusGo wallet.</p>
+          <p class="modal-desc">Your fare was paid from your CampusGo wallet when you booked.</p>
 
           <div class="star-rating-row" id="star-rating-picker">
-            <span class="star-btn active" data-val="1">★</span>
-            <span class="star-btn active" data-val="2">★</span>
-            <span class="star-btn active" data-val="3">★</span>
-            <span class="star-btn active" data-val="4">★</span>
-            <span class="star-btn active" data-val="5">★</span>
+            <button type="button" class="star-btn active" data-val="1" aria-label="1 star">★</button>
+            <button type="button" class="star-btn active" data-val="2" aria-label="2 star">★</button>
+            <button type="button" class="star-btn active" data-val="3" aria-label="3 star">★</button>
+            <button type="button" class="star-btn active" data-val="4" aria-label="4 star">★</button>
+            <button type="button" class="star-btn active" data-val="5" aria-label="5 star">★</button>
           </div>
 
           <div class="rating-tags-row">
-            <button class="tag-pill active">Safe Ride</button>
-            <button class="tag-pill active">Punctual</button>
+            <button class="tag-pill">Safe Ride</button>
+            <button class="tag-pill">Punctual</button>
             <button class="tag-pill">Clean Helmet</button>
             <button class="tag-pill">Polite Behavior</button>
           </div>
@@ -808,25 +824,12 @@
 
           <div class="input-group">
             <label>Origin Pickup (Campus)</label>
-            <select id="route-origin-select" class="location-dropdown route-location-select">
-              <option value="LPU Uni-Mall Plaza">Uni-Mall & Student Plaza</option>
-              <option value="Block 34 (Computer Science)">Block 34 (Computer Science & Engg)</option>
-              <option value="BH-1 & BH-2 (Boys Hostels)">BH-1 & BH-2 (Boys Hostels)</option>
-              <option value="BH-3 & BH-4 (Boys Hostels)">BH-3 & BH-4 (Boys Hostels)</option>
-              <option value="GH-1 & GH-3 (Girls Hostels)">GH-1 & GH-3 (Girls Hostels)</option>
-              <option value="LPU Main Gate (GT Road Highway)">LPU Main Gate (Highway)</option>
-              <option value="Law Gate (PG Hub)">Law Gate (PG Hub)</option>
-            </select>
+            <select id="route-origin-select" class="location-dropdown route-location-select"></select>
           </div>
 
           <div class="input-group">
             <label>Destination Hub (CityLink)</label>
-            <select id="route-dest-select" class="location-dropdown route-location-select">
-              <option value="Jalandhar City Bus Stand">Jalandhar City Bus Stand</option>
-              <option value="Phagwara Railway Station">Phagwara Railway Station</option>
-              <option value="Rama Mandi Chowk, Jalandhar">Rama Mandi Chowk, Jalandhar</option>
-              <option value="Jalandhar Cantt Railway Station">Jalandhar Cantt Railway Station</option>
-            </select>
+            <select id="route-dest-select" class="location-dropdown route-location-select"></select>
           </div>
 
           <div class="input-row">
@@ -847,7 +850,7 @@
 
           <div class="input-group">
             <label>Fare Per Passenger Seat (₹)</label>
-            <input type="number" id="route-price-input" min="20" max="400" value="80">
+            <input type="number" id="route-price-input" min="10" max="2000" value="80">
           </div>
 
           <div class="input-group">
@@ -856,6 +859,53 @@
           </div>
 
           <button id="submit-post-route-btn" class="btn-primary-cta">Publish & Plan Route</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Register / Edit Vehicle Modal -->
+    <div id="modal-vehicle" class="app-modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Your Vehicle</h3>
+          <button class="modal-close-btn" data-modal="modal-vehicle">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="input-group">
+            <label>Vehicle Type</label>
+            <select id="veh-category-input">
+              <option value="bike">Bike</option>
+              <option value="scooty">Scooty</option>
+              <option value="car">Car</option>
+            </select>
+          </div>
+          <div class="input-group">
+            <label>Model</label>
+            <input type="text" id="veh-model-input" maxlength="40" placeholder="e.g. Honda Activa 6G">
+          </div>
+          <div class="input-row">
+            <div class="input-group">
+              <label>Plate Number</label>
+              <input type="text" id="veh-plate-input" maxlength="15" placeholder="PB08-AB-1234">
+            </div>
+            <div class="input-group">
+              <label>Colour</label>
+              <input type="text" id="veh-color-input" maxlength="20" placeholder="e.g. White">
+            </div>
+          </div>
+          <div class="input-row">
+            <div class="input-group">
+              <label>Passenger Seats</label>
+              <input type="number" id="veh-capacity-input" min="1" max="6" value="1">
+            </div>
+            <div class="input-group">
+              <label><input type="checkbox" id="veh-helmet-input" checked> Spare helmet</label>
+              <label><input type="checkbox" id="veh-ac-input"> AC (cars)</label>
+            </div>
+          </div>
+          <p id="veh-error-text" class="login-error hidden"></p>
+          <button id="submit-vehicle-btn" class="btn-primary-cta">Save Vehicle</button>
         </div>
       </div>
     </div>
@@ -881,6 +931,7 @@
             <label>Phone Number</label>
             <input type="tel" id="emg-phone-input" placeholder="+91 98765 00000">
           </div>
+          <p id="emg-error-text" class="login-error hidden"></p>
           <button id="submit-contact-btn" class="btn-primary-cta">Save Contact</button>
         </div>
       </div>

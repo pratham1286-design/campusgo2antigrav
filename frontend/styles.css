@@ -2623,3 +2623,62 @@ body {
 .login-demo-hint li {
   margin-bottom: 2px;
 }
+
+/* --- Driver requests, contact removal, rating stars, route notes --- */
+.driver-requests-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.driver-request-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.empty-state {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 8px 0;
+}
+
+.contact-item {
+  gap: 8px;
+}
+
+.contact-remove-btn {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+button.star-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.route-note {
+  font-size: 0.75rem;
+  color: #B45309;
+  font-weight: 700;
+  text-align: center;
+  padding-top: 6px;
+}
+
+.route-card-footer .btn-sm-outline {
+  margin-top: 6px;
+}
+
+#complete-ride-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

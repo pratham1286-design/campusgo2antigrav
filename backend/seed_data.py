@@ -1,15 +1,25 @@
+import os
+import sys
 import time
 import uuid
 from werkzeug.security import generate_password_hash
 from database import init_db, get_db_connection
 
-# Shared password for every seeded demo persona (documented in README for reviewers/testers).
-DEMO_PASSWORD = "CampusGo@2026"
+# Shared password for every seeded demo persona. Override with DEMO_PASSWORD so
+# a public deployment doesn't use the value printed in the README.
+DEMO_PASSWORD = os.environ.get("DEMO_PASSWORD") or "CampusGo@2026"
 
-def seed():
+def seed(if_empty=False):
+    """Wipes all data and loads the demo personas. With if_empty=True it only
+    seeds a brand-new database, so restarts and redeploys keep real data."""
     init_db()
     conn = get_db_connection()
     cur = conn.cursor()
+
+    if if_empty and cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+        conn.close()
+        print("Database already has users; skipping demo seed.")
+        return
 
     # Clear existing demo data
     cur.execute("DELETE FROM sos_alerts;")
@@ -226,7 +236,7 @@ def seed():
         31.3190,
         75.5860,
         "17:15 Today (Post-Class)",
-        2,
+        3,
         3,
         85.0,
         "AC Carpool via GT Road. Trunk space available for luggage.",
@@ -265,4 +275,4 @@ def seed():
     print(f"Demo login password for every seeded persona: {DEMO_PASSWORD}")
 
 if __name__ == "__main__":
-    seed()
+    seed(if_empty="--if-empty" in sys.argv)

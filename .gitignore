@@ -14,3 +14,9 @@ backend/campusgo.db-journal
 
 # OS / editor
 .DS_Store
+
+# Local dev server output
+backend/server.pid
+backend/*.log
+backend/campusgo.db-wal
+backend/campusgo.db-shm

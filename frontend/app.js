@@ -1,13 +1,19 @@
 /**
  * CampusGo - LPU Community Transit Application Controller
- * Handles Leaflet map, 3 vehicle services, server-validated wallet,
- * peak-time zone queueing, teacher priority, persistent SOS, and driver earnings.
+ * Leaflet map, 3 vehicle services, server-held wallet, zone queueing,
+ * teacher priority, SOS, carpools and the driver dashboard.
+ *
+ * Security rule for this file: server data is never inserted as raw HTML.
+ * Use textContent, or esc() for every value inside an HTML template string.
  */
 
-// Global Application State
+const DEFAULT_AVATAR = 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120';
+const LPU_COORDS = [31.2536, 75.7037];
+
 const AppState = {
   currentUser: null,
   authToken: null,
+  config: null,
   landmarks: {},
   selectedScope: 'campus_hop', // 'campus_hop' | 'citylink'
   selectedService: 'bike',     // 'bike' | 'scooty' | 'car'
@@ -15,14 +21,38 @@ const AppState = {
   dropKey: 'block_34',
   quotes: null,
   activeRide: null,
-  driverInterval: null,
+  activeCockpitRouteId: null,
+  activeCockpitIsHost: false,
+  ratingRideId: null,
+  ratingValue: 5,
+  currentUpiRef: null,
   homeMap: null,
   activeMap: null,
   homeMarkers: {},
+  driverMarkers: [],
   activeMarkers: {},
   activePolyline: null,
-  mapAvailable: false
+  timers: { drivers: null, queue: null, qr: null }
 };
+
+// --- Small helpers ---
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function safeImageUrl(url) {
+  return typeof url === 'string' && /^https:\/\//i.test(url) ? url : DEFAULT_AVATAR;
+}
+
+function money(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function $(id) {
+  return document.getElementById(id);
+}
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
@@ -30,11 +60,25 @@ document.addEventListener('DOMContentLoaded', async () => {
   initModals();
   initMaps();
   initializeCustomLocationDropdowns();
+  await loadConfig();
   await loadLandmarks();
   initEventHandlers();
   initAuthHandlers();
   await tryResumeSession();
 });
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    AppState.config = await res.json();
+  } catch (err) {
+    AppState.config = { security_hotline: '+91 1824 517000', razorpay_enabled: false, payments_demo_mode: false };
+  }
+  const hotline = AppState.config.security_hotline;
+  const link = $('sos-hotline-link');
+  link.textContent = `Call ${hotline}`;
+  link.href = `tel:${hotline.replace(/[^\d+]/g, '')}`;
+}
 
 // --- Authentication ---
 function getStoredToken() {
@@ -57,25 +101,52 @@ function storeToken(token) {
   }
 }
 
-// Wraps fetch() to attach the bearer session token to every authenticated API call.
+// Wraps fetch() to attach the bearer token and parse the JSON reply.
 async function apiFetch(url, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (AppState.authToken) {
     headers['Authorization'] = `Bearer ${AppState.authToken}`;
   }
   const res = await fetch(url, Object.assign({}, options, { headers }));
-  if (res.status === 401) {
+  if (res.status === 401 && AppState.authToken) {
     handleLogout();
   }
   return res;
 }
 
+// POST helper: returns { ok, status, data } and never throws on HTTP errors.
+async function apiPost(url, payload = {}) {
+  const res = await apiFetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Unexpected server response' };
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function apiGet(url) {
+  const res = await apiFetch(url);
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Unexpected server response' };
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
 function showLoginScreen() {
-  document.getElementById('login-screen').classList.remove('hidden');
+  $('login-screen').classList.remove('hidden');
 }
 
 function hideLoginScreen() {
-  document.getElementById('login-screen').classList.add('hidden');
+  $('login-screen').classList.add('hidden');
 }
 
 async function tryResumeSession() {
@@ -86,12 +157,11 @@ async function tryResumeSession() {
   }
   AppState.authToken = token;
   try {
-    const res = await apiFetch('/api/auth/me');
-    if (!res.ok) {
+    const { ok, data } = await apiGet('/api/auth/me');
+    if (!ok) {
       handleLogout();
       return;
     }
-    const data = await res.json();
     AppState.currentUser = data.user;
     await onLoginSuccess();
   } catch (err) {
@@ -101,10 +171,10 @@ async function tryResumeSession() {
 }
 
 async function handleLogin() {
-  const lpuId = document.getElementById('login-lpu-id-input').value.trim();
-  const password = document.getElementById('login-password-input').value;
-  const errorEl = document.getElementById('login-error-text');
-  const btn = document.getElementById('login-submit-btn');
+  const lpuId = $('login-lpu-id-input').value.trim();
+  const password = $('login-password-input').value;
+  const errorEl = $('login-error-text');
+  const btn = $('login-submit-btn');
   errorEl.classList.add('hidden');
 
   if (!lpuId || !password) {
@@ -133,7 +203,7 @@ async function handleLogin() {
     AppState.authToken = data.token;
     AppState.currentUser = data.user;
     storeToken(data.token);
-    document.getElementById('login-password-input').value = '';
+    $('login-password-input').value = '';
     await onLoginSuccess();
   } catch (err) {
     console.error('Login failed:', err);
@@ -145,11 +215,21 @@ async function handleLogin() {
   }
 }
 
+function clearTimers() {
+  Object.keys(AppState.timers).forEach((key) => {
+    clearInterval(AppState.timers[key]);
+    clearTimeout(AppState.timers[key]);
+    AppState.timers[key] = null;
+  });
+}
+
 function handleLogout() {
+  clearTimers();
   AppState.authToken = null;
   AppState.currentUser = null;
   AppState.activeRide = null;
   AppState.activeCockpitRouteId = null;
+  AppState.ratingRideId = null;
   storeToken(null);
   showLoginScreen();
 }
@@ -160,16 +240,17 @@ async function onLoginSuccess() {
   await loadEmergencyContacts();
   await loadDriverEarnings();
   fetchFareQuotes();
+  refreshNearbyDrivers();
+  clearInterval(AppState.timers.drivers);
+  AppState.timers.drivers = setInterval(refreshNearbyDrivers, 30000);
   await checkActiveRide();
 }
 
-// Re-fetches the current user's own record (wallet balance, role, etc.)
-// without requiring the password again - used after actions that change it.
+// Re-fetches the user's own record (wallet, role, vehicle) after changes.
 async function refreshCurrentUser() {
   try {
-    const res = await apiFetch('/api/auth/me');
-    if (!res.ok) return;
-    const data = await res.json();
+    const { ok, data } = await apiGet('/api/auth/me');
+    if (!ok) return;
     AppState.currentUser = data.user;
     updateUserUI();
   } catch (err) {
@@ -177,48 +258,39 @@ async function refreshCurrentUser() {
   }
 }
 
+function setWalletBalance(balance) {
+  if (!AppState.currentUser || typeof balance !== 'number') return;
+  AppState.currentUser.wallet_balance = balance;
+  updateUserUI();
+}
+
 function initAuthHandlers() {
-  document.getElementById('login-submit-btn').addEventListener('click', handleLogin);
-  document.getElementById('login-password-input').addEventListener('keydown', (e) => {
+  $('login-submit-btn').addEventListener('click', handleLogin);
+  $('login-password-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleLogin();
   });
-  document.getElementById('logout-btn').addEventListener('click', handleLogout);
+  $('logout-btn').addEventListener('click', handleLogout);
 }
 
 window.initializeCustomLocationDropdowns = initializeCustomLocationDropdowns;
 window.syncCustomLocationDropdowns = syncCustomLocationDropdowns;
 
-// --- Map Initialization (Centered at LPU Punjab) ---
+// --- Map Initialization (OpenStreetMap, no API key needed) ---
 function initMaps() {
-  const LPU_COORDS = [31.2536, 75.7037]; // LPU GT Road Campus Center
-
   if (typeof L === 'undefined') {
     renderMapFallback('campus-map', 'Campus map preview');
     renderMapFallback('active-tracking-map', 'Live tracking map');
     return;
   }
 
-  AppState.mapAvailable = true;
-
-  // 1. Home Screen Half-Screen Map (100% Free OpenStreetMap - No API key needed)
-  AppState.homeMap = L.map('campus-map', {
-    zoomControl: false,
-    attributionControl: false
-  }).setView(LPU_COORDS, 16);
-
+  AppState.homeMap = L.map('campus-map', { zoomControl: false, attributionControl: false }).setView(LPU_COORDS, 16);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(AppState.homeMap);
-
   L.control.zoom({ position: 'bottomright' }).addTo(AppState.homeMap);
 
-  // 2. Active Ride Live Tracking Map (100% Free OpenStreetMap - No API key needed)
-  AppState.activeMap = L.map('active-tracking-map', {
-    zoomControl: false,
-    attributionControl: false
-  }).setView(LPU_COORDS, 16);
-
+  AppState.activeMap = L.map('active-tracking-map', { zoomControl: false, attributionControl: false }).setView(LPU_COORDS, 16);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap contributors'
@@ -226,18 +298,18 @@ function initMaps() {
 }
 
 function renderMapFallback(elementId, label) {
-  const mapElement = document.getElementById(elementId);
+  const mapElement = $(elementId);
   if (!mapElement || mapElement.querySelector('.map-fallback')) return;
 
   mapElement.innerHTML = `
-    <div class="map-fallback" role="img" aria-label="${label}">
+    <div class="map-fallback" role="img" aria-label="${esc(label)}">
       <div class="map-fallback-road road-horizontal"></div>
       <div class="map-fallback-road road-vertical"></div>
       <div class="map-fallback-area area-academic">Academic Blocks</div>
       <div class="map-fallback-area area-mall">Uni-Mall</div>
       <div class="map-fallback-area area-hostels">Hostels</div>
       <div class="map-fallback-pin pin-campus">LPU</div>
-      <div class="map-fallback-caption">${label} • LPU Campus</div>
+      <div class="map-fallback-caption">${esc(label)} • LPU Campus</div>
     </div>
   `;
 }
@@ -454,90 +526,85 @@ function populatePlannedRouteDropdowns() {
   syncCustomLocationDropdowns();
 }
 
-// --- Render Map Pins & Drivers on Home Map ---
+
+// --- Map pins for pickup/drop and real online drivers ---
+function pinIcon(color, label, size = 24) {
+  return L.divIcon({
+    className: 'custom-map-pin',
+    html: `<div style="background:${color}; width:${size}px; height:${size}px; border-radius:50%; border:2px solid white; box-shadow:0 2px 6px rgba(0,0,0,0.3); display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">${esc(label)}</div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2]
+  });
+}
+
+function vehicleIcon(category, size = 28, border = '#FF7C00') {
+  const iconChar = category === 'bike' ? '🏍' : category === 'scooty' ? '🛵' : '🚗';
+  return L.divIcon({
+    className: 'driver-car-pin',
+    html: `<div style="background:#111827; width:${size}px; height:${size}px; border-radius:50%; border:2px solid ${border}; display:flex; align-items:center; justify-content:center; font-size:14px; box-shadow:0 3px 8px rgba(0,0,0,0.3);">${iconChar}</div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2]
+  });
+}
+
 function renderMapLandmarks() {
   if (!AppState.homeMap) {
     renderMapFallback('campus-map', 'Campus map preview');
     return;
   }
 
-  // Clear existing markers
-  Object.values(AppState.homeMarkers).forEach(m => AppState.homeMap.removeLayer(m));
+  Object.values(AppState.homeMarkers).forEach((m) => AppState.homeMap.removeLayer(m));
   AppState.homeMarkers = {};
 
-  // Custom Icon Helpers
-  const createPinIcon = (color, label) => L.divIcon({
-    className: 'custom-map-pin',
-    html: `<div style="background:${color}; width:24px; height:24px; border-radius:50%; border:2px solid white; box-shadow:0 2px 6px rgba(0,0,0,0.3); display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">${label}</div>`,
-    iconSize: [24, 24],
-    iconAnchor: [12, 12]
-  });
-
-  // Add Pickup Pin
   const p = AppState.landmarks[AppState.pickupKey];
   if (p) {
-    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], {
-      icon: createPinIcon('#10B981', 'P')
-    }).addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${p.name}`);
+    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#10B981', 'P') })
+      .addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${esc(p.name)}`);
   }
-
-  // Add Drop Pin
   const d = AppState.landmarks[AppState.dropKey];
   if (d) {
-    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], {
-      icon: createPinIcon('#FF7C00', 'D')
-    }).addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${d.name}`);
+    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#FF7C00', 'D') })
+      .addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${esc(d.name)}`);
   }
-
-  // Add active simulated drivers near LPU
-  const mockDrivers = [
-    { name: 'Simran (Scooty)', lat: 31.2530, lng: 75.7042, type: 'scooty' },
-    { name: 'Vikram (Bike)', lat: 31.2558, lng: 75.7048, type: 'bike' },
-    { name: 'Harpreet (Car)', lat: 31.2515, lng: 75.7075, type: 'car' }
-  ];
-
-  mockDrivers.forEach((dr, idx) => {
-    const iconChar = dr.type === 'bike' ? '🏍' : dr.type === 'scooty' ? '🛵' : '🚗';
-    const drMarker = L.marker([dr.lat, dr.lng], {
-      icon: L.divIcon({
-        className: 'driver-car-pin',
-        html: `<div style="background:#111827; width:28px; height:28px; border-radius:50%; border:2px solid #FF7C00; display:flex; align-items:center; justify-content:center; font-size:14px; box-shadow:0 3px 8px rgba(0,0,0,0.35);">${iconChar}</div>`,
-        iconSize: [28, 28],
-        iconAnchor: [14, 14]
-      })
-    }).addTo(AppState.homeMap).bindPopup(`<b>${dr.name}</b><br>Available`);
-    AppState.homeMarkers[`driver_${idx}`] = drMarker;
-  });
 }
 
-// --- Fetch 100% Server-Side Fare Quotes ---
+// Shows drivers who are actually online and free, as reported by the server.
+async function refreshNearbyDrivers() {
+  if (!AppState.homeMap || !AppState.currentUser) return;
+  try {
+    const { ok, data } = await apiGet('/api/drivers/nearby');
+    if (!ok) return;
+    AppState.driverMarkers.forEach((m) => AppState.homeMap.removeLayer(m));
+    AppState.driverMarkers = data.drivers.map((dr) => L.marker([dr.lat, dr.lng], { icon: vehicleIcon(dr.category) })
+      .addTo(AppState.homeMap)
+      .bindPopup(`<b>${esc(dr.first_name)}</b> (${esc(dr.category)})<br>Available`));
+  } catch (err) {
+    console.error('Failed to load nearby drivers:', err);
+  }
+}
+
+// --- Server-side fare quotes ---
 async function fetchFareQuotes() {
   if (!AppState.currentUser) return;
 
-  const pickupKey = document.getElementById('pickup-select').value;
-  const dropKey = document.getElementById('drop-select').value;
+  const pickupKey = $('pickup-select').value;
+  const dropKey = $('drop-select').value;
   AppState.pickupKey = pickupKey;
   AppState.dropKey = dropKey;
-
   renderMapLandmarks();
 
   try {
-    const res = await apiFetch('/api/rides/quote', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        pickup_key: pickupKey,
-        drop_key: dropKey,
-        scope: AppState.selectedScope
-      })
+    const { ok, data } = await apiPost('/api/rides/quote', {
+      pickup_key: pickupKey,
+      drop_key: dropKey,
+      scope: AppState.selectedScope
     });
-
-    const data = await res.json();
-    if (!res.ok) {
-      console.warn('Quote error:', data.error);
+    if (!ok) {
+      AppState.quotes = null;
+      $('selected-service-summary').textContent = data.error || 'Choose a valid pickup and drop';
+      $('wallet-warning-banner').classList.add('hidden');
       return;
     }
-
     AppState.quotes = data.quotes;
     updateServicesDisplay(data);
   } catch (err) {
@@ -545,13 +612,9 @@ async function fetchFareQuotes() {
   }
 }
 
-// --- Update Exactly 3 Vehicle Service Cards ---
 function updateServicesDisplay(data) {
   const quotes = data.quotes;
-  const walletBal = data.wallet_balance;
-
-  // Pricing Mode Pill
-  const modePill = document.getElementById('pricing-mode-tag');
+  const modePill = $('pricing-mode-tag');
   if (AppState.selectedScope === 'campus_hop') {
     modePill.textContent = 'Flat Campus Hop';
     modePill.style.backgroundColor = 'var(--primary-orange-light)';
@@ -560,94 +623,92 @@ function updateServicesDisplay(data) {
     modePill.style.backgroundColor = '#FEF3C7';
   }
 
-  // Update Services: Bike, Scooty, Car
-  ['bike', 'scooty', 'car'].forEach(srv => {
+  ['bike', 'scooty', 'car'].forEach((srv) => {
     const q = quotes[srv];
     if (!q) return;
-
-    document.getElementById(`fare-${srv}`).textContent = q.total_fare.toFixed(0);
-    document.getElementById(`eta-${srv}`).textContent = `~${q.estimated_minutes} min`;
-    document.getElementById(`avail-${srv}`).textContent = `${q.available_drivers} driver${q.available_drivers === 1 ? '' : 's'} near`;
+    $(`fare-${srv}`).textContent = q.total_fare.toFixed(0);
+    $(`eta-${srv}`).textContent = `~${q.estimated_minutes} min`;
+    $(`avail-${srv}`).textContent = `${q.available_drivers} driver${q.available_drivers === 1 ? '' : 's'} online`;
   });
 
-  // Selected Service summary text on Primary CTA
   const selectedQuote = quotes[AppState.selectedService];
   if (selectedQuote) {
-    const sName = AppState.selectedService.toUpperCase();
     const sType = AppState.selectedScope === 'campus_hop' ? 'Flat' : 'Est.';
-    document.getElementById('selected-service-summary').textContent = `${sName} • ${sType} ₹${selectedQuote.total_fare.toFixed(0)}`;
-
-    // Wallet warning check
-    const warningBanner = document.getElementById('wallet-warning-banner');
+    $('selected-service-summary').textContent = `${AppState.selectedService.toUpperCase()} • ${sType} ₹${selectedQuote.total_fare.toFixed(0)}`;
+    const warningBanner = $('wallet-warning-banner');
     if (!selectedQuote.has_sufficient_balance) {
       warningBanner.classList.remove('hidden');
-      document.getElementById('banner-deficit-amount').textContent = selectedQuote.deficit.toFixed(0);
+      $('banner-deficit-amount').textContent = selectedQuote.deficit.toFixed(0);
     } else {
       warningBanner.classList.add('hidden');
     }
   }
 }
 
-// --- Update UI with Current User Context ---
+// --- User profile UI ---
 function updateUserUI() {
   const u = AppState.currentUser;
   if (!u) return;
 
-  // Header
-  document.getElementById('header-wallet-amount').textContent = u.wallet_balance.toFixed(2);
-  document.getElementById('header-avatar').src = u.avatar_url || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120';
+  $('header-wallet-amount').textContent = money(u.wallet_balance);
+  $('header-avatar').src = safeImageUrl(u.avatar_url);
 
-  const badgeEl = document.getElementById('header-badge');
+  const badgeEl = $('header-badge');
   if (u.is_teacher_priority) {
     badgeEl.classList.remove('hidden');
-    document.getElementById('header-badge-text').textContent = 'Faculty Priority';
+    $('header-badge-text').textContent = 'Faculty Priority';
   } else {
     badgeEl.classList.add('hidden');
   }
 
-  // Profile Card
-  document.getElementById('profile-card-name').textContent = u.name;
-  document.getElementById('profile-card-avatar').src = u.avatar_url;
-  document.getElementById('profile-card-department').textContent = u.department || 'Lovely Professional University';
-  document.getElementById('profile-card-id').textContent = `LPU ID: ${u.lpu_id}`;
-  document.getElementById('profile-account-lpu').textContent = `Signed in as ${u.lpu_id} (${u.email})`;
+  $('profile-card-name').textContent = u.name;
+  $('profile-card-avatar').src = safeImageUrl(u.avatar_url);
+  $('profile-card-department').textContent = u.department || 'Lovely Professional University';
+  $('profile-card-id').textContent = `LPU ID: ${u.lpu_id}`;
+  $('profile-account-lpu').textContent = `Signed in as ${u.lpu_id} (${u.email})`;
 
-  // Role Buttons
-  document.querySelectorAll('.role-pill-btn').forEach(btn => {
+  document.querySelectorAll('.role-pill-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.role === u.role);
   });
 
-  // Driver Section
-  const driverSec = document.getElementById('driver-dashboard-section');
+  const driverSec = $('driver-dashboard-section');
   if (u.role === 'driver' || u.role === 'both') {
     driverSec.classList.remove('hidden');
     if (u.vehicle) {
-      document.getElementById('veh-model-plate').textContent = `${u.vehicle.model} • ${u.vehicle.plate_number}`;
-      document.getElementById('veh-specs').textContent = `${u.vehicle.color} • ${u.vehicle.has_helmet ? 'Helmet Included' : ''} ${u.vehicle.has_ac ? 'AC Equipped' : ''}`;
+      const extras = [u.vehicle.color, u.vehicle.has_helmet ? 'Helmet Included' : '', u.vehicle.has_ac ? 'AC Equipped' : '']
+        .filter(Boolean).join(' • ');
+      $('veh-model-plate').textContent = `${u.vehicle.model} • ${u.vehicle.plate_number}`;
+      $('veh-specs').textContent = `${u.vehicle.category.toUpperCase()} • ${extras}`;
+      $('edit-vehicle-btn').textContent = 'Edit';
+    } else {
+      $('veh-model-plate').textContent = 'No vehicle registered';
+      $('veh-specs').textContent = 'Add your vehicle to go online and accept rides';
+      $('edit-vehicle-btn').textContent = 'Add Vehicle';
     }
   } else {
     driverSec.classList.add('hidden');
   }
 }
 
-// --- Mandatory Emergency Contacts ---
+// --- Emergency contacts ---
 async function loadEmergencyContacts() {
   if (!AppState.currentUser) return;
   try {
-    const res = await apiFetch('/api/user/emergency-contacts');
-    const data = await res.json();
-    const container = document.getElementById('emergency-contacts-list');
-    container.innerHTML = '';
+    const { ok, data } = await apiGet('/api/user/emergency-contacts');
+    if (!ok) return;
+    const container = $('emergency-contacts-list');
+    container.replaceChildren();
 
-    data.contacts.forEach(c => {
+    data.contacts.forEach((c) => {
       const el = document.createElement('div');
       el.className = 'contact-item';
       el.innerHTML = `
         <div>
-          <div class="contact-name">${c.name} ${c.is_primary ? '🛡️ (Primary)' : ''}</div>
-          <div class="contact-rel">${c.relationship}</div>
+          <div class="contact-name">${esc(c.name)} ${c.is_primary ? '🛡️ (Primary)' : ''}</div>
+          <div class="contact-rel">${esc(c.relationship)}</div>
         </div>
-        <div class="contact-phone">${c.phone}</div>
+        <div class="contact-phone">${esc(c.phone)}</div>
+        <button class="btn-link contact-remove-btn" data-id="${esc(c.id)}" title="Remove contact">✕</button>
       `;
       container.appendChild(el);
     });
@@ -656,91 +717,116 @@ async function loadEmergencyContacts() {
   }
 }
 
-// --- Check Active Ride / During-Ride Session on Startup / Persona Switch ---
+async function handleAddContact() {
+  const errorEl = $('emg-error-text');
+  errorEl.classList.add('hidden');
+  const name = $('emg-name-input').value.trim();
+  const phone = $('emg-phone-input').value.trim();
+  if (!name || !phone) {
+    errorEl.textContent = 'Name and phone number are required.';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+  const { ok, data } = await apiPost('/api/user/emergency-contacts', {
+    name,
+    relationship: $('emg-rel-input').value.trim(),
+    phone
+  });
+  if (!ok) {
+    errorEl.textContent = data.error || 'Could not save contact';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+  ['emg-name-input', 'emg-rel-input', 'emg-phone-input'].forEach((id) => { $(id).value = ''; });
+  closeModal('modal-add-contact');
+  await loadEmergencyContacts();
+}
+
+async function handleRemoveContact(contactId) {
+  if (!confirm('Remove this emergency contact?')) return;
+  const res = await apiFetch(`/api/user/emergency-contacts/${encodeURIComponent(contactId)}`, { method: 'DELETE' });
+  if (!res.ok) {
+    alert('Could not remove contact');
+    return;
+  }
+  await loadEmergencyContacts();
+}
+
+// --- Active ride / cockpit detection ---
 async function checkActiveRide() {
   if (!AppState.currentUser) return;
   try {
-    // 1. Check for active scheduled carpool during-ride cockpit
-    const sessRes = await apiFetch('/api/user/active-session');
-    const sessData = await sessRes.json();
-
-    if (sessData.active_session && sessData.session_type === 'scheduled_route') {
-      const route = sessData.active_session;
-      if (route.status === 'in_progress') {
-        await openDuringRideCockpit(route.route_id);
-        return;
-      }
+    const sess = await apiGet('/api/user/active-session');
+    if (sess.ok && sess.data.active_session && sess.data.session_type === 'scheduled_route'
+        && sess.data.active_session.status === 'in_progress') {
+      await openDuringRideCockpit(sess.data.active_session.route_id);
+      return;
     }
 
-    // 2. Check for on-demand active ride
-    const res = await apiFetch('/api/rides/active');
-    const data = await res.json();
+    const { ok, data } = await apiGet('/api/rides/active');
+    if (!ok) return;
 
     if (data.active_ride) {
       AppState.activeRide = data.active_ride;
       if (data.active_ride.status === 'queued') {
         renderQueueStatus(data.active_ride);
       } else {
+        hideQueueStatus();
         renderActiveRide(data.active_ride);
         switchView('view-active-ride');
       }
     } else {
       AppState.activeRide = null;
-      AppState.activeCockpitRouteId = null;
-      document.getElementById('queue-status-card').classList.add('hidden');
-      document.getElementById('nav-queue-dot').classList.add('hidden');
+      hideQueueStatus();
     }
   } catch (err) {
     console.error('Failed to check active ride:', err);
   }
 }
 
-// --- Book Ride Handler ---
+// --- Booking ---
 async function handleBookRide() {
   if (!AppState.currentUser) return;
-
   const quote = AppState.quotes ? AppState.quotes[AppState.selectedService] : null;
-  if (!quote) return;
-
-  // Pre-check wallet balance on client before submitting
+  if (!quote) {
+    alert($('selected-service-summary').textContent || 'Choose a valid pickup and drop first.');
+    return;
+  }
   if (!quote.has_sufficient_balance) {
+    $('topup-custom-input').value = Math.ceil(quote.deficit + 20);
     openModal('modal-topup');
-    document.getElementById('topup-custom-input').value = Math.ceil(quote.deficit + 20);
     return;
   }
 
-  const btn = document.getElementById('find-ride-btn');
+  const btn = $('find-ride-btn');
   btn.disabled = true;
-  document.getElementById('find-ride-text').textContent = 'Matching...';
+  $('find-ride-text').textContent = 'Matching...';
 
   try {
-    const res = await apiFetch('/api/rides/book', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        pickup_key: AppState.pickupKey,
-        drop_key: AppState.dropKey,
-        service_type: AppState.selectedService,
-        scope: AppState.selectedScope
-      })
+    const { ok, status, data } = await apiPost('/api/rides/book', {
+      pickup_key: AppState.pickupKey,
+      drop_key: AppState.dropKey,
+      service_type: AppState.selectedService,
+      scope: AppState.selectedScope
     });
 
-    const data = await res.json();
-    btn.disabled = false;
-    document.getElementById('find-ride-text').textContent = 'Find Ride';
-
-    if (!res.ok) {
-      if (res.status === 402) { // Insufficient Balance
+    if (!ok) {
+      if (status === 402) {
+        $('topup-custom-input').value = Math.ceil((data.deficit || 0) + 20);
         openModal('modal-topup');
-        document.getElementById('topup-custom-input').value = Math.ceil(data.deficit + 20);
+      } else if (data.code === 'CONCURRENT_RIDE_EXISTS') {
+        alert('You already have a ride in progress. Check the Activity tab to view or cancel it.');
+        await checkActiveRide();
+        switchView('view-activity');
       } else {
         alert(data.error || 'Failed to book ride');
       }
       return;
     }
 
+    setWalletBalance(data.wallet_balance);
     if (data.status === 'queued') {
-      alert(`Peak-time rush: You are queued at position #${data.queue_position}.${data.is_priority ? ' (Teacher Priority Applied ⭐)' : ''}`);
+      alert(`All nearby drivers are busy. You are #${data.queue_position} in the queue.${data.is_priority ? ' (Teacher Priority Applied ⭐)' : ''}\nYour fare is held and fully refunded if you cancel.`);
       await checkActiveRide();
       switchView('view-activity');
     } else {
@@ -749,41 +835,71 @@ async function handleBookRide() {
     }
   } catch (err) {
     console.error('Book ride failed:', err);
+    alert('Could not reach the server. Please try again.');
+  } finally {
     btn.disabled = false;
-    document.getElementById('find-ride-text').textContent = 'Find Ride';
+    $('find-ride-text').textContent = 'Find Ride';
   }
 }
 
-// --- Render Queue Status in Activity Tab ---
+// --- Queue card (Activity tab) ---
 function renderQueueStatus(ride) {
-  const card = document.getElementById('queue-status-card');
-  card.classList.remove('hidden');
-  document.getElementById('nav-queue-dot').classList.remove('hidden');
+  $('queue-status-card').classList.remove('hidden');
+  $('nav-queue-dot').classList.remove('hidden');
+  $('queue-pos-badge').textContent = `Position #${ride.queue_position || 1}`;
+  $('queue-priority-note').classList.toggle('hidden', !ride.is_priority);
 
-  document.getElementById('queue-pos-badge').textContent = `Position #${ride.queue_position || 1}`;
-  const prioNote = document.getElementById('queue-priority-note');
-  if (ride.is_priority) {
-    prioNote.classList.remove('hidden');
-  } else {
-    prioNote.classList.add('hidden');
+  // Poll so the rider moves to the live view as soon as a driver accepts.
+  if (!AppState.timers.queue) {
+    AppState.timers.queue = setInterval(checkActiveRide, 10000);
   }
 }
 
+function hideQueueStatus() {
+  $('queue-status-card').classList.add('hidden');
+  $('nav-queue-dot').classList.add('hidden');
+  clearInterval(AppState.timers.queue);
+  AppState.timers.queue = null;
+}
+
+async function handleCancelRide() {
+  const ride = AppState.activeRide;
+  if (!ride) return;
+  const isRider = ride.is_rider !== false;
+  const question = isRider
+    ? 'Cancel this ride? Your held fare will be refunded in full.'
+    : 'Release this ride? It will go back to the queue for another driver.';
+  if (!confirm(question)) return;
+
+  const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(ride.id)}/cancel`);
+  if (!ok) {
+    alert(data.error || 'Could not cancel the ride');
+    return;
+  }
+  AppState.activeRide = null;
+  hideQueueStatus();
+  if (typeof data.wallet_balance === 'number') setWalletBalance(data.wallet_balance);
+  switchView(isRider ? 'view-ride' : 'view-profile');
+  fetchFareQuotes();
+  if (!isRider) loadDriverRequests();
+}
+
+// --- Activity / wallet history ---
 async function loadActivityHistory() {
   if (!AppState.currentUser) return;
-
-  const container = document.getElementById('transactions-list');
+  const container = $('transactions-list');
   try {
-    const res = await apiFetch('/api/wallet');
-    const data = await res.json();
-    container.innerHTML = '';
+    const { ok, data } = await apiGet('/api/wallet');
+    if (!ok) throw new Error(data.error);
+    container.replaceChildren();
+    setWalletBalance(data.balance);
 
     if (!data.transactions || data.transactions.length === 0) {
       container.innerHTML = '<p class="empty-state">No transactions or completed rides yet.</p>';
       return;
     }
 
-    data.transactions.forEach(transaction => {
+    data.transactions.forEach((transaction) => {
       const item = document.createElement('div');
       item.className = 'tx-item';
       const amount = Number(transaction.amount || 0);
@@ -791,7 +907,7 @@ async function loadActivityHistory() {
       item.innerHTML = `
         <div>
           <span class="tx-desc"></span>
-          <span class="tx-date">${date}</span>
+          <span class="tx-date">${esc(date)}</span>
         </div>
         <strong class="tx-amount ${amount < 0 ? 'negative' : ''}">${amount < 0 ? '-' : '+'}₹${Math.abs(amount).toFixed(2)}</strong>
       `;
@@ -804,665 +920,757 @@ async function loadActivityHistory() {
   }
 }
 
-// --- Render Active Ride Tracking Screen ---
+// --- Live ride screen ---
+function passengerChip(name, avatar, suffix = '') {
+  const chip = document.createElement('span');
+  chip.className = 'passenger-chip';
+  chip.innerHTML = `
+    <img src="${esc(safeImageUrl(avatar))}" alt="">
+    <span class="passenger-chip-name">${esc(name)}${suffix ? ` ${esc(suffix)}` : ''}</span>
+  `;
+  return chip;
+}
+
+function updateRideControls(status, isRider) {
+  const cancelBtn = $('cancel-ride-btn');
+  const completeBtn = $('complete-ride-btn');
+  const cancellable = ['queued', 'matched', 'arriving'].includes(status);
+  cancelBtn.classList.toggle('hidden', !cancellable);
+  cancelBtn.querySelector('span').textContent = isRider ? 'Cancel Ride (Refund)' : 'Release Ride';
+  completeBtn.classList.remove('hidden');
+  completeBtn.disabled = status !== 'in_progress';
+  completeBtn.title = status === 'in_progress' ? '' : 'Available after pickup';
+}
+
 function renderActiveRide(ride) {
-  document.getElementById('active-trip-fare').textContent = ride.fare.toFixed(2);
-  document.getElementById('active-pickup-name').textContent = ride.pickup_name;
-  document.getElementById('active-drop-name').textContent = ride.drop_name;
-  document.getElementById('cockpit-route-title').textContent = `${ride.pickup_name} ➔ ${ride.drop_name}`;
+  AppState.activeCockpitRouteId = null;
+  $('active-trip-fare').textContent = money(ride.fare);
+  $('active-pickup-name').textContent = ride.pickup_name;
+  $('active-drop-name').textContent = ride.drop_name;
+  $('cockpit-route-title').textContent = `${ride.pickup_name} ➔ ${ride.drop_name}`;
 
   const isArriving = ride.status === 'arriving' || ride.status === 'matched';
-  document.getElementById('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
-  document.getElementById('cockpit-telemetry-sub').textContent = isArriving ? 'Driver is heading to your campus pickup point' : 'En route to destination safely';
+  $('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
+  $('cockpit-telemetry-sub').textContent = isArriving ? 'Driver is heading to your pickup point' : 'En route to destination';
 
-  // Driver details
-  document.getElementById('active-driver-name').textContent = ride.driver_name || 'Assigned Driver';
-  if (ride.driver_avatar) {
-    document.getElementById('active-driver-avatar').src = ride.driver_avatar;
-  }
-  document.getElementById('active-vehicle-model').textContent = ride.vehicle_model || 'Vehicle';
-  document.getElementById('active-vehicle-plate').textContent = ride.vehicle_plate || 'PB08-XX';
+  $('active-driver-name').textContent = ride.driver_name || 'Assigned Driver';
+  $('active-driver-avatar').src = safeImageUrl(ride.driver_avatar);
+  $('active-vehicle-model').textContent = ride.vehicle_model || 'Vehicle';
+  $('active-vehicle-plate').textContent = ride.vehicle_plate || '—';
 
-  // Manifest (single rider)
-  const manifestBox = document.getElementById('cockpit-passenger-list');
-  manifestBox.innerHTML = `
-    <span class="passenger-chip">
-      <img src="${ride.rider_avatar || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120'}">
-      <span class="passenger-chip-name">${ride.rider_name || 'Rider'} (Primary)</span>
-    </span>
-  `;
-  document.getElementById('manifest-count-badge').textContent = '1 Passenger Onboard';
+  const manifestBox = $('cockpit-passenger-list');
+  manifestBox.replaceChildren(passengerChip(ride.rider_name || 'Rider', ride.rider_avatar, '(Rider)'));
+  $('manifest-count-badge').textContent = '1 Passenger';
 
-  // Active Map Pins & Polyline
+  updateRideControls(ride.status, ride.is_rider !== false);
+  $('share-live-btn').classList.toggle('hidden', !ride.share_token);
+
   if (AppState.activeMap) {
     setTimeout(() => AppState.activeMap.invalidateSize(), 200);
-
-    Object.values(AppState.activeMarkers).forEach(m => AppState.activeMap.removeLayer(m));
-    AppState.activeMarkers = {};
-    if (AppState.activePolyline) {
-      AppState.activeMap.removeLayer(AppState.activePolyline);
-    }
+    clearActiveMap();
 
     const pCoords = [ride.pickup_lat, ride.pickup_lng];
     const dCoords = [ride.drop_lat, ride.drop_lng];
     const drCoords = [ride.driver_live_lat || ride.pickup_lat, ride.driver_live_lng || ride.pickup_lng];
 
-    AppState.activeMarkers.pickup = L.marker(pCoords, {
-      icon: L.divIcon({
-        className: 'active-pin',
-        html: `<div style="background:#10B981; width:22px; height:22px; border-radius:50%; border:2px solid white; display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">P</div>`,
-        iconSize: [22, 22]
-      })
-    }).addTo(AppState.activeMap);
-
-    AppState.activeMarkers.drop = L.marker(dCoords, {
-      icon: L.divIcon({
-        className: 'active-pin',
-        html: `<div style="background:#FF7C00; width:22px; height:22px; border-radius:50%; border:2px solid white; display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">D</div>`,
-        iconSize: [22, 22]
-      })
-    }).addTo(AppState.activeMap);
-
-    const iconChar = ride.service_type === 'car' ? '🚗' : '🏍️';
-    AppState.activeMarkers.driver = L.marker(drCoords, {
-      icon: L.divIcon({
-        className: 'driver-live-marker',
-        html: `<div style="background:#111827; width:32px; height:32px; border-radius:50%; border:3px solid #FF7C00; display:flex; align-items:center; justify-content:center; font-size:16px; box-shadow:0 0 12px rgba(255,124,0,0.5);">${iconChar}</div>`,
-        iconSize: [32, 32],
-        iconAnchor: [16, 16]
-      })
-    }).addTo(AppState.activeMap);
-
-    AppState.activePolyline = L.polyline([pCoords, dCoords], {
-      color: '#FF7C00',
-      weight: 5,
-      opacity: 0.8,
-      dashArray: '8, 8'
-    }).addTo(AppState.activeMap);
-
+    AppState.activeMarkers.pickup = L.marker(pCoords, { icon: pinIcon('#10B981', 'P', 22) }).addTo(AppState.activeMap);
+    AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#FF7C00', 'D', 22) }).addTo(AppState.activeMap);
+    AppState.activeMarkers.driver = L.marker(drCoords, { icon: vehicleIcon(ride.service_type, 32) }).addTo(AppState.activeMap);
+    AppState.activePolyline = L.polyline([pCoords, dCoords], { color: '#FF7C00', weight: 5, opacity: 0.8, dashArray: '8, 8' })
+      .addTo(AppState.activeMap);
     AppState.activeMap.fitBounds([pCoords, dCoords], { padding: [40, 40] });
   }
 }
 
-// --- Advance Telemetry Simulation (Scheduled Cockpit OR On-Demand) ---
+function clearActiveMap() {
+  Object.values(AppState.activeMarkers).forEach((m) => AppState.activeMap.removeLayer(m));
+  AppState.activeMarkers = {};
+  if (AppState.activePolyline) {
+    AppState.activeMap.removeLayer(AppState.activePolyline);
+    AppState.activePolyline = null;
+  }
+}
+
+// --- Simulation step (scheduled cockpit OR on-demand ride) ---
 async function advanceTelemetryStep() {
   if (AppState.activeCockpitRouteId) {
-    try {
-      const res = await apiFetch(`/api/routes/${AppState.activeCockpitRouteId}/telemetry-step`, { method: 'POST' });
-      const data = await res.json();
-      if (data.current_lat && AppState.activeMarkers.car) {
-        AppState.activeMarkers.car.setLatLng([data.current_lat, data.current_lng]);
-        document.getElementById('cockpit-telemetry-sub').textContent = `${data.distance_remaining_km} km remaining • Moving towards destination`;
-      }
-    } catch (err) {
-      console.error('Failed to advance route telemetry:', err);
+    const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/telemetry-step`);
+    if (!ok) {
+      alert(data.error || 'Could not update the trip');
+      return;
     }
+    if (AppState.activeMarkers.car) AppState.activeMarkers.car.setLatLng([data.current_lat, data.current_lng]);
+    $('cockpit-telemetry-sub').textContent = `${data.distance_remaining_km} km remaining • Moving towards destination`;
     return;
   }
 
-  if (AppState.activeRide) {
-    try {
-      const res = await apiFetch(`/api/rides/${AppState.activeRide.id}/telemetry-step`, { method: 'POST' });
-      const data = await res.json();
-      if (data.status) {
-        AppState.activeRide.status = data.status;
-        if (AppState.activeMarkers.driver && data.current_lat) {
-          AppState.activeMarkers.driver.setLatLng([data.current_lat, data.current_lng]);
-        }
-        const isArriving = data.status === 'arriving';
-        document.getElementById('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
-        document.getElementById('cockpit-telemetry-sub').textContent = `Distance remaining: ${data.distance_remaining_km} km`;
-      }
-    } catch (err) {
-      console.error('Failed to advance telemetry:', err);
-    }
-  }
-}
-
-// --- Complete Ride & Clean Dashboard Reset ---
-async function handleCompleteRide() {
-  // Case 1: Scheduled Carpool Cockpit
-  if (AppState.activeCockpitRouteId) {
-    try {
-      const res = await apiFetch(`/api/routes/${AppState.activeCockpitRouteId}/complete`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        alert(`🏁 Carpool trip completed! Host payout of ₹${data.driver_payout} disbursed.\n\nDashboard is now reset to clean idle state for all passengers.`);
-        
-        // Reset state
-        AppState.activeCockpitRouteId = null;
-        openModal('modal-rating');
-        switchView('view-ride');
-
-        // Refresh user context & scheduled routes
-        await refreshCurrentUser();
-        await loadCityLinkRoutes();
-      }
-    } catch (err) {
-      console.error('Failed to complete scheduled route:', err);
-    }
-    return;
-  }
-
-  // Case 2: On-demand Ride
-  if (AppState.activeRide) {
-    try {
-      const res = await apiFetch(`/api/rides/${AppState.activeRide.id}/complete`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        openModal('modal-rating');
-        if (AppState.currentUser) {
-          AppState.currentUser.wallet_balance = data.rider_balance_after;
-          updateUserUI();
-        }
-        AppState.activeRide = null;
-        switchView('view-ride');
-        fetchFareQuotes();
-      }
-    } catch (err) {
-      console.error('Failed to complete ride:', err);
-    }
-  }
-}
-
-// --- Submit Rating ---
-async function submitRating() {
   if (!AppState.activeRide) return;
-  try {
-    await apiFetch(`/api/rides/${AppState.activeRide.id}/rate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rating: 5,
-        tags: 'Safe Ride, Punctual, Verified LPU',
-        comment: 'Great campus ride!'
-      })
-    });
-
-    closeModal('modal-rating');
-    AppState.activeRide = null;
-    switchView('view-ride');
-    fetchFareQuotes();
-  } catch (err) {
-    console.error('Failed to submit rating:', err);
+  const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(AppState.activeRide.id)}/telemetry-step`);
+  if (!ok) {
+    alert(data.error || 'Could not update the ride');
+    return;
   }
+  AppState.activeRide.status = data.status;
+  if (AppState.activeMarkers.driver && data.current_lat) {
+    AppState.activeMarkers.driver.setLatLng([data.current_lat, data.current_lng]);
+  }
+  const isArriving = data.status === 'arriving' || data.status === 'matched';
+  $('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
+  if (data.distance_remaining_km !== undefined) {
+    $('cockpit-telemetry-sub').textContent = `${isArriving ? 'Driver is' : 'Destination is'} ${data.distance_remaining_km} km away`;
+  }
+  updateRideControls(data.status, AppState.activeRide.is_rider !== false);
 }
 
-// --- Trigger Persistent SOS with Multi-Channel Alert ---
+// --- Completing trips ---
+async function handleCompleteRide() {
+  if (AppState.activeCockpitRouteId) {
+    const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/complete`);
+    if (!ok) {
+      alert(data.error || 'Could not complete the trip');
+      return;
+    }
+    alert(`🏁 Carpool trip completed! Host payout of ₹${money(data.driver_payout)} added to your wallet.`);
+    AppState.activeCockpitRouteId = null;
+    switchView('view-citylink');
+    await refreshCurrentUser();
+    await loadDriverEarnings();
+    return;
+  }
+
+  if (!AppState.activeRide) return;
+  const rideId = AppState.activeRide.id;
+  const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(rideId)}/complete`);
+  if (!ok) {
+    alert(data.error || 'Could not complete the ride');
+    return;
+  }
+  AppState.activeRide = null;
+  switchView('view-ride');
+  await refreshCurrentUser();
+  await loadDriverEarnings();
+  fetchFareQuotes();
+  openRatingModal(rideId);
+}
+
+// --- Rating ---
+function openRatingModal(rideId) {
+  AppState.ratingRideId = rideId;
+  setRating(5);
+  document.querySelectorAll('#modal-rating .tag-pill').forEach((t) => t.classList.remove('active'));
+  openModal('modal-rating');
+}
+
+function setRating(value) {
+  AppState.ratingValue = value;
+  document.querySelectorAll('#star-rating-picker .star-btn').forEach((star) => {
+    star.classList.toggle('active', Number(star.dataset.val) <= value);
+  });
+}
+
+async function submitRating() {
+  const rideId = AppState.ratingRideId;
+  if (!rideId) {
+    closeModal('modal-rating');
+    return;
+  }
+  const tags = Array.from(document.querySelectorAll('#modal-rating .tag-pill.active')).map((t) => t.textContent.trim());
+  const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(rideId)}/rate`, {
+    rating: AppState.ratingValue,
+    tags: tags.join(', ')
+  });
+  if (!ok && data.code !== 'ALREADY_RATED') {
+    alert(data.error || 'Could not save your rating');
+    return;
+  }
+  AppState.ratingRideId = null;
+  closeModal('modal-rating');
+}
+
+// --- SOS ---
+function getBrowserPosition(timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) {
+      resolve(null);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 30000 }
+    );
+  });
+}
+
+async function resolveSosLocation() {
+  // 1. The phone's real position, named after the closest landmark.
+  const gps = await getBrowserPosition();
+  if (gps) {
+    const { ok, data } = await apiPost('/api/campus/locate', gps);
+    if (ok && data.distance_km < 2) {
+      return { ...gps, name: `Near ${data.landmark.name}` };
+    }
+    return { ...gps, name: `GPS ${gps.lat.toFixed(5)}, ${gps.lng.toFixed(5)}` };
+  }
+  // 2. Without GPS: the driver's live position during a ride.
+  const ride = AppState.activeRide;
+  if (ride && ride.driver_live_lat && ride.status === 'in_progress') {
+    return { lat: ride.driver_live_lat, lng: ride.driver_live_lng, name: `En route from ${ride.pickup_name} (approx.)` };
+  }
+  if (ride) {
+    return { lat: ride.pickup_lat, lng: ride.pickup_lng, name: `${ride.pickup_name} (approx.)` };
+  }
+  // 3. Last resort: the pickup selected on the booking form.
+  const p = AppState.landmarks[AppState.pickupKey] || { lat: LPU_COORDS[0], lng: LPU_COORDS[1], name: 'LPU Campus' };
+  return { lat: p.lat, lng: p.lng, name: `${p.name} (approx., GPS unavailable)` };
+}
+
+const DELIVERY_LABELS = {
+  sent: '✓ Texted',
+  failed: '✗ Sending failed',
+  not_sent: 'Not texted',
+  invalid_number: 'Invalid number'
+};
+
 async function handleTriggerSOS() {
   if (!AppState.currentUser) return;
-  const p = AppState.landmarks[AppState.pickupKey] || { lat: 31.2536, lng: 75.7037, name: 'LPU Campus' };
-
+  const sosBtn = $('persistent-sos-btn');
+  sosBtn.disabled = true;
   try {
-    const res = await apiFetch('/api/sos/trigger', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ride_id: AppState.activeRide ? AppState.activeRide.id : null,
-        lat: p.lat,
-        lng: p.lng,
-        location_name: p.name
-      })
+    const loc = await resolveSosLocation();
+    const { ok, data } = await apiPost('/api/sos/trigger', {
+      ride_id: AppState.activeRide ? AppState.activeRide.id : null,
+      lat: loc.lat,
+      lng: loc.lng,
+      location_name: loc.name
+    });
+    if (!ok) {
+      alert(`${data.error || 'Could not record the SOS.'}\nCall campus security now: ${AppState.config.security_hotline}`);
+      return;
+    }
+
+    $('sos-display-location').textContent = loc.name;
+    const total = data.contacts_notified.length;
+    $('sos-contacts-count').textContent = data.sms_gateway_configured
+      ? `${data.contacts_sent} of ${total} contacts texted`
+      : `SMS is not set up on this server. Your ${total} contacts were NOT texted. Call them directly.`;
+    $('sos-gateway-tag').textContent = data.sms_gateway_configured ? 'SMS gateway active' : 'No SMS gateway';
+    $('sos-sms-text').textContent = data.sos_message;
+    $('sos-advice-text').textContent = data.campus_security_dispatch.message;
+
+    const hotline = data.campus_security_hotline;
+    $('sos-hotline-link').textContent = `Call ${hotline}`;
+    $('sos-hotline-link').href = `tel:${hotline.replace(/[^\d+]/g, '')}`;
+
+    const listEl = $('sos-dispatched-recipients');
+    listEl.replaceChildren();
+    data.contacts_notified.forEach((c) => {
+      const row = document.createElement('div');
+      row.className = 'sos-recipient-item';
+      const status = c.delivery.status;
+      row.innerHTML = `
+        <div>
+          <strong>${esc(c.contact_name)}</strong> (${esc(c.relationship)}) •
+          <a href="tel:${esc(String(c.contact_phone).replace(/[^\d+]/g, ''))}" style="font-family:var(--font-mono)">${esc(c.contact_phone)}</a>
+        </div>
+        <span class="check">${esc(DELIVERY_LABELS[status] || status)}</span>
+      `;
+      listEl.appendChild(row);
     });
 
-    const data = await res.json();
-    if (data.success) {
-      document.getElementById('sos-display-location').textContent = p.name;
-      document.getElementById('sos-contacts-count').textContent = `${data.contacts_notified.length} Contacts Dispatched`;
-      
-      // Render real SMS message payload
-      if (data.sos_message) {
-        document.getElementById('sos-sms-text').textContent = data.sos_message;
-      }
-      
-      // Render delivery records
-      const listEl = document.getElementById('sos-dispatched-recipients');
-      listEl.innerHTML = '';
-      data.contacts_notified.forEach(c => {
-        const row = document.createElement('div');
-        row.className = 'sos-recipient-item';
-        row.innerHTML = `
-          <div>
-            <strong>${c.contact_name}</strong> (${c.relationship}) • <span style="font-family:var(--font-mono)">${c.contact_phone}</span>
-          </div>
-          <span class="check">✓ ${c.delivery.status}</span>
-        `;
-        listEl.appendChild(row);
-      });
-
-      openModal('modal-sos');
-    }
+    openModal('modal-sos');
   } catch (err) {
     console.error('Failed to trigger SOS:', err);
+    alert(`Could not reach the server. Call campus security now: ${AppState.config.security_hotline}`);
+  } finally {
+    sosBtn.disabled = false;
   }
 }
 
-// --- Share Trip Link ---
+// --- Share live trip link ---
 function handleShareTrip() {
-  if (!AppState.activeRide) return;
-  const token = AppState.activeRide.share_token || 'share_demo123';
-  const url = `${window.location.origin}/api/rides/share/${token}`;
-  document.getElementById('share-link-input').value = url;
+  const ride = AppState.activeRide;
+  if (!ride || !ride.share_token) {
+    alert('Live sharing is available for on-demand rides.');
+    return;
+  }
+  $('share-link-input').value = `${window.location.origin}/track/${encodeURIComponent(ride.share_token)}`;
   openModal('modal-share-trip');
 }
 
-// --- Enhanced Payment Handlers: UPI QR Code & Razorpay ---
-let currentUpiRef = null;
+// --- Wallet top-up: UPI QR & Razorpay ---
+function setTopupStatus(message) {
+  const el = $('topup-status-text');
+  el.textContent = message || '';
+  el.classList.toggle('hidden', !message);
+}
+
+function currentTopupAmount() {
+  return parseFloat($('topup-custom-input').value) || 100;
+}
+
+function scheduleQrRefresh() {
+  clearTimeout(AppState.timers.qr);
+  AppState.timers.qr = setTimeout(() => fetchUpiQr(currentTopupAmount()), 400);
+}
 
 async function fetchUpiQr(amount) {
   if (!AppState.currentUser) return;
-  const container = document.getElementById('upi-qr-container');
+  const container = $('upi-qr-container');
   container.innerHTML = '<div class="qr-loading-spinner">Generating UPI QR...</div>';
-  document.getElementById('qr-pay-amount-label').textContent = amount;
-  document.getElementById('rzp-pay-amount-label').textContent = amount;
+  $('qr-pay-amount-label').textContent = amount;
+  $('rzp-pay-amount-label').textContent = amount;
+  AppState.currentUpiRef = null;
 
   try {
-    const res = await apiFetch('/api/payments/upi/create-qr', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amount: amount })
-    });
-
-    const data = await res.json();
-    if (data.success) {
-      currentUpiRef = data.reference_id;
-      container.innerHTML = data.svg_qr;
-      document.getElementById('upi-vpa-text').textContent = data.vpa;
-      const intentBtn = document.getElementById('open-upi-intent-btn');
-      intentBtn.href = data.upi_uri;
-    } else {
-      container.innerHTML = `<span style="color:red; font-size:0.7rem;">Error: ${data.error}</span>`;
+    const { ok, data } = await apiPost('/api/payments/upi/create-qr', { amount });
+    if (!ok) {
+      const msg = document.createElement('span');
+      msg.style.cssText = 'color:red; font-size:0.7rem;';
+      msg.textContent = data.error || 'Could not create QR';
+      container.replaceChildren(msg);
+      return;
     }
+    AppState.currentUpiRef = data.reference_id;
+    const img = document.createElement('img');
+    img.src = data.qr_data_url;
+    img.alt = 'UPI payment QR code';
+    img.style.cssText = 'width:100%; height:auto;';
+    container.replaceChildren(img);
+    $('upi-vpa-text').textContent = data.vpa;
+    $('open-upi-intent-btn').href = data.upi_uri.startsWith('upi://') ? data.upi_uri : '#';
   } catch (err) {
     console.error('Failed to generate UPI QR:', err);
-    container.innerHTML = '<span style="color:red; font-size:0.7rem;">Failed to load QR</span>';
+    container.textContent = 'Failed to load QR';
   }
 }
 
 async function handleConfirmUpiPayment() {
-  if (!AppState.currentUser) return;
-  const amount = parseFloat(document.getElementById('topup-custom-input').value) || 100;
-
-  try {
-    const res = await apiFetch('/api/payments/upi/confirm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        amount: amount,
-        reference_id: currentUpiRef || `UPI_${Date.now()}`
-      })
-    });
-
-    const data = await res.json();
-    if (data.success) {
-      AppState.currentUser.wallet_balance = data.new_balance;
-      updateUserUI();
-      closeModal('modal-topup');
-      fetchFareQuotes();
-      alert(`Payment of ₹${amount} confirmed via UPI! New balance: ₹${data.new_balance.toFixed(2)}`);
-    } else {
-      alert(data.error || 'Payment confirmation failed');
-    }
-  } catch (err) {
-    console.error('UPI payment error:', err);
+  if (!AppState.currentUser || !AppState.currentUpiRef) return;
+  const { ok, status, data } = await apiPost('/api/payments/upi/confirm', { reference_id: AppState.currentUpiRef });
+  if (!ok) {
+    setTopupStatus(data.error || 'Payment confirmation failed');
+    return;
   }
+  if (status === 202) {
+    setTopupStatus(data.message);
+    AppState.currentUpiRef = null;
+    return;
+  }
+  setWalletBalance(data.new_balance);
+  closeModal('modal-topup');
+  fetchFareQuotes();
+  alert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
+}
+
+function loadRazorpayScript() {
+  if (window.Razorpay) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.onload = resolve;
+    script.onerror = () => reject(new Error('Could not load Razorpay checkout'));
+    document.head.appendChild(script);
+  });
+}
+
+async function verifyRazorpayPayment(orderId, paymentId, signature) {
+  const { ok, data } = await apiPost('/api/payments/razorpay/verify', {
+    order_id: orderId,
+    payment_id: paymentId,
+    signature
+  });
+  if (!ok) {
+    setTopupStatus(data.error || 'Payment verification failed');
+    return;
+  }
+  setWalletBalance(data.new_balance);
+  closeModal('modal-topup');
+  fetchFareQuotes();
+  alert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
 }
 
 async function handleRazorpayCheckout() {
   if (!AppState.currentUser) return;
-  const amount = parseFloat(document.getElementById('topup-custom-input').value) || 100;
+  setTopupStatus('');
+  const { ok, data: order } = await apiPost('/api/payments/razorpay/create-order', { amount: currentTopupAmount() });
+  if (!ok) {
+    setTopupStatus(order.error || 'Failed to start the payment');
+    return;
+  }
+
+  if (order.demo_mode) {
+    // Demo servers accept a fixed test signature; live servers never do.
+    await verifyRazorpayPayment(order.order_id, `pay_demo_${Date.now()}`, 'demo_signature_valid');
+    return;
+  }
 
   try {
-    // 1. Create order
-    const orderRes = await apiFetch('/api/payments/razorpay/create-order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amount: amount })
-    });
-    const orderData = await orderRes.json();
-
-    if (!orderData.success) {
-      alert(orderData.error || 'Failed to initialize Razorpay order');
-      return;
-    }
-
-    // 2. Verify payment (simulated / test mode)
-    const verifyRes = await apiFetch('/api/payments/razorpay/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        order_id: orderData.order_id,
-        payment_id: `pay_${Date.now()}`,
-        signature: 'demo_signature_valid',
-        amount: amount
-      })
-    });
-
-    const verifyData = await verifyRes.json();
-    if (verifyData.success) {
-      AppState.currentUser.wallet_balance = verifyData.new_balance;
-      updateUserUI();
-      closeModal('modal-topup');
-      fetchFareQuotes();
-      alert(`Razorpay checkout verified! ₹${amount} credited. New balance: ₹${verifyData.new_balance.toFixed(2)}`);
-    } else {
-      alert(verifyData.error || 'Verification failed');
-    }
+    await loadRazorpayScript();
   } catch (err) {
-    console.error('Razorpay payment error:', err);
+    setTopupStatus(err.message);
+    return;
   }
+  const checkout = new window.Razorpay({
+    key: order.key_id,
+    amount: order.amount,
+    currency: order.currency,
+    order_id: order.order_id,
+    name: order.merchant_name,
+    description: 'CampusGo wallet top-up',
+    prefill: { email: AppState.currentUser.email, contact: AppState.currentUser.phone },
+    handler: (resp) => verifyRazorpayPayment(resp.razorpay_order_id, resp.razorpay_payment_id, resp.razorpay_signature)
+  });
+  checkout.on('payment.failed', (resp) => setTopupStatus(resp.error && resp.error.description ? resp.error.description : 'Payment failed'));
+  checkout.open();
 }
 
-// --- Driver Dashboard & CityLink Carpooling ---
+function configureTopupModal() {
+  const cfg = AppState.config || {};
+  $('modal-current-bal').textContent = money(AppState.currentUser.wallet_balance);
+  $('confirm-upi-label').textContent = cfg.payments_demo_mode ? 'Simulate Payment (Demo)' : "I've Paid";
+  $('rzp-mode-badge').textContent = cfg.payments_demo_mode ? 'RAZORPAY DEMO MODE' : 'RAZORPAY SECURE CHECKOUT';
+  document.querySelector('.pay-method-tab[data-method="razorpay"]').classList.toggle('hidden', !cfg.razorpay_enabled);
+  setTopupStatus('');
+  fetchUpiQr(currentTopupAmount());
+}
+
+// --- Driver dashboard ---
 async function loadDriverEarnings() {
   if (!AppState.currentUser) return;
   try {
-    const res = await apiFetch('/api/driver/earnings');
-    const data = await res.json();
-    document.getElementById('driver-total-earned').textContent = data.total_earnings.toFixed(2);
-    document.getElementById('driver-total-trips').textContent = data.total_trips;
-    document.getElementById('driver-rating-val').textContent = data.avg_rating.toFixed(1);
+    const { ok, data } = await apiGet('/api/driver/earnings');
+    if (!ok) return;
+    $('driver-total-earned').textContent = money(data.total_earnings);
+    $('driver-total-trips').textContent = data.total_trips;
+    $('driver-rating-val').textContent = data.avg_rating.toFixed(1);
+    $('driver-online-toggle').checked = data.is_online;
+    $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
+    $('driver-requests-section').classList.toggle('hidden', !data.has_vehicle);
+    if (data.has_vehicle) loadDriverRequests();
   } catch (err) {
     console.error('Failed to load driver earnings:', err);
   }
 }
 
-// --- Scheduled Carpool Routes & Automatic Pinning Dashboard ---
+async function handleToggleOnline(event) {
+  const wantOnline = event.target.checked;
+  const { ok, data } = await apiPost('/api/driver/toggle-online', { is_online: wantOnline });
+  if (!ok) {
+    event.target.checked = !wantOnline;
+    if (data.code === 'VEHICLE_REQUIRED') {
+      openVehicleModal();
+    } else {
+      alert(data.error || 'Could not change your status');
+    }
+    return;
+  }
+  $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
+  refreshNearbyDrivers();
+  fetchFareQuotes();
+}
+
+async function loadDriverRequests() {
+  const list = $('driver-requests-list');
+  const { ok, data } = await apiGet('/api/driver/requests');
+  if (!ok) {
+    list.innerHTML = `<p class="empty-state">${esc(data.error || 'Requests unavailable')}</p>`;
+    return;
+  }
+  if (!data.requests.length) {
+    list.innerHTML = '<p class="empty-state">No waiting requests.</p>';
+    return;
+  }
+  list.replaceChildren();
+  data.requests.forEach((r) => {
+    const card = document.createElement('div');
+    card.className = 'driver-request-card';
+    card.innerHTML = `
+      <div>
+        <div class="veh-title">${esc(r.pickup_name)} ➔ ${esc(r.drop_name)}</div>
+        <div class="veh-sub">${esc(r.rider_name)}${r.is_priority ? ' ⭐ Faculty' : ''} • You earn ₹${money(r.driver_payout)}</div>
+      </div>
+      <button class="btn-sm-primary" data-action="accept-ride" data-id="${esc(r.id)}">Accept</button>
+    `;
+    list.appendChild(card);
+  });
+}
+
+async function handleAcceptRide(rideId) {
+  const { ok, data } = await apiPost('/api/driver/accept', { ride_id: rideId });
+  if (!ok) {
+    alert(data.error || 'Could not accept this ride');
+    loadDriverRequests();
+    return;
+  }
+  await checkActiveRide();
+}
+
+function openVehicleModal() {
+  const v = AppState.currentUser && AppState.currentUser.vehicle;
+  $('veh-category-input').value = v ? v.category : 'bike';
+  $('veh-model-input').value = v ? v.model : '';
+  $('veh-plate-input').value = v ? v.plate_number : '';
+  $('veh-color-input').value = v ? v.color : '';
+  $('veh-capacity-input').value = v ? v.capacity : 1;
+  $('veh-helmet-input').checked = v ? Boolean(v.has_helmet) : true;
+  $('veh-ac-input').checked = v ? Boolean(v.has_ac) : false;
+  $('veh-error-text').classList.add('hidden');
+  openModal('modal-vehicle');
+}
+
+async function handleSaveVehicle() {
+  const errorEl = $('veh-error-text');
+  const { ok, data } = await apiPost('/api/user/vehicle', {
+    category: $('veh-category-input').value,
+    model: $('veh-model-input').value.trim(),
+    plate_number: $('veh-plate-input').value.trim(),
+    color: $('veh-color-input').value.trim(),
+    capacity: parseInt($('veh-capacity-input').value, 10) || 1,
+    has_helmet: $('veh-helmet-input').checked,
+    has_ac: $('veh-ac-input').checked
+  });
+  if (!ok) {
+    errorEl.textContent = data.error || 'Could not save vehicle';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+  closeModal('modal-vehicle');
+  await refreshCurrentUser();
+  await loadDriverEarnings();
+}
+
+// --- CityLink carpools ---
+function routeCardHtml(r, pinned) {
+  const chips = r.passengers.length
+    ? r.passengers.map((p) => `
+        <span class="passenger-chip">
+          <img src="${esc(safeImageUrl(p.passenger_avatar))}" alt="">
+          <span class="passenger-chip-name">${esc(p.passenger_name)}</span>
+          <span class="passenger-chip-seats">(${Number(p.seats)} seat${p.seats > 1 ? 's' : ''})</span>
+        </span>`).join('')
+    : '<span style="font-size:0.68rem; color:var(--text-muted);">No passengers yet</span>';
+
+  const id = esc(r.id);
+  let actions = '';
+  if (r.status === 'in_progress') {
+    actions = (r.is_host || r.has_joined)
+      ? `<button class="btn-start-cockpit" data-action="cockpit" data-id="${id}">🟢 Live Trip • Open Cockpit</button>`
+      : '<div class="route-note">Trip in progress</div>';
+  } else if (r.is_host) {
+    actions = `
+      ${r.passengers.length ? `<button class="btn-start-cockpit" data-action="start" data-id="${id}">🚀 Start Trip</button>` : '<div class="route-note">You are the host • waiting for passengers</div>'}
+      <button class="btn-sm-outline" data-action="cancel-route" data-id="${id}">Cancel Trip & Refund Passengers</button>`;
+  } else if (r.has_joined) {
+    actions = `<button class="btn-sm-outline" data-action="leave" data-id="${id}">Leave Trip (Full Refund)</button>`;
+  } else if (!pinned && r.available_seats > 0) {
+    const options = Array.from({ length: r.available_seats }, (_, i) => `<option value="${i + 1}">${i + 1} Seat${i > 0 ? 's' : ''}</option>`).join('');
+    actions = `
+      <div style="display:flex; gap:6px; align-items:center;">
+        <select class="seat-picker-select" data-seat-for="${id}" style="border:1px solid var(--border-light); border-radius:4px; padding:3px 6px; font-size:0.75rem;">${options}</select>
+        <button class="btn-join-route" data-action="join" data-id="${id}">Book Seat</button>
+      </div>`;
+  } else {
+    actions = '<div class="route-note">🔒 Ride is fully booked</div>';
+  }
+
+  return `
+    ${pinned ? `<div class="pinned-banner-header"><span class="pinned-pill">📌 PINNED & FULL</span><span class="pinned-seats-full">All ${Number(r.total_seats)} Seats Booked</span></div>` : ''}
+    <div class="route-card-header">
+      <div>
+        <div class="route-dest-title">${esc(r.origin)} ➔ ${esc(r.destination)}</div>
+        <div style="font-size:0.75rem; color:var(--text-secondary);">Departure: <strong>${esc(r.departure_time)}</strong></div>
+        ${r.notes ? `<div style="font-size:0.7rem; color:var(--text-muted);">${esc(r.notes)}</div>` : ''}
+      </div>
+      <div class="route-price-tag">₹${Number(r.price_per_seat).toFixed(0)} <span style="font-size:0.6rem; color:var(--text-muted);">/seat</span></div>
+    </div>
+    <div class="route-driver-row">
+      <img class="route-driver-avatar" src="${esc(safeImageUrl(r.driver_avatar))}" alt="">
+      <span class="route-driver-text"><strong>${esc(r.driver_name)}</strong> • ${esc(r.vehicle_model || 'Vehicle')}${r.vehicle_plate ? ` (${esc(r.vehicle_plate)})` : ''}</span>
+    </div>
+    <div style="margin: 6px 0;">
+      <div style="font-size:0.65rem; font-weight:700; color:var(--text-muted);">PASSENGERS:</div>
+      <div class="passenger-chips-row" style="margin-top:2px;">${chips}</div>
+    </div>
+    <div class="route-card-footer">
+      ${pinned ? '' : `<span class="route-seats-pill">${Number(r.available_seats)} of ${Number(r.total_seats)} seats remaining</span>`}
+      ${actions}
+    </div>
+  `;
+}
+
 async function loadCityLinkRoutes() {
   if (!AppState.currentUser) return;
   try {
-    const res = await apiFetch('/api/routes/scheduled');
-    const data = await res.json();
+    const { ok, data } = await apiGet('/api/routes/scheduled');
+    if (!ok) return;
     const routes = data.routes || [];
+    const pinnedContainer = $('pinned-routes-container');
+    const openContainer = $('citylink-routes-container');
+    pinnedContainer.replaceChildren();
+    openContainer.replaceChildren();
 
-    const pinnedContainer = document.getElementById('pinned-routes-container');
-    const openContainer = document.getElementById('citylink-routes-container');
-    pinnedContainer.innerHTML = '';
-    openContainer.innerHTML = '';
+    const pinnedRoutes = routes.filter((r) => r.status === 'pinned' || r.status === 'in_progress');
+    const openRoutes = routes.filter((r) => r.status === 'open');
 
-    const pinnedRoutes = routes.filter(r => r.status === 'pinned' || r.status === 'in_progress' || r.available_seats === 0);
-    const openRoutes = routes.filter(r => r.status === 'open' && r.available_seats > 0);
-
-    // 1. Render Pinned & Full Routes
-    if (pinnedRoutes.length === 0) {
-      pinnedContainer.innerHTML = '<p style="font-size:0.75rem; color:var(--text-muted); padding:8px 0;">No pinned routes currently. Scheduled rides automatically pin here once all seats fill up!</p>';
-    } else {
-      pinnedRoutes.forEach(r => {
-        const card = document.createElement('div');
-        card.className = 'pinned-route-card';
-        
-        let passengerChips = r.passengers.map(p => `
-          <span class="passenger-chip">
-            <img src="${p.passenger_avatar || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120'}">
-            <span class="passenger-chip-name">${p.passenger_name}</span>
-            <span class="passenger-chip-seats">(${p.seats} seat${p.seats > 1 ? 's' : ''})</span>
-          </span>
-        `).join('');
-
-        let actionButtonHtml = '';
-        if (r.status === 'in_progress') {
-          actionButtonHtml = `<button class="btn-start-cockpit" onclick="openDuringRideCockpit('${r.id}')">🟢 Live Trip Active • Enter Cockpit</button>`;
-        } else if (r.is_host) {
-          actionButtonHtml = `<button class="btn-start-cockpit" onclick="startConfirmedRoute('${r.id}')">🚀 Start Confirmed Ride (Launch Cockpit)</button>`;
-        } else if (r.has_joined) {
-          actionButtonHtml = `<button class="btn-view-cockpit" onclick="openDuringRideCockpit('${r.id}')">👀 View Confirmed Ride Cockpit</button>`;
-        } else {
-          actionButtonHtml = `<div style="font-size:0.75rem; color:#B45309; font-weight:700; text-align:center; padding-top:6px;">🔒 Ride is fully booked</div>`;
-        }
-
-        card.innerHTML = `
-          <div class="pinned-banner-header">
-            <span class="pinned-pill">📌 PINNED & FULL</span>
-            <span class="pinned-seats-full">All ${r.total_seats} Seats Booked</span>
-          </div>
-          <div class="route-card-header">
-            <div>
-              <div class="route-dest-title">${r.origin || 'LPU'} ➔ ${r.destination}</div>
-              <div style="font-size:0.75rem; color:var(--text-secondary);">Departure: <strong>${r.departure_time}</strong></div>
-            </div>
-            <div class="route-price-tag">₹${r.price_per_seat.toFixed(0)} <span style="font-size:0.6rem; color:var(--text-muted);">/seat</span></div>
-          </div>
-          <div class="route-driver-row">
-            <img class="route-driver-avatar" src="${r.driver_avatar || 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=120'}">
-            <span class="route-driver-text"><strong>${r.driver_name}</strong> • ${r.vehicle_model || 'Car'} (${r.vehicle_plate || 'PB08'})</span>
-          </div>
-          <div style="margin-top:8px;">
-            <div style="font-size:0.68rem; font-weight:800; color:var(--text-secondary); margin-bottom:4px;">PASSENGERS ONBOARD:</div>
-            <div class="passenger-chips-row">${passengerChips || '<span style="font-size:0.7rem; color:var(--text-muted);">Reserved</span>'}</div>
-          </div>
-          ${actionButtonHtml}
-        `;
-        pinnedContainer.appendChild(card);
-      });
+    if (!pinnedRoutes.length) {
+      pinnedContainer.innerHTML = '<p style="font-size:0.75rem; color:var(--text-muted); padding:8px 0;">No pinned routes currently. Scheduled rides pin here once all seats fill up!</p>';
     }
+    pinnedRoutes.forEach((r) => {
+      const card = document.createElement('div');
+      card.className = 'pinned-route-card';
+      card.innerHTML = routeCardHtml(r, true);
+      pinnedContainer.appendChild(card);
+    });
 
-    // 2. Render Open Scheduled Routes (Passengers can select and book seats)
-    if (openRoutes.length === 0) {
+    if (!openRoutes.length) {
       openContainer.innerHTML = '<p style="text-align:center; color:var(--text-muted); font-size:0.8rem; padding:16px;">No open carpools at the moment. Use "+ Plan a Route" to offer seats!</p>';
-    } else {
-      openRoutes.forEach(r => {
-        const card = document.createElement('div');
-        card.className = 'route-card';
-        
-        let passengerChips = r.passengers.length > 0 ? r.passengers.map(p => `
-          <span class="passenger-chip">
-            <img src="${p.passenger_avatar || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120'}">
-            <span class="passenger-chip-name">${p.passenger_name}</span>
-          </span>
-        `).join('') : '<span style="font-size:0.68rem; color:var(--text-muted);">No passengers yet</span>';
-
-        card.innerHTML = `
-          <div class="route-card-header">
-            <div>
-              <div class="route-dest-title">${r.origin || 'LPU'} ➔ ${r.destination}</div>
-              <div style="font-size:0.75rem; color:var(--text-secondary);">Departure: <strong>${r.departure_time}</strong></div>
-            </div>
-            <div class="route-price-tag">₹${r.price_per_seat.toFixed(0)} <span style="font-size:0.6rem; color:var(--text-muted);">/seat</span></div>
-          </div>
-          <div class="route-driver-row">
-            <img class="route-driver-avatar" src="${r.driver_avatar || 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=120'}">
-            <span class="route-driver-text"><strong>${r.driver_name}</strong> • ${r.vehicle_model || 'Vehicle'}</span>
-          </div>
-          <div style="margin: 6px 0;">
-            <div style="font-size:0.65rem; font-weight:700; color:var(--text-muted);">JOINED PASSENGERS:</div>
-            <div class="passenger-chips-row" style="margin-top:2px;">${passengerChips}</div>
-          </div>
-          <div class="route-card-footer">
-            <span class="route-seats-pill">${r.available_seats} of ${r.total_seats} seats remaining</span>
-            ${r.is_host ? '<span style="font-size:0.75rem; font-weight:700; color:var(--primary-orange);">You are the Host</span>' : 
-              `<div style="display:flex; gap:6px; align-items:center;">
-                <select class="seat-picker-select" id="seat-pick-${r.id}" style="border:1px solid var(--border-light); border-radius:4px; padding:3px 6px; font-size:0.75rem;">
-                  ${Array.from({length: r.available_seats}, (_, i) => `<option value="${i+1}">${i+1} Seat${i>0?'s':''}</option>`).join('')}
-                </select>
-                <button class="btn-join-route" data-id="${r.id}" data-price="${r.price_per_seat}">Book Seat</button>
-              </div>`
-            }
-          </div>
-        `;
-        openContainer.appendChild(card);
-      });
-
-      // Attach join handlers
-      openContainer.querySelectorAll('.btn-join-route').forEach(btn => {
-        btn.onclick = () => {
-          const routeId = btn.dataset.id;
-          const price = parseFloat(btn.dataset.price);
-          const sel = document.getElementById(`seat-pick-${routeId}`);
-          const seats = sel ? parseInt(sel.value) : 1;
-          joinCityLinkRoute(routeId, seats, price * seats);
-        };
-      });
     }
+    openRoutes.forEach((r) => {
+      const card = document.createElement('div');
+      card.className = 'route-card';
+      card.innerHTML = routeCardHtml(r, false);
+      openContainer.appendChild(card);
+    });
   } catch (err) {
     console.error('Failed to load scheduled carpool dashboard:', err);
   }
 }
 
-async function joinCityLinkRoute(routeId, seats, totalFare) {
-  if (!AppState.currentUser) return;
-  if (AppState.currentUser.wallet_balance < totalFare) {
-    openModal('modal-topup');
-    document.getElementById('topup-custom-input').value = Math.ceil(totalFare - AppState.currentUser.wallet_balance + 10);
+// One delegated handler for every button on route cards (no inline onclick).
+async function handleRouteAction(event) {
+  const btn = event.target.closest('[data-action]');
+  if (!btn) return;
+  const routeId = btn.dataset.id;
+  const action = btn.dataset.action;
+
+  if (action === 'cockpit') {
+    await openDuringRideCockpit(routeId);
+  } else if (action === 'start') {
+    await startConfirmedRoute(routeId);
+  } else if (action === 'join') {
+    const sel = document.querySelector(`[data-seat-for="${CSS.escape(routeId)}"]`);
+    await joinCityLinkRoute(routeId, sel ? parseInt(sel.value, 10) : 1);
+  } else if (action === 'leave') {
+    if (!confirm('Leave this trip? Your seat fare will be refunded.')) return;
+    await routeSimpleAction(routeId, 'leave', (d) => `Booking cancelled. ₹${money(d.refunded)} refunded.`);
+  } else if (action === 'cancel-route') {
+    if (!confirm('Cancel this trip? Every passenger will be refunded.')) return;
+    await routeSimpleAction(routeId, 'cancel', (d) => `Trip cancelled. ${d.refunded_bookings} booking(s) refunded.`);
+  }
+}
+
+async function routeSimpleAction(routeId, verb, successMessage) {
+  const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/${verb}`);
+  if (!ok) {
+    alert(data.error || 'Something went wrong');
     return;
   }
+  alert(successMessage(data));
+  await refreshCurrentUser();
+  await loadCityLinkRoutes();
+}
 
-  try {
-    const res = await apiFetch(`/api/routes/${routeId}/join`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ seats: seats })
-    });
-
-    const data = await res.json();
-    if (data.success) {
-      AppState.currentUser.wallet_balance -= totalFare;
-      updateUserUI();
-
-      if (data.is_pinned) {
-        alert(`🎉 ALL SEATS ARE NOW FULL!\n\nThis scheduled ride has been automatically PINNED and is confirmed for departure.`);
-      } else {
-        alert(`Confirmed! ${seats} seat(s) booked for ₹${totalFare}. ${data.remaining_seats} seat(s) remaining until ride pins.`);
-      }
-
-      await loadCityLinkRoutes();
+async function joinCityLinkRoute(routeId, seats) {
+  if (!AppState.currentUser) return;
+  const { ok, status, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/join`, { seats });
+  if (!ok) {
+    if (status === 402) {
+      $('topup-custom-input').value = Math.ceil((data.deficit || 0) + 10);
+      openModal('modal-topup');
     } else {
       alert(data.error || 'Could not join route');
     }
-  } catch (err) {
-    console.error('Join route error:', err);
+    return;
   }
+  setWalletBalance(data.wallet_balance);
+  if (data.is_pinned) {
+    alert('🎉 ALL SEATS ARE NOW FULL!\n\nThis scheduled ride has been automatically PINNED and is confirmed for departure.');
+  } else {
+    alert(`Confirmed! ${seats} seat(s) booked for ₹${money(data.fare_paid)}. ${data.remaining_seats} seat(s) remaining.`);
+  }
+  await loadCityLinkRoutes();
 }
 
 async function postCityLinkRoute() {
   if (!AppState.currentUser) return;
-  const origin = document.getElementById('route-origin-select').value;
-  const destination = document.getElementById('route-dest-select').value;
-  const departure_time = document.getElementById('route-time-input').value;
-  const total_seats = parseInt(document.getElementById('route-seats-input').value) || 3;
-  const price_per_seat = parseFloat(document.getElementById('route-price-input').value) || 80;
-  const notes = document.getElementById('route-notes-input').value;
-
-  try {
-    const res = await apiFetch('/api/routes/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        origin,
-        destination,
-        departure_time,
-        total_seats,
-        price_per_seat,
-        notes
-      })
-    });
-
-    const data = await res.json();
-    if (data.success) {
+  const payload = {
+    origin: $('route-origin-select').value,
+    destination: $('route-dest-select').value,
+    departure_time: $('route-time-input').value.trim(),
+    total_seats: parseInt($('route-seats-input').value, 10) || 1,
+    price_per_seat: parseFloat($('route-price-input').value) || 80,
+    notes: $('route-notes-input').value.trim()
+  };
+  const { ok, data } = await apiPost('/api/routes/plan', payload);
+  if (!ok) {
+    if (data.code === 'VEHICLE_REQUIRED') {
       closeModal('modal-post-route');
-      await loadCityLinkRoutes();
-      alert(`Route scheduled! Offering ${total_seats} seats from ${origin} to ${destination}. Once all seats are booked, it will automatically get pinned!`);
+      openVehicleModal();
+    } else {
+      alert(data.error || 'Could not publish the route');
     }
-  } catch (err) {
-    console.error('Failed to plan route:', err);
+    return;
   }
+  closeModal('modal-post-route');
+  await loadCityLinkRoutes();
+  alert(`Route scheduled! Offering ${data.total_seats} seat(s) from ${payload.origin} to ${payload.destination}.`);
 }
 
-// --- During-Ride Cockpit Dashboard Lifecycle ---
-AppState.activeCockpitRouteId = null;
-
+// --- During-ride cockpit for carpools ---
 async function startConfirmedRoute(routeId) {
-  try {
-    const res = await apiFetch(`/api/routes/${routeId}/start`, { method: 'POST' });
-    const data = await res.json();
-    if (data.success) {
-      await openDuringRideCockpit(routeId);
-    }
-  } catch (err) {
-    console.error('Failed to start confirmed route:', err);
+  const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/start`);
+  if (!ok) {
+    alert(data.error || 'Could not start the trip');
+    return;
   }
+  await openDuringRideCockpit(routeId);
 }
 
 async function openDuringRideCockpit(routeId) {
   try {
-    const res = await apiFetch(`/api/routes/${routeId}/live`);
-    const data = await res.json();
-    if (!data.cockpit) return;
-
+    const { ok, data } = await apiGet(`/api/routes/${encodeURIComponent(routeId)}/live`);
+    if (!ok || !data.cockpit) {
+      alert(data.error || 'Could not open the trip');
+      return;
+    }
     const cockpit = data.cockpit;
     AppState.activeCockpitRouteId = routeId;
+    AppState.activeCockpitIsHost = cockpit.is_host;
 
-    // Set UI Texts
-    document.getElementById('cockpit-route-title').textContent = `${cockpit.origin} ➔ ${cockpit.destination}`;
-    document.getElementById('cockpit-telemetry-sub').textContent = `${cockpit.distance_remaining_km} km remaining • ETA: ~${cockpit.eta_minutes} mins`;
-    document.getElementById('active-trip-fare').textContent = cockpit.price_per_seat.toFixed(2);
-    document.getElementById('active-pickup-name').textContent = cockpit.origin;
-    document.getElementById('active-drop-name').textContent = cockpit.destination;
+    $('cockpit-route-title').textContent = `${cockpit.origin} ➔ ${cockpit.destination}`;
+    $('cockpit-live-status-text').textContent = cockpit.status === 'in_progress' ? 'CARPOOL IN PROGRESS' : 'CARPOOL CONFIRMED';
+    $('cockpit-telemetry-sub').textContent = `${cockpit.distance_remaining_km} km remaining • ETA: ~${cockpit.eta_minutes} mins`;
+    $('active-trip-fare').textContent = money(cockpit.price_per_seat);
+    $('active-pickup-name').textContent = cockpit.origin;
+    $('active-drop-name').textContent = cockpit.destination;
+    $('active-driver-name').textContent = `${cockpit.driver_name} (Host)`;
+    $('active-driver-avatar').src = safeImageUrl(cockpit.driver_avatar);
+    $('active-vehicle-model').textContent = cockpit.vehicle_model || 'Vehicle';
+    $('active-vehicle-plate').textContent = cockpit.vehicle_plate || '—';
 
-    // Host details
-    document.getElementById('active-driver-name').textContent = `${cockpit.driver_name} (Host)`;
-    if (cockpit.driver_avatar) document.getElementById('active-driver-avatar').src = cockpit.driver_avatar;
-    document.getElementById('active-vehicle-model').textContent = cockpit.vehicle_model || 'Vehicle';
-    document.getElementById('active-vehicle-plate').textContent = cockpit.vehicle_plate || 'PB08';
+    const manifestBox = $('cockpit-passenger-list');
+    manifestBox.replaceChildren(...cockpit.passengers.map((p) =>
+      passengerChip(p.passenger_name, p.passenger_avatar, `(${p.seats} seat${p.seats > 1 ? 's' : ''})`)));
+    $('manifest-count-badge').textContent = `${cockpit.passengers.length} Passenger${cockpit.passengers.length === 1 ? '' : 's'}`;
 
-    // Manifest list
-    const manifestBox = document.getElementById('cockpit-passenger-list');
-    manifestBox.innerHTML = '';
-    cockpit.passengers.forEach(p => {
-      const chip = document.createElement('span');
-      chip.className = 'passenger-chip';
-      chip.innerHTML = `
-        <img src="${p.passenger_avatar || 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120'}">
-        <span class="passenger-chip-name">${p.passenger_name} (${p.seats} seat${p.seats>1?'s':''})</span>
-      `;
-      manifestBox.appendChild(chip);
-    });
-    document.getElementById('manifest-count-badge').textContent = `${cockpit.passengers.length} Passenger${cockpit.passengers.length===1?'':'s'} Onboard`;
+    $('cancel-ride-btn').classList.add('hidden');
+    $('share-live-btn').classList.add('hidden');
+    const completeBtn = $('complete-ride-btn');
+    completeBtn.classList.toggle('hidden', !cockpit.is_host);
+    completeBtn.disabled = cockpit.status !== 'in_progress';
 
-    // Map Rendering
     if (AppState.activeMap) {
       setTimeout(() => AppState.activeMap.invalidateSize(), 200);
-
-      // Clear previous layers
-      Object.values(AppState.activeMarkers).forEach(m => AppState.activeMap.removeLayer(m));
-      AppState.activeMarkers = {};
-      if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
-
+      clearActiveMap();
       const oCoords = [cockpit.origin_lat, cockpit.origin_lng];
       const dCoords = [cockpit.destination_lat, cockpit.destination_lng];
       const vCoords = [cockpit.current_lat || cockpit.origin_lat, cockpit.current_lng || cockpit.origin_lng];
-
-      AppState.activeMarkers.origin = L.marker(oCoords, {
-        icon: L.divIcon({
-          className: 'pin-o',
-          html: '<div style="background:#10B981; width:22px; height:22px; border-radius:50%; border:2px solid white; display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">P</div>',
-          iconSize: [22, 22]
-        })
-      }).addTo(AppState.activeMap);
-
-      AppState.activeMarkers.drop = L.marker(dCoords, {
-        icon: L.divIcon({
-          className: 'pin-d',
-          html: '<div style="background:#FF7C00; width:22px; height:22px; border-radius:50%; border:2px solid white; display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">D</div>',
-          iconSize: [22, 22]
-        })
-      }).addTo(AppState.activeMap);
-
-      AppState.activeMarkers.car = L.marker(vCoords, {
-        icon: L.divIcon({
-          className: 'pin-car',
-          html: '<div style="background:#111827; width:34px; height:34px; border-radius:50%; border:3px solid #F59E0B; display:flex; align-items:center; justify-content:center; font-size:18px; box-shadow:0 0 14px rgba(245,158,11,0.6);">🚗</div>',
-          iconSize: [34, 34],
-          iconAnchor: [17, 17]
-        })
-      }).addTo(AppState.activeMap);
-
-      AppState.activePolyline = L.polyline([oCoords, dCoords], {
-        color: '#F59E0B',
-        weight: 5,
-        opacity: 0.85,
-        dashArray: '8, 8'
-      }).addTo(AppState.activeMap);
-
+      AppState.activeMarkers.origin = L.marker(oCoords, { icon: pinIcon('#10B981', 'P', 22) }).addTo(AppState.activeMap);
+      AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#FF7C00', 'D', 22) }).addTo(AppState.activeMap);
+      AppState.activeMarkers.car = L.marker(vCoords, { icon: vehicleIcon(cockpit.vehicle_category || 'car', 34, '#F59E0B') }).addTo(AppState.activeMap);
+      AppState.activePolyline = L.polyline([oCoords, dCoords], { color: '#F59E0B', weight: 5, opacity: 0.85, dashArray: '8, 8' })
+        .addTo(AppState.activeMap);
       AppState.activeMap.fitBounds([oCoords, dCoords], { padding: [50, 50] });
     }
 
@@ -1472,26 +1680,19 @@ async function openDuringRideCockpit(routeId) {
   }
 }
 
-// --- Navigation View Switcher ---
+// --- Navigation ---
 function initNavigation() {
-  document.querySelectorAll('.nav-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      switchView(tab.dataset.view);
-    });
+  document.querySelectorAll('.nav-tab').forEach((tab) => {
+    tab.addEventListener('click', () => switchView(tab.dataset.view));
   });
 }
 
 function switchView(viewId) {
-  document.querySelectorAll('.app-view').forEach(v => v.classList.remove('active-view'));
-  const target = document.getElementById(viewId);
-  if (target) {
-    target.classList.add('active-view');
-  }
+  document.querySelectorAll('.app-view').forEach((v) => v.classList.remove('active-view'));
+  const target = $(viewId);
+  if (target) target.classList.add('active-view');
 
-  // Update tab bar active state
-  document.querySelectorAll('.nav-tab').forEach(t => {
+  document.querySelectorAll('.nav-tab').forEach((t) => {
     t.classList.toggle('active', t.dataset.view === viewId);
   });
 
@@ -1499,6 +1700,8 @@ function switchView(viewId) {
     loadCityLinkRoutes();
   } else if (viewId === 'view-activity') {
     loadActivityHistory();
+  } else if (viewId === 'view-profile') {
+    loadDriverEarnings();
   } else if (viewId === 'view-ride' && AppState.homeMap) {
     setTimeout(() => AppState.homeMap.invalidateSize(), 150);
   } else if (viewId === 'view-active-ride' && AppState.activeMap) {
@@ -1506,117 +1709,91 @@ function switchView(viewId) {
   }
 }
 
-// --- Modals Management ---
+// --- Modals ---
 function initModals() {
-  document.querySelectorAll('.modal-close-btn, .modal-backdrop').forEach(btn => {
+  document.querySelectorAll('.modal-close-btn, .modal-backdrop').forEach((btn) => {
     btn.addEventListener('click', () => {
       const modal = btn.closest('.app-modal');
       if (modal) modal.classList.add('hidden');
     });
   });
-
-  document.querySelectorAll('.amount-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      document.querySelectorAll('.amount-chip').forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      document.getElementById('topup-custom-input').value = chip.dataset.amount;
-    });
-  });
 }
 
 function openModal(id) {
-  const modal = document.getElementById(id);
-  if (modal) {
-    modal.classList.remove('hidden');
-    if (id === 'modal-topup' && AppState.currentUser) {
-      document.getElementById('modal-current-bal').textContent = AppState.currentUser.wallet_balance.toFixed(2);
-      const amt = parseFloat(document.getElementById('topup-custom-input').value) || 100;
-      fetchUpiQr(amt);
-    }
-    if (id === 'modal-post-route') {
-      setTimeout(() => {
-        populatePlannedRouteDropdowns();
-        initializeCustomLocationDropdowns();
-        syncCustomLocationDropdowns();
-      }, 0);
-    }
+  const modal = $(id);
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  if (id === 'modal-topup' && AppState.currentUser) {
+    configureTopupModal();
+  }
+  if (id === 'modal-post-route') {
+    setTimeout(() => {
+      populatePlannedRouteDropdowns();
+      initializeCustomLocationDropdowns();
+      syncCustomLocationDropdowns();
+    }, 0);
   }
 }
 
 function closeModal(id) {
-  const modal = document.getElementById(id);
+  const modal = $(id);
   if (modal) modal.classList.add('hidden');
 }
 
-// --- Event Handlers Setup ---
+// --- Event wiring ---
 function initEventHandlers() {
-  // Top-Up Payment Method Tabs
-  document.querySelectorAll('.pay-method-tab').forEach(tab => {
+  // Top-up payment method tabs
+  document.querySelectorAll('.pay-method-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
-      document.querySelectorAll('.pay-method-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.pay-method-tab').forEach((t) => t.classList.remove('active'));
       tab.classList.add('active');
-      const method = tab.dataset.method;
-      if (method === 'upi') {
-        document.getElementById('pay-panel-upi').classList.remove('hidden');
-        document.getElementById('pay-panel-razorpay').classList.add('hidden');
-      } else {
-        document.getElementById('pay-panel-upi').classList.add('hidden');
-        document.getElementById('pay-panel-razorpay').classList.remove('hidden');
-      }
+      const isUpi = tab.dataset.method === 'upi';
+      $('pay-panel-upi').classList.toggle('hidden', !isUpi);
+      $('pay-panel-razorpay').classList.toggle('hidden', isUpi);
     });
   });
 
-  // Amount input change triggers QR refresh
-  document.getElementById('topup-custom-input').addEventListener('input', (e) => {
-    const val = parseFloat(e.target.value);
-    if (val > 0) fetchUpiQr(val);
+  $('topup-custom-input').addEventListener('input', () => {
+    if (currentTopupAmount() > 0) scheduleQrRefresh();
   });
-
-  // UPI and Razorpay Buttons
-  document.getElementById('confirm-upi-paid-btn').addEventListener('click', handleConfirmUpiPayment);
-  document.getElementById('razorpay-checkout-btn').addEventListener('click', handleRazorpayCheckout);
-
-  // Amount Chips
-  document.querySelectorAll('.amount-chip').forEach(chip => {
+  document.querySelectorAll('.amount-chip').forEach((chip) => {
     chip.addEventListener('click', () => {
-      document.querySelectorAll('.amount-chip').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('.amount-chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
-      const amt = parseFloat(chip.dataset.amount);
-      document.getElementById('topup-custom-input').value = amt;
-      fetchUpiQr(amt);
+      $('topup-custom-input').value = parseFloat(chip.dataset.amount);
+      scheduleQrRefresh();
     });
   });
+  $('confirm-upi-paid-btn').addEventListener('click', handleConfirmUpiPayment);
+  $('razorpay-checkout-btn').addEventListener('click', handleRazorpayCheckout);
 
   // Scope switcher: Campus Hop vs CityLink
-  document.querySelectorAll('.scope-tab').forEach(tab => {
+  document.querySelectorAll('.scope-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
-      document.querySelectorAll('.scope-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.scope-tab').forEach((t) => t.classList.remove('active'));
       tab.classList.add('active');
       AppState.selectedScope = tab.dataset.scope;
       populateLocationDropdowns();
     });
   });
 
-  // Exactly 3 Services: Bike, Scooty, Car selection
-  document.querySelectorAll('.service-card').forEach(card => {
+  // Bike / Scooty / Car
+  document.querySelectorAll('.service-card').forEach((card) => {
     card.addEventListener('click', () => {
-      document.querySelectorAll('.service-card').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('.service-card').forEach((c) => c.classList.remove('active'));
       card.classList.add('active');
       AppState.selectedService = card.dataset.service;
-      if (AppState.quotes) {
-        updateServicesDisplay({ quotes: AppState.quotes, wallet_balance: AppState.currentUser.wallet_balance });
+      if (AppState.quotes && AppState.currentUser) {
+        updateServicesDisplay({ quotes: AppState.quotes });
       }
     });
   });
 
-  // Dropdown changes
-  document.getElementById('pickup-select').addEventListener('change', fetchFareQuotes);
-  document.getElementById('drop-select').addEventListener('change', fetchFareQuotes);
-
-  // Swap Locations
-  document.getElementById('swap-locations-btn').addEventListener('click', () => {
-    const p = document.getElementById('pickup-select');
-    const d = document.getElementById('drop-select');
+  $('pickup-select').addEventListener('change', fetchFareQuotes);
+  $('drop-select').addEventListener('change', fetchFareQuotes);
+  $('swap-locations-btn').addEventListener('click', () => {
+    const p = $('pickup-select');
+    const d = $('drop-select');
     const temp = p.value;
     p.value = d.value;
     d.value = temp;
@@ -1624,80 +1801,87 @@ function initEventHandlers() {
     fetchFareQuotes();
   });
 
-  // Quick Top-up Button
-  document.getElementById('quick-topup-btn').addEventListener('click', () => openModal('modal-topup'));
-  document.getElementById('header-wallet-btn').addEventListener('click', () => openModal('modal-topup'));
-  const confirmTopupButton = document.getElementById('confirm-topup-btn');
-  if (confirmTopupButton) {
-    confirmTopupButton.addEventListener('click', handleWalletTopup);
-  }
-
-  // Persona quick menu
-  document.getElementById('persona-switch-btn').addEventListener('click', () => switchView('view-profile'));
-
-  // Recenter map
-  document.getElementById('recenter-map-btn').addEventListener('click', () => {
-    if (AppState.homeMap) AppState.homeMap.setView([31.2536, 75.7037], 16);
+  $('quick-topup-btn').addEventListener('click', () => openModal('modal-topup'));
+  $('header-wallet-btn').addEventListener('click', () => openModal('modal-topup'));
+  $('persona-switch-btn').addEventListener('click', () => switchView('view-profile'));
+  $('recenter-map-btn').addEventListener('click', () => {
+    if (AppState.homeMap) AppState.homeMap.setView(LPU_COORDS, 16);
   });
 
-  // Primary CTA: Find Ride
-  document.getElementById('find-ride-btn').addEventListener('click', handleBookRide);
+  // Booking and live ride
+  $('find-ride-btn').addEventListener('click', handleBookRide);
+  $('cancel-queued-ride-btn').addEventListener('click', handleCancelRide);
+  $('cancel-ride-btn').addEventListener('click', handleCancelRide);
+  $('sim-telemetry-btn').addEventListener('click', advanceTelemetryStep);
+  $('complete-ride-btn').addEventListener('click', handleCompleteRide);
 
-  // Persistent SOS
-  document.getElementById('persistent-sos-btn').addEventListener('click', handleTriggerSOS);
-  document.getElementById('dismiss-sos-btn').addEventListener('click', () => closeModal('modal-sos'));
+  // Rating
+  document.querySelectorAll('#star-rating-picker .star-btn').forEach((star) => {
+    star.addEventListener('click', () => setRating(Number(star.dataset.val)));
+  });
+  document.querySelectorAll('#modal-rating .tag-pill').forEach((tag) => {
+    tag.addEventListener('click', () => tag.classList.toggle('active'));
+  });
+  $('submit-rating-btn').addEventListener('click', submitRating);
 
-  // Share Live Trip
-  document.getElementById('share-live-btn').addEventListener('click', handleShareTrip);
-  document.getElementById('copy-share-btn').addEventListener('click', () => {
-    const input = document.getElementById('share-link-input');
+  // SOS and sharing
+  $('persistent-sos-btn').addEventListener('click', handleTriggerSOS);
+  $('dismiss-sos-btn').addEventListener('click', () => closeModal('modal-sos'));
+  $('share-live-btn').addEventListener('click', handleShareTrip);
+  $('copy-share-btn').addEventListener('click', async () => {
+    const input = $('share-link-input');
     input.select();
-    navigator.clipboard.writeText(input.value);
-    alert('Live tracking link copied to clipboard!');
+    try {
+      await navigator.clipboard.writeText(input.value);
+      alert('Live tracking link copied to clipboard!');
+    } catch (err) {
+      alert('Copy failed - select the link and copy it manually.');
+    }
   });
 
-  // Active Ride Controls
-  document.getElementById('sim-telemetry-btn').addEventListener('click', advanceTelemetryStep);
-  document.getElementById('complete-ride-btn').addEventListener('click', handleCompleteRide);
-  document.getElementById('submit-rating-btn').addEventListener('click', submitRating);
+  // CityLink
+  $('open-plan-route-btn').addEventListener('click', () => openModal('modal-post-route'));
+  $('submit-post-route-btn').addEventListener('click', postCityLinkRoute);
+  $('pinned-routes-container').addEventListener('click', handleRouteAction);
+  $('citylink-routes-container').addEventListener('click', handleRouteAction);
 
-  // CityLink Post Route
-  document.getElementById('open-plan-route-btn').addEventListener('click', () => openModal('modal-post-route'));
-  document.getElementById('submit-post-route-btn').addEventListener('click', postCityLinkRoute);
+  // Driver dashboard
+  $('driver-online-toggle').addEventListener('change', handleToggleOnline);
+  $('edit-vehicle-btn').addEventListener('click', openVehicleModal);
+  $('submit-vehicle-btn').addEventListener('click', handleSaveVehicle);
+  $('refresh-requests-btn').addEventListener('click', loadDriverRequests);
+  $('driver-requests-list').addEventListener('click', (event) => {
+    const btn = event.target.closest('[data-action="accept-ride"]');
+    if (btn) handleAcceptRide(btn.dataset.id);
+  });
 
-  // Emergency contact modal
-  document.getElementById('add-emergency-btn').addEventListener('click', () => openModal('modal-add-contact'));
-  document.getElementById('submit-contact-btn').addEventListener('click', async () => {
-    const name = document.getElementById('emg-name-input').value;
-    const relationship = document.getElementById('emg-rel-input').value;
-    const phone = document.getElementById('emg-phone-input').value;
-    if (!name || !phone) return;
-
-    await apiFetch('/api/user/emergency-contacts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name,
-        relationship,
-        phone,
-        is_primary: 0
-      })
-    });
-    closeModal('modal-add-contact');
-    await loadEmergencyContacts();
+  // Emergency contacts
+  $('add-emergency-btn').addEventListener('click', () => {
+    $('emg-error-text').classList.add('hidden');
+    openModal('modal-add-contact');
+  });
+  $('submit-contact-btn').addEventListener('click', handleAddContact);
+  $('emergency-contacts-list').addEventListener('click', (event) => {
+    const btn = event.target.closest('.contact-remove-btn');
+    if (btn) handleRemoveContact(btn.dataset.id);
   });
 
   // Role selector
-  document.querySelectorAll('.role-pill-btn').forEach(btn => {
+  document.querySelectorAll('.role-pill-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const newRole = btn.dataset.role;
-      await apiFetch('/api/user/role', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: newRole })
-      });
+      const { ok, data } = await apiPost('/api/user/role', { role: newRole });
+      if (!ok) {
+        alert(data.error || 'Could not change role');
+        return;
+      }
       AppState.currentUser.role = newRole;
       updateUserUI();
+      if (newRole !== 'rider' && !AppState.currentUser.vehicle) {
+        openVehicleModal();
+      } else {
+        loadDriverEarnings();
+      }
     });
   });
 }

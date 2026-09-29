@@ -1,25 +1,40 @@
 services:
   - type: web
     name: campusgo-lpu
-    env: python
+    runtime: python
     region: singapore
     plan: free
-    # NOTE: Render's free plan does not support persistent disks, so the
-    # SQLite file lives in the ephemeral container filesystem and resets to
-    # seed data on every deploy/restart. Fine for a demo. For real
-    # persistence, upgrade this service to a paid plan (Starter+), add:
+    # NOTE: Render's free plan has no persistent disk, so the SQLite file is
+    # lost on every deploy/restart. For real persistence use a paid plan, add:
     #   disk:
     #     name: campusgo-data
     #     mountPath: /var/data
     #     sizeGB: 1
-    # and set DATABASE_PATH=/var/data/campusgo.db as an env var below.
-    buildCommand: pip install -r requirements.txt && python backend/seed_data.py
-    startCommand: gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+    # and set DATABASE_PATH=/var/data/campusgo.db below.
+    buildCommand: pip install -r requirements.txt
+    startCommand: >-
+      if [ "$SEED_DEMO_DATA" = "1" ]; then python backend/seed_data.py --if-empty; fi &&
+      gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /api/config
     envVars:
-      - key: PORT
-        value: 5000
       - key: SECRET_KEY
         generateValue: true
+      - key: ADMIN_API_KEY
+        generateValue: true
+      # Render sits behind one proxy; this makes rate limits use the real client IP.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # Portfolio demo: creates the demo personas on an empty database.
+      # Set DEMO_PASSWORD in the dashboard so the README password doesn't work here.
+      - key: SEED_DEMO_DATA
+        value: "1"
+      - key: DEMO_PASSWORD
+        sync: false
+      # "1" lets reviewers top up with fake money. Leave "0" for anything real.
+      - key: PAYMENTS_DEMO_MODE
+        value: "0"
       - key: CAMPUSGO_UPI_VPA
         value: campusgo.lpu@okhdfcbank
       - key: RAZORPAY_KEY_ID

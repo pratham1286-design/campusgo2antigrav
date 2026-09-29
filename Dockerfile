@@ -1,41 +1,33 @@
-# Multi-stage production Dockerfile for CampusGo
-FROM python:3.12-slim AS base
+FROM python:3.12-slim
 
 # Prevent Python from writing .pyc and buffer stdout
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+# The database lives in its own directory so a volume can persist it without
+# also freezing the application code (mounting over /app/backend did that).
+ENV DATABASE_PATH=/app/data/campusgo.db
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend and frontend source files
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 
-# Initialize database and seed demo data on build
-RUN python backend/seed_data.py
-
-# Create non-root user for security
-RUN useradd -m -u 1000 campusgo && chown -R campusgo:campusgo /app
+# Non-root user owns only the data directory.
+RUN useradd -m -u 1000 campusgo && mkdir -p /app/data && chown -R campusgo:campusgo /app/data
 USER campusgo
 
-# Expose default application port
 EXPOSE 5000
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/api/campus/landmarks || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:5000/api/config || exit 1
 
-# Start production server.
-# Set SECRET_KEY via env var (e.g. `docker run -e SECRET_KEY=...`) so login
-# sessions survive container restarts - without it a random key is generated
-# per-process and every session is invalidated on restart.
-CMD ["gunicorn", "--chdir", "backend", "--workers", "1", "--threads", "4", "--bind", "0.0.0.0:5000", "app:app"]
+# SECRET_KEY must be set (the app refuses to start with a known placeholder).
+# Demo personas are created only when SEED_DEMO_DATA=1, and only into an empty
+# database, so restarts never wipe real data.
+CMD ["sh", "-c", "if [ \"$SEED_DEMO_DATA\" = \"1\" ]; then python backend/seed_data.py --if-empty; fi && exec gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:5000 app:app"]

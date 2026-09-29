@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   campusgo-app:
     build:
@@ -10,24 +8,27 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - PORT=5000
-      # Override with a real random value for any non-local deployment -
-      # without it, sessions are invalidated whenever the container restarts.
-      - SECRET_KEY=${SECRET_KEY:-dev_only_change_me_in_production}
-      - CAMPUSGO_UPI_VPA=campusgo.lpu@okhdfcbank
-      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-rzp_test_campusgo_demo}
-      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-demo_secret_campusgo_2026}
+      # Required. Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY to a random 64-character value}
+      - DATABASE_PATH=/app/data/campusgo.db
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS:-0}
+      # Demo data and simulated payments are opt-in.
+      - SEED_DEMO_DATA=${SEED_DEMO_DATA:-0}
+      - DEMO_PASSWORD=${DEMO_PASSWORD:-}
+      - PAYMENTS_DEMO_MODE=${PAYMENTS_DEMO_MODE:-0}
+      - CAMPUSGO_UPI_VPA=${CAMPUSGO_UPI_VPA:-campusgo.lpu@okhdfcbank}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
       - FAST2SMS_API_KEY=${FAST2SMS_API_KEY:-}
       - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
       - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER:-}
+      - CAMPUS_SECURITY_PHONE=${CAMPUS_SECURITY_PHONE:-+91 1824 517000}
     volumes:
-      - campusgo-db-data:/app/backend
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/campus/landmarks"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      # Only the database directory is persisted, so rebuilt images ship new code.
+      - campusgo-db-data:/app/data
 
 volumes:
   campusgo-db-data:

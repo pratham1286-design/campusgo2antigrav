@@ -31,8 +31,48 @@ CAMPUS_LANDMARKS = {
     "phagwara_station": {"name": "Phagwara Railway Station", "lat": 31.2210, "lng": 75.7720, "zone": "CityLink-Phagwara"},
     "jalandhar_bus_stand": {"name": "Jalandhar City Bus Stand", "lat": 31.3190, "lng": 75.5860, "zone": "CityLink-Jalandhar"},
     "rama_mandi": {"name": "Rama Mandi Chowk, Jalandhar", "lat": 31.3050, "lng": 75.6410, "zone": "CityLink-RamaMandi"},
-    "jalandhar_cantt": {"name": "Jalandhar Cantt Railway Station", "lat": 31.2850, "lng": 75.6200, "zone": "CityLink-Jalandhar"}
+    "jalandhar_cantt": {"name": "Jalandhar Cantt Railway Station", "lat": 31.2850, "lng": 75.6200, "zone": "CityLink-Jalandhar"},
+    "kapurthala": {"name": "Kapurthala Bus Stand", "lat": 31.3800, "lng": 75.3800, "zone": "CityLink-Kapurthala"},
+
+    # CityLink: NH-44 corridor from Phagwara to Chandigarh (approximate coordinates)
+    "goraya": {"name": "Goraya Bus Stop", "lat": 31.1236, "lng": 75.7727, "zone": "CityLink-Goraya"},
+    "phillaur": {"name": "Phillaur Railway Station", "lat": 31.0197, "lng": 75.7867, "zone": "CityLink-Phillaur"},
+    "ludhiana_bus_stand": {"name": "Ludhiana Bus Stand", "lat": 30.9130, "lng": 75.8580, "zone": "CityLink-Ludhiana"},
+    "ludhiana_station": {"name": "Ludhiana Railway Station", "lat": 30.9127, "lng": 75.8490, "zone": "CityLink-Ludhiana"},
+    "khanna": {"name": "Khanna Bus Stand", "lat": 30.7050, "lng": 76.2222, "zone": "CityLink-Khanna"},
+    "sirhind": {"name": "Sirhind (Fatehgarh Sahib) Station", "lat": 30.6436, "lng": 76.3842, "zone": "CityLink-Sirhind"},
+    "rajpura": {"name": "Rajpura Bus Stand", "lat": 30.4840, "lng": 76.5940, "zone": "CityLink-Rajpura"},
+    "zirakpur": {"name": "Zirakpur Flyover Chowk", "lat": 30.6425, "lng": 76.8173, "zone": "CityLink-Zirakpur"},
+    "kharar": {"name": "Kharar Bus Stand", "lat": 30.7460, "lng": 76.6450, "zone": "CityLink-Mohali"},
+    "mohali": {"name": "Mohali Bus Stand (Phase 6)", "lat": 30.7046, "lng": 76.7179, "zone": "CityLink-Mohali"},
+    "chandigarh_isbt_43": {"name": "Chandigarh ISBT Sector 43", "lat": 30.7224, "lng": 76.7493, "zone": "CityLink-Chandigarh"},
+    "chandigarh_sector_17": {"name": "Chandigarh Sector 17 Plaza", "lat": 30.7410, "lng": 76.7821, "zone": "CityLink-Chandigarh"},
+    "chandigarh_station": {"name": "Chandigarh Railway Station", "lat": 30.7026, "lng": 76.8210, "zone": "CityLink-Chandigarh"}
 }
+
+VALID_SCOPES = ("campus_hop", "citylink")
+VALID_SERVICES = ("bike", "scooty", "car")
+
+def is_city_landmark(landmark: dict) -> bool:
+    return landmark["zone"].startswith("CityLink")
+
+def validate_trip(scope: str, pickup_key: str, drop_key: str):
+    """Returns (pickup, drop, error). Campus Hop must stay on campus; CityLink
+    must have at least one off-campus end, so flat campus pricing can't be
+    used for inter-city trips."""
+    if scope not in VALID_SCOPES:
+        return None, None, "Invalid ride type"
+    pickup = CAMPUS_LANDMARKS.get(pickup_key)
+    drop = CAMPUS_LANDMARKS.get(drop_key)
+    if not pickup or not drop:
+        return None, None, "Invalid pickup or drop location selected"
+    if pickup_key == drop_key:
+        return None, None, "Pickup and drop must be different locations"
+    if scope == "campus_hop" and (is_city_landmark(pickup) or is_city_landmark(drop)):
+        return None, None, "Campus Hop is for on-campus trips only. Use CityLink for off-campus destinations."
+    if scope == "citylink" and not (is_city_landmark(pickup) or is_city_landmark(drop)):
+        return None, None, "CityLink needs an off-campus pickup or drop. Use Campus Hop for on-campus trips."
+    return pickup, drop, None
 
 # Campus Hop Flat Pricing Rules
 FLAT_CAMPUS_HOP = {
@@ -93,8 +133,10 @@ def calculate_fare(service_type: str, scope: str, pickup_lat: float, pickup_lng:
     - Campus Hop: strictly flat rate.
     - CityLink: base + distance + dynamic surge.
     """
-    if service_type not in ('bike', 'scooty', 'car'):
+    if service_type not in VALID_SERVICES:
         raise ValueError(f"Invalid service type: {service_type}")
+    if scope not in VALID_SCOPES:
+        raise ValueError(f"Invalid scope: {scope}")
 
     dist_km = haversine_distance_km(pickup_lat, pickup_lng, drop_lat, drop_lng)
 
