@@ -15,7 +15,7 @@ services:
       - TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS:-0}
       # Demo data and simulated payments are opt-in.
       - SEED_DEMO_DATA=${SEED_DEMO_DATA:-0}
-      - DEMO_PASSWORD=${DEMO_PASSWORD:-}
+      - DEMO_SIMULATE_MOVEMENT=${DEMO_SIMULATE_MOVEMENT:-0}
       - PAYMENTS_DEMO_MODE=${PAYMENTS_DEMO_MODE:-0}
       - CAMPUSGO_UPI_VPA=${CAMPUSGO_UPI_VPA:-campusgo.lpu@okhdfcbank}
       - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}

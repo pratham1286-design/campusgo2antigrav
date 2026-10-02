@@ -1,17 +1,15 @@
 import unittest
 
-from test_support import ClientMixin, DEMO_PASSWORD, LPU_IDS
+from test_support import ClientMixin, LPU_IDS, departure_in
 
 
 class TestCampusGo(ClientMixin, unittest.TestCase):
-    def test_00_login_requires_correct_password(self):
-        bad = self.client.post("/api/auth/login", json={"lpu_id": LPU_IDS["usr_student_aarav"], "password": "wrong"})
-        self.assertEqual(bad.status_code, 401)
+    def test_00_protected_routes_need_a_token(self):
         self.assertEqual(self.client.get("/api/wallet").status_code, 401)
 
     def test_01_login_returns_teacher_badge_without_password_hash(self):
-        res = self.client.post("/api/auth/login", json={"lpu_id": LPU_IDS["usr_teacher_raman"], "password": DEMO_PASSWORD})
-        user = res.get_json()["user"]
+        headers = self.auth_headers("usr_teacher_raman")
+        user = self.client.get("/api/auth/me", headers=headers).get_json()["user"]
         self.assertEqual(user["is_teacher_priority"], 1)
         self.assertNotIn("password_hash", user)
 
@@ -65,7 +63,8 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 5}).status_code, 409)
         step = {}
         for _ in range(20):
-            step = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=rider).get_json()
+            driver = self.auth_headers(self.db("SELECT driver_id FROM rides WHERE id = ?", (ride_id,))[0]["driver_id"])
+            step = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=driver).get_json()
             if step["status"] == "in_progress":
                 break
         self.assertEqual(step["status"], "in_progress")
@@ -95,7 +94,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         headers = self.auth_headers("usr_driver_harpreet")
         res = self.client.post("/api/routes/plan", headers=headers, json={
             "origin": "Uni-Mall & Student Plaza", "destination": "Chandigarh ISBT Sector 43",
-            "departure_time": "19:00 Today", "total_seats": 3, "price_per_seat": 250})
+            "departure_time": departure_in(4), "total_seats": 3, "price_per_seat": 250})
         self.assertEqual(res.status_code, 200, res.get_json())
         route_id = res.get_json()["route_id"]
         routes = self.client.get("/api/routes/scheduled", headers=headers).get_json()["routes"]
@@ -114,7 +113,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         host = self.auth_headers("usr_driver_harpreet")
         rider = self.auth_headers("usr_teacher_raman")
         route_id = self.client.post("/api/routes/plan", headers=host, json={
-            "origin": "uni_mall", "destination": "phagwara_station", "departure_time": "18:00",
+            "origin": "uni_mall", "destination": "phagwara_station", "departure_time": departure_in(5),
             "total_seats": 1, "price_per_seat": 100}).get_json()["route_id"]
         join = self.client.post(f"/api/routes/{route_id}/join", headers=rider, json={"seats": 1})
         self.assertEqual(join.status_code, 200)

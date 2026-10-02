@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import logging
 import math
 import os
@@ -7,13 +10,13 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import Flask, g, jsonify, request, send_from_directory
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.security import check_password_hash
 
 import payments
 from database import get_db_connection, init_db
@@ -21,6 +24,7 @@ from emergency_dispatch import (
     CAMPUS_SECURITY_PHONE,
     dispatch_emergency_alert,
     normalize_phone,
+    send_sms,
     sms_gateway_configured,
 )
 from payments import PaymentError
@@ -50,6 +54,16 @@ if _trust_hops > 0:
 PLATFORM_SHARE = 0.10
 DRIVER_SHARE = 1 - PLATFORM_SHARE
 MAX_EMERGENCY_CONTACTS = 5
+LOCATION_MAX_AGE_SECONDS = 120     # a driver who hasn't reported a position this recently can't be matched
+PICKUP_RADIUS_KM = 0.15            # driver must be this close to the pickup for the ride to start
+DROP_RADIUS_KM = 0.30              # ...and this close to the drop for the driver to complete it
+ROUTE_ORIGIN_RADIUS_KM = 0.5
+ROUTE_DEST_RADIUS_KM = 1.0
+QUEUE_TTL_SECONDS = 30 * 60        # an unmatched ride request is cancelled and refunded after this
+ROUTE_GRACE_SECONDS = 6 * 3600     # a carpool is cancelled and refunded this long after its departure time
+SWEEP_INTERVAL_SECONDS = 30
+# Campus time is India time; datetime-local inputs send naive local times.
+LOCAL_UTC_OFFSET_MINUTES = int(os.environ.get("LOCAL_UTC_OFFSET_MINUTES", "330") or 330)
 ACTIVE_RIDE_STATUSES = ("queued", "matched", "arriving", "in_progress")
 CANCELLABLE_RIDE_STATUSES = ("queued", "matched", "arriving")
 
@@ -73,17 +87,23 @@ def _load_secret_key():
 
 SESSION_SERIALIZER = URLSafeTimedSerializer(_load_secret_key(), salt="campusgo-session-v1")
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7  # 7 days
+OTP_HMAC_KEY = hashlib.sha256(b"campusgo-otp-v1:" + SESSION_SERIALIZER.secret_keys[-1]).digest()
 
 
-def generate_session_token(user_id):
-    return SESSION_SERIALIZER.dumps(user_id)
+def generate_session_token(conn, user_id):
+    row = conn.execute("SELECT token_version FROM users WHERE id = ?", (user_id,)).fetchone()
+    return SESSION_SERIALIZER.dumps({"u": user_id, "v": row["token_version"] if row else 0})
 
 
 def verify_session_token(token):
+    """Returns the token's {"u": user_id, "v": version} payload, or None."""
     try:
-        return SESSION_SERIALIZER.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
+        payload = SESSION_SERIALIZER.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
     except (BadSignature, SignatureExpired):
         return None
+    if isinstance(payload, dict) and isinstance(payload.get("u"), str) and isinstance(payload.get("v"), int):
+        return payload
+    return None
 
 
 # --- Errors -----------------------------------------------------------------
@@ -147,11 +167,12 @@ def _close_db(exc):
 # --- Security headers ---------------------------------------------------------
 CONTENT_SECURITY_POLICY = "; ".join([
     "default-src 'self'",
-    "script-src 'self' https://unpkg.com https://checkout.razorpay.com https://*.razorpay.com",
-    "style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com",
+    # unpkg is limited to the one pinned Leaflet folder (and the pages carry SRI hashes), not the whole CDN.
+    "script-src 'self' https://unpkg.com/leaflet@1.9.4/dist/ https://checkout.razorpay.com https://*.razorpay.com",
+    "style-src 'self' 'unsafe-inline' https://unpkg.com/leaflet@1.9.4/dist/ https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: https://*.tile.openstreetmap.org https://tile.openstreetmap.org "
-    "https://images.unsplash.com https://unpkg.com https://*.razorpay.com",
+    "https://images.unsplash.com https://unpkg.com/leaflet@1.9.4/dist/ https://*.razorpay.com",
     "connect-src 'self' https://*.razorpay.com",
     "frame-src https://api.razorpay.com https://checkout.razorpay.com",
     "object-src 'none'",
@@ -168,9 +189,24 @@ def _security_headers(resp):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "geolocation=(self), camera=(), microphone=()"
+    if request.is_secure:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+_proxy_warned = False
+
+
+@app.before_request
+def _warn_about_proxy_misconfig():
+    # Behind a proxy with TRUST_PROXY_HOPS=0 every user shares one rate-limit bucket.
+    global _proxy_warned
+    if not _proxy_warned and _trust_hops == 0 and request.headers.get("X-Forwarded-For"):
+        _proxy_warned = True
+        log.warning("X-Forwarded-For seen but TRUST_PROXY_HOPS=0: all clients share one rate-limit bucket. "
+                    "Set TRUST_PROXY_HOPS to the number of proxies in front of the app.")
 
 
 # --- Input helpers ------------------------------------------------------------
@@ -215,9 +251,16 @@ def get_text(data, key, *, required=False, max_len=100, default="", label=None):
 
 
 def get_coordinates(data):
-    lat = get_number(data, "lat", 31.2536, lo=-90, hi=90, label="latitude")
-    lng = get_number(data, "lng", 75.7037, lo=-180, hi=180, label="longitude")
+    """Both coordinates are required: a missing GPS fix must never be replaced by a made-up place."""
+    lat = get_number(data, "lat", lo=-90, hi=90, label="latitude")
+    lng = get_number(data, "lng", lo=-180, hi=180, label="longitude")
     return lat, lng
+
+
+def as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 # --- Rate limiting --------------------------------------------------------------
@@ -259,10 +302,11 @@ def require_auth(f):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             raise ApiError("Authentication required", 401, "AUTH_REQUIRED")
-        user_id = verify_session_token(auth_header[7:])
-        if not user_id:
+        payload = verify_session_token(auth_header[7:])
+        row = get_db().execute("SELECT token_version FROM users WHERE id = ?", (payload["u"],)).fetchone() if payload else None
+        if not row or row["token_version"] != payload["v"]:
             raise ApiError("Session expired or invalid, please log in again", 401, "AUTH_INVALID")
-        request.auth_user_id = user_id
+        request.auth_user_id = payload["u"]
         return f(*args, **kwargs)
     return wrapped
 
@@ -381,6 +425,103 @@ def queue_position(conn, zone, is_priority, created_at):
     """, (zone, is_priority, is_priority, created_at)).fetchone()["pos"]
 
 
+def movement_simulation_enabled():
+    """Demo-only: lets the driver advance a fake position from the UI. Real deployments
+    leave this off and trust only the GPS the driver's phone reports."""
+    return os.environ.get("DEMO_SIMULATE_MOVEMENT", "") == "1"
+
+
+def fresh_cutoff():
+    """Drivers whose last position report is older than this are treated as offline."""
+    return 0.0 if movement_simulation_enabled() else time.time() - LOCATION_MAX_AGE_SECONDS
+
+
+def driver_near(conn, driver_id, lat, lng, radius_km):
+    """True when the driver's own phone recently reported a position within radius_km of the point."""
+    if movement_simulation_enabled():
+        return True
+    loc = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
+    if not loc or time.time() - loc["updated_at"] > LOCATION_MAX_AGE_SECONDS:
+        return False
+    return haversine_distance_km(loc["lat"], loc["lng"], lat, lng) <= radius_km
+
+
+def parse_departure(text):
+    """Epoch seconds for a 'YYYY-MM-DDTHH:MM' campus-local time, or None for legacy free text."""
+    try:
+        naive = datetime.strptime((text or "").strip(), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+    return (naive - timedelta(minutes=LOCAL_UTC_OFFSET_MINUTES)).replace(tzinfo=timezone.utc).timestamp()
+
+
+def route_is_expired(route, now):
+    departs = parse_departure(route["departure_time"])
+    if departs is None:
+        return now - route["created_at"] > 24 * 3600
+    return now > departs + ROUTE_GRACE_SECONDS
+
+
+def cancel_ride_with_refund(conn, ride, reason):
+    """Cancels a not-yet-started ride and returns the held fare. Returns the refunded
+    amount, or None if the ride had already moved on. Caller holds the write lock."""
+    cur = conn.execute(
+        "UPDATE rides SET status = 'cancelled', cancelled_at = ?, cancellation_reason = ? "
+        "WHERE id = ? AND status IN ('queued', 'matched', 'arriving')",
+        (time.time(), reason, ride["id"]),
+    )
+    if cur.rowcount != 1:
+        return None
+    refunded = 0.0
+    if fare_was_held(conn, ride):
+        refunded = ride["fare"]
+        credit_wallet(conn, ride["rider_id"], refunded, "refund", ride["id"], f"Refund for cancelled Ride #{ride['id'][5:13]}")
+    return refunded
+
+
+def cancel_route_with_refunds(conn, route, why):
+    """Cancels an unstarted carpool and refunds every confirmed seat. Returns bookings refunded, or None."""
+    cur = conn.execute("UPDATE driver_routes SET status = 'cancelled' WHERE id = ? AND status IN ('open', 'pinned')",
+                       (route["id"],))
+    if cur.rowcount != 1:
+        return None
+    bookings = conn.execute("SELECT * FROM route_bookings WHERE route_id = ? AND status = 'confirmed'", (route["id"],)).fetchall()
+    for b in bookings:
+        conn.execute("UPDATE route_bookings SET status = 'cancelled' WHERE id = ?", (b["id"],))
+        credit_wallet(conn, b["rider_id"], b["fare_paid"], "refund", b["id"], f"Refund: {why} to {route['destination']}")
+    return len(bookings)
+
+
+_last_sweep = 0.0
+
+
+def sweep_stale(conn, force=False):
+    """Frees money and seats stuck in requests nobody served: queued rides older than
+    QUEUE_TTL and carpools long past their departure. Must run outside a transaction."""
+    global _last_sweep
+    now = time.time()
+    if not force and now - _last_sweep < SWEEP_INTERVAL_SECONDS:
+        return
+    _last_sweep = now
+    ride_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM rides WHERE status = 'queued' AND created_at < ?", (now - QUEUE_TTL_SECONDS,)).fetchall()]
+    route_ids = [r["id"] for r in conn.execute(
+        "SELECT id, departure_time, created_at FROM driver_routes WHERE status IN ('open', 'pinned')").fetchall()
+        if route_is_expired(r, now)]
+    if not ride_ids and not route_ids:
+        return
+    begin_write(conn)
+    for ride_id in ride_ids:
+        ride = conn.execute("SELECT * FROM rides WHERE id = ? AND status = 'queued'", (ride_id,)).fetchone()
+        if ride:
+            cancel_ride_with_refund(conn, ride, "No driver accepted in time")
+    for route_id in route_ids:
+        route = conn.execute("SELECT * FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
+        if route:
+            cancel_route_with_refunds(conn, route, "trip expired")
+    conn.commit()
+
+
 # --- Static pages -------------------------------------------------------------------
 @app.route("/")
 def index():
@@ -403,13 +544,14 @@ def public_config():
         "payments_demo_mode": demo,
         "razorpay_enabled": live or demo,
         "upi_manual_verification": not demo,
+        "demo_simulation": movement_simulation_enabled(),
         "min_topup": payments.MIN_TOPUP,
         "max_topup": payments.MAX_TOPUP,
     })
 
 
 # --- Auth -----------------------------------------------------------------------------
-USER_PUBLIC_FIELDS = ("id, lpu_id, name, email, phone, user_type, role, is_verified, "
+USER_PUBLIC_FIELDS = ("id, lpu_id, username, name, email, phone, user_type, role, is_verified, "
                       "is_teacher_priority, department, avatar_url, created_at")
 
 
@@ -426,23 +568,264 @@ def _build_user_dict(conn, user_id):
     return user_dict
 
 
-@app.route("/api/auth/login", methods=["POST"])
+# --- Sign up / log in with a one-time password sent by SMS ---------------------------
+OTP_LENGTH = 6
+OTP_TTL_SECONDS = 300
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_SECONDS = 30
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._]{2,19}$")
+STUDENT_ID_PATTERN = re.compile(r"^\d{8}$")
+TEACHER_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\-]{3,19}$")
+NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z .'\-]{1,59}$")
+
+
+def otp_demo_mode():
+    """Shows the code in the API reply instead of texting it. Only works while no
+    SMS gateway is configured, so it can never leak codes in a real deployment."""
+    return os.environ.get("OTP_DEMO_MODE", "") == "1" and not sms_gateway_configured()
+
+
+def phone_key(raw):
+    """Canonical form of an Indian mobile number (its last 10 digits), or None."""
+    cleaned = normalize_phone(raw)
+    if not cleaned:
+        return None
+    digits = re.sub(r"\D", "", cleaned)
+    if len(digits) == 10:
+        key = digits
+    elif len(digits) == 12 and digits.startswith("91"):
+        key = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        key = digits[1:]
+    else:
+        return None
+    return key if key[0] in "6789" else None
+
+
+def _otp_hash(challenge_id, code):
+    return hmac.new(OTP_HMAC_KEY, f"{challenge_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def require_phone(data):
+    key = phone_key(data.get("phone"))
+    if not key:
+        raise ApiError("Enter a valid 10-digit Indian mobile number", 400, "BAD_PHONE")
+    return key
+
+
+def normalize_lpu_id(value, user_type):
+    value = value.strip().upper()
+    if user_type == "student" and not STUDENT_ID_PATTERN.match(value):
+        raise ApiError("A student LPU ID is 8 digits, e.g. 12204592", 400, "BAD_LPU_ID")
+    if user_type == "teacher" and not TEACHER_ID_PATTERN.match(value):
+        raise ApiError("Enter your faculty ID, e.g. FAC-10822", 400, "BAD_LPU_ID")
+    return value
+
+
+def issue_otp(conn, purpose, key, payload):
+    """Creates a challenge and texts the code. Returns the JSON reply for the client."""
+    demo = otp_demo_mode()
+    if not demo and not sms_gateway_configured():
+        raise ApiError("SMS sign-in is not available right now. Please try again later.", 503, "SMS_UNAVAILABLE")
+
+    now = time.time()
+    recent = conn.execute(
+        "SELECT created_at FROM otp_challenges WHERE phone_key = ? ORDER BY created_at DESC LIMIT 1", (key,)
+    ).fetchone()
+    if recent and now - recent["created_at"] < OTP_RESEND_SECONDS:
+        wait = int(OTP_RESEND_SECONDS - (now - recent["created_at"])) + 1
+        raise ApiError(f"Please wait {wait}s before asking for another code", 429, "OTP_COOLDOWN", retry_after=wait)
+    # Caps texts per number: SMS costs money, and this stops spamming someone else's phone.
+    check_rate(f"otp-phone:{key}", 5, 3600)
+
+    code = "".join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
+    challenge_id = f"otp_{secrets.token_urlsafe(16)}"
+    if not demo:
+        delivery = send_sms(f"+91{key}", f"{code} is your CampusGo verification code. It expires in 5 minutes. Do not share it with anyone.")
+        if delivery.get("status") != "sent":
+            raise ApiError("We couldn't send the SMS. Check the number and try again.", 502, "SMS_FAILED")
+
+    conn.execute("DELETE FROM otp_challenges WHERE expires_at < ?", (now - 3600,))
+    conn.execute(
+        "INSERT INTO otp_challenges (id, purpose, phone_key, code_hash, payload, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (challenge_id, purpose, key, _otp_hash(challenge_id, code), json.dumps(payload), now, now + OTP_TTL_SECONDS),
+    )
+    conn.commit()
+    reply = {
+        "challenge_id": challenge_id,
+        "phone_hint": f"+91 {key[:2]}XXXXXX{key[-2:]}",
+        "expires_in": OTP_TTL_SECONDS,
+        "resend_after": OTP_RESEND_SECONDS,
+    }
+    if demo:
+        reply["demo_otp"] = code
+    return reply
+
+
+def consume_otp(conn, purpose, data):
+    """Checks the submitted code once. Returns (payload, phone_key) stored when it was issued."""
+    challenge_id = get_text(data, "challenge_id", required=True, max_len=64, label="challenge")
+    code = get_text(data, "otp", required=True, max_len=12, label="code")
+    row = conn.execute("SELECT * FROM otp_challenges WHERE id = ? AND purpose = ?", (challenge_id, purpose)).fetchone()
+    if not row or row["consumed"] or time.time() > row["expires_at"]:
+        raise ApiError("This code has expired. Request a new one.", 400, "OTP_EXPIRED")
+    # Count the attempt before comparing, so guessing is capped even with parallel requests.
+    begin_write(conn)
+    cur = conn.execute("UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ? AND attempts < ? AND consumed = 0",
+                       (challenge_id, OTP_MAX_ATTEMPTS))
+    conn.commit()
+    if cur.rowcount == 0:
+        raise ApiError("Too many wrong codes. Request a new one.", 429, "OTP_LOCKED")
+    if not hmac.compare_digest(row["code_hash"], _otp_hash(challenge_id, code)):
+        left = OTP_MAX_ATTEMPTS - row["attempts"] - 1
+        raise ApiError("That code is not correct" + (f" ({left} tries left)" if left > 0 else ""), 400, "OTP_WRONG")
+    begin_write(conn)
+    claimed = conn.execute("UPDATE otp_challenges SET consumed = 1 WHERE id = ? AND consumed = 0", (challenge_id,))
+    conn.commit()
+    if claimed.rowcount == 0:
+        raise ApiError("This code has already been used.", 400, "OTP_EXPIRED")
+    return json.loads(row["payload"]), row["phone_key"]
+
+
+def username_taken(conn, username):
+    return conn.execute("SELECT 1 FROM users WHERE lower(username) = ?", (username.lower(),)).fetchone() is not None
+
+
+def suggest_usernames(conn, name, count=5):
+    parts = [re.sub(r"[^a-z0-9]", "", p) for p in name.lower().split()]
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+    first, last = parts[0], parts[-1]
+    if first == last:
+        candidates = [first, f"{first}_official", f"the{first}"]
+    else:
+        candidates = [f"{first}.{last}", f"{first}{last}", f"{first}_{last}", f"{first}{last[:1]}", f"{first[:1]}{last}", first]
+    suggestions = []
+    for candidate in candidates:
+        if USERNAME_PATTERN.match(candidate) and candidate not in suggestions and not username_taken(conn, candidate):
+            suggestions.append(candidate)
+    # Fill the rest with numbered variants that are free right now.
+    base = candidates[0][:16]
+    attempts = 0
+    while len(suggestions) < count and attempts < 50:
+        attempts += 1
+        candidate = f"{base}{secrets.randbelow(900) + 100}"
+        if candidate not in suggestions and USERNAME_PATTERN.match(candidate) and not username_taken(conn, candidate):
+            suggestions.append(candidate)
+    return suggestions[:count]
+
+
+@app.route("/api/auth/username-suggestions", methods=["POST"])
+@rate_limit(max_requests=30, window_seconds=60)
+def username_suggestions():
+    name = get_text(body(), "name", required=True, max_len=60, label="name")
+    if not NAME_PATTERN.match(name):
+        raise ApiError("Enter your full name using letters only", 400, "BAD_NAME")
+    return jsonify({"suggestions": suggest_usernames(get_db(), name)})
+
+
+@app.route("/api/auth/username-available", methods=["POST"])
+@rate_limit(max_requests=60, window_seconds=60)
+def username_available():
+    username = get_text(body(), "username", required=True, max_len=30, label="username").lower()
+    if not USERNAME_PATTERN.match(username):
+        return jsonify({"available": False, "reason": "Use 3-20 lowercase letters, numbers, dots or underscores"})
+    taken = username_taken(get_db(), username)
+    return jsonify({"available": not taken, "reason": "That username is taken" if taken else ""})
+
+
+@app.route("/api/auth/signup/start", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=60)
-def login():
+def signup_start():
     data = body()
-    lpu_id = get_text(data, "lpu_id", required=True, max_len=32, label="LPU ID")
-    password = data.get("password")
-    if not isinstance(password, str) or not password or len(password) > 256:
-        raise ApiError("LPU ID and password are required")
-    # Second limit per account, so rotating IPs doesn't allow password guessing.
-    check_rate(f"login-account:{lpu_id.lower()}", 10, 300)
+    name = get_text(data, "name", required=True, max_len=60, label="name")
+    if not NAME_PATTERN.match(name):
+        raise ApiError("Enter your full name using letters only", 400, "BAD_NAME")
+    username = get_text(data, "username", required=True, max_len=30, label="username").lower()
+    if not USERNAME_PATTERN.match(username):
+        raise ApiError("Username must be 3-20 lowercase letters, numbers, dots or underscores", 400, "BAD_USERNAME")
+    user_type = data.get("user_type")
+    if user_type not in ("student", "teacher"):
+        raise ApiError("Choose whether you are a student or a teacher")
+    lpu_id = normalize_lpu_id(get_text(data, "lpu_id", required=True, max_len=32, label="LPU ID"), user_type)
+    key = require_phone(data)
 
     conn = get_db()
-    user = conn.execute("SELECT id, password_hash FROM users WHERE lpu_id = ?", (lpu_id,)).fetchone()
-    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
-        raise ApiError("Invalid LPU ID or password", 401)
+    if username_taken(conn, username):
+        raise ApiError("That username is taken. Pick another.", 409, "USERNAME_TAKEN")
+    if conn.execute("SELECT 1 FROM users WHERE upper(lpu_id) = ?", (lpu_id,)).fetchone():
+        raise ApiError("An account with this LPU ID already exists. Please log in instead.", 409, "LPU_ID_EXISTS")
+    if conn.execute("SELECT 1 FROM users WHERE phone_key = ?", (key,)).fetchone():
+        raise ApiError("An account with this mobile number already exists. Please log in instead.", 409, "PHONE_EXISTS")
 
-    return jsonify({"user": _build_user_dict(conn, user["id"]), "token": generate_session_token(user["id"])})
+    payload = {"name": " ".join(name.split()), "username": username, "user_type": user_type, "lpu_id": lpu_id}
+    return jsonify(issue_otp(conn, "signup", key, payload))
+
+
+@app.route("/api/auth/signup/verify", methods=["POST"])
+@rate_limit(max_requests=15, window_seconds=60)
+def signup_verify():
+    conn = get_db()
+    payload, key = consume_otp(conn, "signup", body())
+
+    user_id = f"usr_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    begin_write(conn)
+    try:
+        conn.execute("""
+        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified,
+                           is_teacher_priority, department, avatar_url, created_at, username, phone_key)
+        VALUES (?, ?, ?, '', ?, ?, 'rider', '', 1, 0, NULL, NULL, ?, ?, ?)
+        """, (user_id, payload["lpu_id"], payload["name"], f"+91{key}", payload["user_type"],
+              now, payload["username"], key))
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        raise ApiError("Someone just took that username, ID or number. Please start again.", 409, "SIGNUP_CONFLICT")
+    conn.execute("INSERT INTO wallets (user_id, balance, currency, updated_at) VALUES (?, 0, 'INR', ?)", (user_id, now))
+    conn.commit()
+    return jsonify({"user": _build_user_dict(conn, user_id), "token": generate_session_token(conn, user_id), "new_account": True})
+
+
+@app.route("/api/auth/login/start", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=60)
+def login_start():
+    data = body()
+    lpu_id = get_text(data, "lpu_id", required=True, max_len=32, label="LPU ID").upper()
+    key = require_phone(data)
+    # Keyed by caller too, so a stranger can't use up a victim's attempts and lock them out.
+    check_rate(f"login-account:{lpu_id}:{request.remote_addr}", 10, 300)
+    conn = get_db()
+    user = conn.execute("SELECT id FROM users WHERE upper(lpu_id) = ? AND phone_key = ?", (lpu_id, key)).fetchone()
+    if not user:
+        if otp_demo_mode():
+            raise ApiError("No account matches this LPU ID and mobile number. New here? Sign up instead.", 404, "NO_ACCOUNT")
+        # Same reply as a real code request, so this endpoint can't be used to find out who has an account.
+        return jsonify({
+            "challenge_id": f"otp_{secrets.token_urlsafe(16)}",
+            "phone_hint": f"+91 {key[:2]}XXXXXX{key[-2:]}",
+            "expires_in": OTP_TTL_SECONDS,
+            "resend_after": OTP_RESEND_SECONDS,
+        })
+    return jsonify(issue_otp(conn, "login", key, {"user_id": user["id"]}))
+
+
+@app.route("/api/auth/login/verify", methods=["POST"])
+@rate_limit(max_requests=15, window_seconds=60)
+def login_verify():
+    conn = get_db()
+    payload, _ = consume_otp(conn, "login", body())
+    return jsonify({"user": _build_user_dict(conn, payload["user_id"]), "token": generate_session_token(conn, payload["user_id"])})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+@require_auth
+def logout():
+    """Signs the user out everywhere: every token issued so far stops working."""
+    conn = get_db()
+    conn.execute("UPDATE users SET token_version = token_version + 1 WHERE id = ?", (request.auth_user_id,))
+    conn.commit()
+    return jsonify({"success": True})
 
 
 @app.route("/api/auth/me", methods=["GET"])
@@ -488,8 +871,8 @@ def save_vehicle():
         raise ApiError("Plate number should look like PB08-AB-1234")
     color = get_text(data, "color", max_len=20)
     capacity = get_number(data, "capacity", 1, lo=1, hi=MAX_CAPACITY[category], integer=True, label="seat capacity")
-    has_helmet = 1 if data.get("has_helmet") else 0
-    has_ac = 1 if data.get("has_ac") and category == "car" else 0
+    has_helmet = 1 if as_bool(data.get("has_helmet")) else 0
+    has_ac = 1 if as_bool(data.get("has_ac")) and category == "car" else 0
 
     conn = get_db()
     begin_write(conn)
@@ -534,9 +917,17 @@ def add_emergency_contact():
     phone = normalize_phone(data.get("phone"))
     if not phone:
         raise ApiError("Enter a valid phone number with 10 to 15 digits")
+    check_rate(f"contact-add-hour:{user_id}", 10, 3600)
 
     conn = get_db()
+    own = conn.execute("SELECT phone_key FROM users WHERE id = ?", (user_id,)).fetchone()
+    new_key = phone_key(phone)
+    if own and new_key and own["phone_key"] == new_key:
+        raise ApiError("Add someone else's number. Your own phone can't be your emergency contact.")
     begin_write(conn)
+    for existing in conn.execute("SELECT phone FROM emergency_contacts WHERE user_id = ?", (user_id,)).fetchall():
+        if phone_key(existing["phone"]) == new_key if new_key else existing["phone"] == phone:
+            raise ApiError("That number is already one of your emergency contacts.", 409)
     count = conn.execute("SELECT COUNT(*) AS c FROM emergency_contacts WHERE user_id = ?", (user_id,)).fetchone()["c"]
     if count >= MAX_EMERGENCY_CONTACTS:
         raise ApiError(f"You can save up to {MAX_EMERGENCY_CONTACTS} emergency contacts. Remove one first.")
@@ -585,11 +976,11 @@ def nearby_drivers():
     FROM driver_locations dl
     JOIN users u ON u.id = dl.driver_id
     JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
-    WHERE dl.is_online = 1
+    WHERE dl.is_online = 1 AND dl.updated_at >= ?
       AND dl.driver_id != ?
       AND dl.driver_id NOT IN (SELECT driver_id FROM rides
                                WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
-    """, (request.auth_user_id,)).fetchall()
+    """, (fresh_cutoff(), request.auth_user_id)).fetchall()
     drivers = [{"lat": r["lat"], "lng": r["lng"], "category": r["category"],
                 "first_name": (r["name"] or "Driver").split()[0]} for r in rows]
     return jsonify({"drivers": drivers})
@@ -615,6 +1006,7 @@ def _demand(conn, zone):
 def get_ride_quote():
     scope, pickup, drop = _trip_from_request(body())
     conn = get_db()
+    sweep_stale(conn)
     balance = wallet_balance(conn, request.auth_user_id)
     demand = _demand(conn, pickup["zone"])
 
@@ -623,8 +1015,8 @@ def get_ride_quote():
         drivers = conn.execute("""
         SELECT COUNT(*) AS n FROM driver_locations dl
         JOIN vehicles v ON dl.driver_id = v.user_id AND v.is_active = 1
-        WHERE dl.is_online = 1 AND v.category = ?
-        """, (service,)).fetchone()["n"]
+        WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ?
+        """, (fresh_cutoff(), service)).fetchone()["n"]
         fare = calculate_fare(service, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"], pickup["zone"], demand)
         fare["available_drivers"] = drivers
         fare["has_sufficient_balance"] = balance >= fare["total_fare"]
@@ -646,6 +1038,7 @@ def book_ride():
     scope, pickup, drop = _trip_from_request(data)
 
     conn = get_db()
+    sweep_stale(conn)
     begin_write(conn)
     rider = conn.execute("SELECT id, is_teacher_priority FROM users WHERE id = ?", (rider_id,)).fetchone()
     if not rider:
@@ -673,12 +1066,12 @@ def book_ride():
     FROM driver_locations dl
     JOIN users u ON dl.driver_id = u.id
     JOIN vehicles v ON dl.driver_id = v.user_id
-    WHERE dl.is_online = 1 AND v.category = ? AND v.is_active = 1 AND dl.driver_id != ?
+    WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND v.is_active = 1 AND dl.driver_id != ?
       AND dl.driver_id NOT IN (SELECT driver_id FROM rides
                                WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
     ORDER BY (CASE WHEN dl.zone = ? THEN 0 ELSE 1 END), dl.updated_at DESC
     LIMIT 1
-    """, (service_type, rider_id, pickup["zone"])).fetchone()
+    """, (fresh_cutoff(), service_type, rider_id, pickup["zone"])).fetchone()
 
     now = time.time()
     is_priority = 1 if rider["is_teacher_priority"] else 0
@@ -721,6 +1114,7 @@ def book_ride():
 def get_active_ride():
     user_id = request.auth_user_id
     conn = get_db()
+    sweep_stale(conn)
     ride = conn.execute("""
     SELECT r.*,
            ru.name AS rider_name, ru.phone AS rider_phone, ru.avatar_url AS rider_avatar,
@@ -748,14 +1142,51 @@ def get_active_ride():
     return jsonify({"active_ride": ride_dict})
 
 
+@app.route("/api/driver/location", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=30, window_seconds=60)
+def report_driver_location():
+    """The driver's phone reports its real GPS position. This is the only thing that
+    moves a driver on the map, starts a pickup, or lets a trip be completed."""
+    lat, lng = get_coordinates(body())
+    driver_id = request.auth_user_id
+    conn = get_db()
+    begin_write(conn)
+    now = time.time()
+    conn.execute("""
+    INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
+    VALUES (?, 0, ?, ?, 'Zone-Central', 0.0, ?)
+    ON CONFLICT(driver_id) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, updated_at = excluded.updated_at
+    """, (driver_id, lat, lng, now))
+
+    ride = conn.execute(
+        "SELECT * FROM rides WHERE driver_id = ? AND status IN ('matched', 'arriving', 'in_progress') LIMIT 1",
+        (driver_id,),
+    ).fetchone()
+    status = ride["status"] if ride else None
+    if ride and status in ("matched", "arriving") and \
+            haversine_distance_km(lat, lng, ride["pickup_lat"], ride["pickup_lng"]) <= PICKUP_RADIUS_KM:
+        conn.execute("UPDATE rides SET status = 'in_progress', started_at = ? WHERE id = ? AND status IN ('matched', 'arriving')",
+                     (now, ride["id"]))
+        status = "in_progress"
+    conn.execute("UPDATE driver_routes SET current_lat = ?, current_lng = ? WHERE driver_id = ? AND status = 'in_progress'",
+                 (lat, lng, driver_id))
+    conn.commit()
+    return jsonify({"success": True, "ride_status": status})
+
+
 @app.route("/api/rides/<ride_id>/telemetry-step", methods=["POST"])
 @require_auth
 @rate_limit(max_requests=120, window_seconds=60)
 def telemetry_step(ride_id):
-    """Simulates the driver moving: towards pickup while 'arriving', then
-    towards the drop while 'in_progress'."""
+    """Demo only (DEMO_SIMULATE_MOVEMENT=1): the driver advances a fake position. With
+    it off, positions come from /api/driver/location and this endpoint refuses."""
+    if not movement_simulation_enabled():
+        raise ApiError("Movement simulation is disabled. Positions come from the driver's phone.", 403, "SIMULATION_DISABLED")
     conn = get_db()
     ride = load_ride_for_participant(conn, ride_id)
+    if request.auth_user_id != ride["driver_id"]:
+        raise ApiError("Only the driver can move the simulated vehicle", 403)
     status = ride["status"]
     driver_id = ride["driver_id"]
     if status not in ("matched", "arriving", "in_progress") or not driver_id:
@@ -805,17 +1236,9 @@ def cancel_ride(ride_id):
     now = time.time()
 
     if request.auth_user_id == ride["rider_id"]:
-        cur = conn.execute(
-            "UPDATE rides SET status = 'cancelled', cancelled_at = ?, cancellation_reason = ? "
-            "WHERE id = ? AND status IN ('queued', 'matched', 'arriving')",
-            (now, reason or "Cancelled by rider", ride_id),
-        )
-        if cur.rowcount != 1:
+        refunded = cancel_ride_with_refund(conn, ride, reason or "Cancelled by rider")
+        if refunded is None:
             raise ApiError("This ride can no longer be cancelled", 409, "NOT_CANCELLABLE")
-        refunded = 0.0
-        if fare_was_held(conn, ride):
-            refunded = ride["fare"]
-            credit_wallet(conn, ride["rider_id"], refunded, "refund", ride_id, f"Refund for cancelled Ride #{ride_id[5:13]}")
         conn.commit()
         return jsonify({"success": True, "status": "cancelled", "refunded": refunded,
                         "wallet_balance": round(wallet_balance(conn, ride["rider_id"]), 2)})
@@ -841,6 +1264,11 @@ def complete_ride(ride_id):
 
     begin_write(conn)
     now = time.time()
+    # The rider can always confirm arrival. The driver can only finish the trip once their own
+    # phone has reported a position at the drop-off, so a fare can't be collected without driving.
+    if request.auth_user_id == ride["driver_id"] and not driver_near(conn, ride["driver_id"], ride["drop_lat"], ride["drop_lng"], DROP_RADIUS_KM):
+        raise ApiError("You can complete the ride once your phone shows you at the drop-off point "
+                       "(or the rider confirms arrival).", 409, "NOT_AT_DESTINATION")
     cur = conn.execute(
         "UPDATE rides SET status = 'completed', completed_at = ? "
         "WHERE id = ? AND status = 'in_progress' AND driver_id IS NOT NULL",
@@ -894,14 +1322,26 @@ def rate_ride(ride_id):
 
 
 # --- SOS -------------------------------------------------------------------------------------
+SOS_CONTACT_TEXTS_PER_HOUR = 3     # per destination number, across all accounts
+
+
 @app.route("/api/sos/trigger", methods=["POST"])
 @require_auth
 @rate_limit(max_requests=3, window_seconds=60)
 def trigger_sos():
     data = body()
     user_id = request.auth_user_id
-    lat, lng = get_coordinates(data)
-    location_name = get_text(data, "location_name", max_len=100) or "Near LPU Campus"
+    # Hourly and daily caps stop the button being used to text someone's contacts over and over.
+    check_rate(f"sos-hour:{user_id}", 6, 3600)
+    check_rate(f"sos-day:{user_id}", 15, 86400)
+
+    # A missing GPS fix is reported as "location unavailable", never replaced by a made-up place.
+    if data.get("lat") is not None and data.get("lng") is not None:
+        lat, lng = get_coordinates(data)
+    else:
+        lat = lng = None
+    approximate = as_bool(data.get("approximate")) or lat is None
+    location_name = get_text(data, "location_name", max_len=100) or "Location unavailable"
     ride_id = data.get("ride_id")
 
     conn = get_db()
@@ -925,14 +1365,28 @@ def trigger_sos():
             linked_ride_id = ride["id"]
             share_url = tracking_url(ride["share_token"])
 
-    result = dispatch_emergency_alert(user["name"], user["lpu_id"], location_name, lat, lng, contacts, share_url)
+    blocked = set()
+    for c in contacts:
+        number = normalize_phone(c.get("phone"))
+        if not number:
+            continue
+        try:
+            check_rate(f"sos-dest:{phone_key(number) or number}", SOS_CONTACT_TEXTS_PER_HOUR, 3600)
+        except ApiError:
+            blocked.add(number)
+
+    result = dispatch_emergency_alert(user["name"], user["lpu_id"], location_name, lat, lng, contacts, share_url,
+                                      approximate=approximate, blocked_phones=blocked)
 
     alert_id = f"sos_{uuid.uuid4().hex[:8]}"
+    note = "SOS triggered from app" + (" (approximate location)" if approximate and lat is not None else "")
+    if lat is None:
+        note = "SOS triggered from app (no location available)"
     conn.execute("""
     INSERT INTO sos_alerts (id, ride_id, user_id, lat, lng, location_name, status, notified_contacts_count, notes, created_at)
     VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-    """, (alert_id, linked_ride_id, user_id, lat, lng, location_name, result["contacts_sent"],
-          "SOS triggered from app", time.time()))
+    """, (alert_id, linked_ride_id, user_id, lat if lat is not None else 0.0, lng if lng is not None else 0.0,
+          location_name, result["contacts_sent"], note, time.time()))
     conn.commit()
 
     return jsonify({
@@ -947,6 +1401,21 @@ def trigger_sos():
         "campus_security_hotline": CAMPUS_SECURITY_PHONE,
         "tracking_url": share_url,
     })
+
+
+@app.route("/api/sos/<alert_id>/resolve", methods=["POST"])
+@require_auth
+def resolve_own_sos(alert_id):
+    """The user marks their own alert as resolved ("I'm safe")."""
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE sos_alerts SET status = 'resolved', resolved_at = ? WHERE id = ? AND user_id = ? AND status != 'resolved'",
+        (time.time(), alert_id, request.auth_user_id),
+    )
+    if cur.rowcount != 1:
+        raise ApiError("Alert not found or already resolved", 404)
+    conn.commit()
+    return jsonify({"success": True, "status": "resolved"})
 
 
 # --- Public live-tracking link -----------------------------------------------------------
@@ -970,6 +1439,8 @@ def get_shared_ride(share_token):
         raise ApiError("This tracking link has expired or is invalid", 404)
     ride_dict = dict(ride)
     ride_dict["rider_name"] = (ride_dict["rider_name"] or "Rider").split()[0]
+    if ride_dict["driver_name"]:
+        ride_dict["driver_name"] = ride_dict["driver_name"].split()[0]
     return jsonify({"ride": ride_dict})
 
 
@@ -986,13 +1457,20 @@ def toggle_driver_online():
 
     zones = {l["zone"] for l in CAMPUS_LANDMARKS.values()}
     zone = data.get("zone") if data.get("zone") in zones else "Zone-Central"
-    now = time.time()
+    has_fix = data.get("lat") is not None and data.get("lng") is not None
+    lat, lng = get_coordinates(data) if has_fix else (31.2536, 75.7038)
+    # Only a real position report refreshes the location timestamp; going online alone doesn't,
+    # so a driver whose phone stops reporting drops out of matching after a couple of minutes.
     conn.execute("""
     INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
-    VALUES (?, ?, 31.2536, 75.7038, ?, 0.0, ?)
-    ON CONFLICT(driver_id) DO UPDATE SET is_online = excluded.is_online, zone = excluded.zone,
-                                         updated_at = excluded.updated_at
-    """, (driver_id, is_online, zone, now))
+    VALUES (:driver, :online, :lat, :lng, :zone, 0.0, :now)
+    ON CONFLICT(driver_id) DO UPDATE SET
+        is_online = excluded.is_online, zone = excluded.zone,
+        lat = CASE WHEN :fix THEN excluded.lat ELSE driver_locations.lat END,
+        lng = CASE WHEN :fix THEN excluded.lng ELSE driver_locations.lng END,
+        updated_at = CASE WHEN :fix THEN excluded.updated_at ELSE driver_locations.updated_at END
+    """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng, "zone": zone,
+          "now": time.time(), "fix": 1 if has_fix else 0})
     conn.commit()
     return jsonify({"success": True, "is_online": bool(is_online)})
 
@@ -1002,6 +1480,7 @@ def toggle_driver_online():
 def get_driver_requests():
     """Queued requests this driver's vehicle can serve, teachers first."""
     conn = get_db()
+    sweep_stale(conn)
     vehicle = require_vehicle(conn, request.auth_user_id)
     rows = conn.execute("""
     SELECT r.id, r.service_type, r.scope, r.pickup_name, r.pickup_zone, r.drop_name, r.fare,
@@ -1046,7 +1525,7 @@ def driver_accept_request():
     conn.execute("""
     INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
     VALUES (?, 1, 31.2536, 75.7038, 'Zone-Central', 0.0, ?)
-    ON CONFLICT(driver_id) DO UPDATE SET is_online = 1, updated_at = excluded.updated_at
+    ON CONFLICT(driver_id) DO UPDATE SET is_online = 1
     """, (driver_id, time.time()))
     conn.commit()
     return jsonify({"success": True, "ride_id": ride_id, "status": "arriving"})
@@ -1091,6 +1570,7 @@ v.model AS vehicle_model, v.category AS vehicle_category, v.plate_number AS vehi
 def get_scheduled_routes():
     user_id = request.auth_user_id
     conn = get_db()
+    sweep_stale(conn)
     routes = [dict(r) for r in conn.execute(f"""
     SELECT {ROUTE_LIST_FIELDS}
     FROM driver_routes dr
@@ -1137,6 +1617,13 @@ def plan_future_route():
         raise ApiError("A CityLink route needs an off-campus origin or destination")
 
     departure_time = get_text(data, "departure_time", required=True, max_len=40, label="departure time")
+    departs = parse_departure(departure_time)
+    if departs is None:
+        raise ApiError("Pick the departure date and time")
+    if departs < time.time() - 300:
+        raise ApiError("That departure time has already passed")
+    if departs > time.time() + 30 * 24 * 3600:
+        raise ApiError("Departure can be at most 30 days ahead")
     max_seats = max(1, vehicle["capacity"])
     total_seats = get_number(data, "total_seats", data.get("available_seats", 1), lo=1, hi=max_seats,
                              integer=True, label="seats")
@@ -1184,6 +1671,8 @@ def join_route(route_id):
     WHERE id = ? AND status = 'open' AND available_seats >= ?
     """, (seats, seats, route_id, seats))
     if cur.rowcount != 1:
+        if route["status"] == "pinned" or route["available_seats"] == 0:
+            raise ApiError("This trip is full", 409, "NOT_ENOUGH_SEATS")
         raise ApiError(f"Only {route['available_seats']} seat(s) remaining", 409, "NOT_ENOUGH_SEATS")
 
     fare = round(route["price_per_seat"] * seats, 2)
@@ -1243,18 +1732,11 @@ def cancel_route(route_id):
         raise ApiError("Route not found", 404)
     if route["driver_id"] != request.auth_user_id:
         raise ApiError("Only the route host can cancel this trip", 403)
-    cur = conn.execute("UPDATE driver_routes SET status = 'cancelled' WHERE id = ? AND status IN ('open', 'pinned')",
-                       (route_id,))
-    if cur.rowcount != 1:
+    refunded = cancel_route_with_refunds(conn, route, "host cancelled trip")
+    if refunded is None:
         raise ApiError("This trip has already started or ended", 409)
-
-    bookings = conn.execute("SELECT * FROM route_bookings WHERE route_id = ? AND status = 'confirmed'", (route_id,)).fetchall()
-    for b in bookings:
-        conn.execute("UPDATE route_bookings SET status = 'cancelled' WHERE id = ?", (b["id"],))
-        credit_wallet(conn, b["rider_id"], b["fare_paid"], "refund", b["id"],
-                      f"Refund: host cancelled trip to {route['destination']}")
     conn.commit()
-    return jsonify({"success": True, "status": "cancelled", "refunded_bookings": len(bookings)})
+    return jsonify({"success": True, "status": "cancelled", "refunded_bookings": refunded})
 
 
 @app.route("/api/routes/<route_id>/start", methods=["POST"])
@@ -1269,6 +1751,9 @@ def start_scheduled_route(route_id):
         raise ApiError("Only the route host can start this trip", 403)
     if not conn.execute("SELECT 1 FROM route_bookings WHERE route_id = ? AND status = 'confirmed'", (route_id,)).fetchone():
         raise ApiError("No passengers have booked this route yet")
+    if not driver_near(conn, route["driver_id"], route["origin_lat"], route["origin_lng"], ROUTE_ORIGIN_RADIUS_KM):
+        raise ApiError("Start the trip from the pickup point: your phone's live location must be near it.",
+                       409, "NOT_AT_ORIGIN")
 
     now = time.time()
     cur = conn.execute(
@@ -1301,6 +1786,7 @@ def get_live_cockpit(route_id):
     route_dict = dict(route)
     route_dict.pop("share_token", None)
     route_dict["is_host"] = route["driver_id"] == request.auth_user_id
+    is_host = route["driver_id"] == request.auth_user_id
     route_dict["passengers"] = [dict(p) for p in conn.execute("""
     SELECT rb.id AS booking_id, rb.seats, rb.fare_paid, rb.status AS booking_status,
            u.name AS passenger_name, u.phone AS passenger_phone, u.avatar_url AS passenger_avatar
@@ -1308,6 +1794,10 @@ def get_live_cockpit(route_id):
     WHERE rb.route_id = ? AND rb.status IN ('confirmed', 'in_progress', 'completed')
     """, (route_id,)).fetchall()]
 
+    if not is_host:
+        # Fellow passengers get names only; contact numbers are for the host.
+        for p in route_dict["passengers"]:
+            p.pop("passenger_phone", None)
     c_lat = route_dict["current_lat"] or route_dict["origin_lat"]
     c_lng = route_dict["current_lng"] or route_dict["origin_lng"]
     dist = haversine_distance_km(c_lat, c_lng, route_dict["destination_lat"], route_dict["destination_lng"])
@@ -1320,11 +1810,15 @@ def get_live_cockpit(route_id):
 @require_auth
 @rate_limit(max_requests=120, window_seconds=60)
 def route_telemetry_step(route_id):
+    """Demo only (DEMO_SIMULATE_MOVEMENT=1). Real trips are moved by the host's phone GPS."""
+    if not movement_simulation_enabled():
+        raise ApiError("Movement simulation is disabled. Positions come from the host's phone.", 403, "SIMULATION_DISABLED")
     conn = get_db()
     route = conn.execute("SELECT * FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
     if not route or route["status"] != "in_progress":
         raise ApiError("Route is not active")
-    route_participant_check(conn, route, request.auth_user_id)
+    if route["driver_id"] != request.auth_user_id:
+        raise ApiError("Only the host can move the simulated vehicle", 403)
 
     curr_lat = route["current_lat"] or route["origin_lat"]
     curr_lng = route["current_lng"] or route["origin_lng"]
@@ -1348,6 +1842,8 @@ def complete_scheduled_route(route_id):
         raise ApiError("Route not found", 404)
     if route["driver_id"] != request.auth_user_id:
         raise ApiError("Only the route host can complete this trip", 403)
+    if not driver_near(conn, route["driver_id"], route["destination_lat"], route["destination_lng"], ROUTE_DEST_RADIUS_KM):
+        raise ApiError("Complete the trip once your phone shows you at the destination.", 409, "NOT_AT_DESTINATION")
 
     now = time.time()
     cur = conn.execute(
@@ -1586,6 +2082,59 @@ def admin_reject_payment(order_id):
         raise ApiError("Payment order not found or already processed", 404)
     conn.commit()
     return jsonify({"success": True, "status": "rejected"})
+
+
+@app.route("/api/admin/faculty/pending", methods=["GET"])
+@require_admin
+def admin_pending_faculty():
+    """Accounts that signed up as teachers and are waiting for priority-queue approval."""
+    rows = get_db().execute("""
+    SELECT id, lpu_id, name, phone, created_at FROM users
+    WHERE user_type = 'teacher' AND is_teacher_priority = 0 ORDER BY created_at ASC
+    """).fetchall()
+    return jsonify({"pending": [dict(r) for r in rows]})
+
+
+@app.route("/api/admin/faculty/<user_id>/approve", methods=["POST"])
+@require_admin
+def admin_approve_faculty(user_id):
+    """Call only after checking the faculty ID against the staff records."""
+    conn = get_db()
+    cur = conn.execute("UPDATE users SET is_teacher_priority = 1 WHERE id = ? AND user_type = 'teacher'", (user_id,))
+    if cur.rowcount != 1:
+        raise ApiError("Teacher account not found", 404)
+    conn.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/sos", methods=["GET"])
+@require_admin
+def admin_list_sos():
+    rows = get_db().execute("""
+    SELECT s.id, s.ride_id, s.lat, s.lng, s.location_name, s.status, s.notes, s.created_at,
+           u.name, u.lpu_id, u.phone
+    FROM sos_alerts s JOIN users u ON u.id = s.user_id
+    WHERE s.status != 'resolved' ORDER BY s.created_at DESC LIMIT 100
+    """).fetchall()
+    return jsonify({"alerts": [dict(r) for r in rows]})
+
+
+@app.route("/api/admin/sos/<alert_id>/<action>", methods=["POST"])
+@require_admin
+def admin_update_sos(alert_id, action):
+    if action not in ("acknowledge", "resolve"):
+        raise ApiError("Not found", 404)
+    status = "acknowledged" if action == "acknowledge" else "resolved"
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE sos_alerts SET status = ?, resolved_at = CASE WHEN ? = 'resolved' THEN ? ELSE resolved_at END "
+        "WHERE id = ? AND status != 'resolved'",
+        (status, status, time.time(), alert_id),
+    )
+    if cur.rowcount != 1:
+        raise ApiError("Alert not found or already resolved", 404)
+    conn.commit()
+    return jsonify({"success": True, "status": status})
 
 
 # Create tables on startup (idempotent). Demo data is seeded separately.

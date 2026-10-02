@@ -4,7 +4,7 @@ import os
 import unittest
 from unittest import mock
 
-from test_support import ClientMixin
+from test_support import ClientMixin, departure_in
 import app as app_module
 import payments
 
@@ -69,7 +69,7 @@ class TestMoneyHoles(ClientMixin, unittest.TestCase):
 
     def test_negative_carpool_price_and_seats_rejected(self):
         host = self.auth_headers("usr_driver_harpreet")
-        base = {"origin": "uni_mall", "destination": "jalandhar_bus_stand", "departure_time": "now", "total_seats": 2}
+        base = {"origin": "uni_mall", "destination": "jalandhar_bus_stand", "departure_time": departure_in(), "total_seats": 2}
         self.assertEqual(self.client.post("/api/routes/plan", headers=host, json={**base, "price_per_seat": -1000}).status_code, 400)
         self.assertEqual(self.client.post("/api/routes/plan", headers=host, json={**base, "total_seats": -3, "price_per_seat": 50}).status_code, 400)
 
@@ -84,7 +84,7 @@ class TestMoneyHoles(ClientMixin, unittest.TestCase):
     def test_join_refused_without_balance_leaves_seats_untouched(self):
         host = self.auth_headers("usr_driver_harpreet")
         route_id = self.client.post("/api/routes/plan", headers=host, json={
-            "origin": "uni_mall", "destination": "rama_mandi", "departure_time": "now",
+            "origin": "uni_mall", "destination": "rama_mandi", "departure_time": departure_in(),
             "total_seats": 2, "price_per_seat": 1500}).get_json()["route_id"]
         kavya = self.auth_headers("usr_student_kavya")
         self.assertEqual(self.client.post(f"/api/routes/{route_id}/join", headers=kavya, json={"seats": 1}).status_code, 402)
@@ -97,7 +97,7 @@ class TestInjectionAndAuth(ClientMixin, unittest.TestCase):
         host = self.auth_headers("usr_driver_harpreet")
         res = self.client.post("/api/routes/plan", headers=host, json={
             "destination": "<img src=x onerror=alert(localStorage.campusgo_token)>",
-            "departure_time": "now", "total_seats": 1, "price_per_seat": 50})
+            "departure_time": departure_in(), "total_seats": 1, "price_per_seat": 50})
         self.assertEqual(res.status_code, 400)
 
     def test_weak_secret_key_refused(self):
@@ -126,7 +126,7 @@ class TestInjectionAndAuth(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.post("/api/user/emergency-contacts", headers=headers,
                                           json={"name": "X", "phone": "<b>hi</b>"}).status_code, 400)
         codes = [self.client.post("/api/user/emergency-contacts", headers=headers,
-                                  json={"name": f"C{i}", "phone": "+919876543210"}).status_code for i in range(5)]
+                                  json={"name": f"C{i}", "phone": f"+91987654321{i}"}).status_code for i in range(5)]
         self.assertIn(400, codes)  # two seeded + three new hits the limit of five
 
     def test_admin_routes_hidden_without_key(self):

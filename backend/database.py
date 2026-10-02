@@ -43,6 +43,49 @@ def init_db():
     }
     if "password_hash" not in existing_user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
+    # Sign-up with a unique username and OTP-verified mobile number.
+    if "username" not in existing_user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if "phone_key" not in existing_user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN phone_key TEXT")
+    # Bumped on logout so every token issued earlier stops working.
+    if "token_version" not in existing_user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+    # Canonical phone (last 10 digits) and a username for accounts created before these columns existed.
+    seen_keys = set()
+    for row in cursor.execute("SELECT id, phone, lpu_id, username, phone_key FROM users ORDER BY created_at").fetchall():
+        key = row[4] or "".join(ch for ch in (row[1] or "") if ch.isdigit())[-10:]
+        # Two legacy accounts sharing a number would break the unique index and stop the app
+        # booting; the later one gets a placeholder key and must be sorted out by an admin.
+        if key in seen_keys:
+            key = f"dup_{row[0]}"
+        seen_keys.add(key)
+        uname = row[3]
+        if not uname:
+            base = "".join(ch for ch in (row[2] or "").lower() if ch.isalnum()) or "user"
+            uname, n = base, 1
+            while cursor.execute("SELECT 1 FROM users WHERE lower(username) = ?", (uname,)).fetchone():
+                n += 1
+                uname = f"{base}{n}"
+        cursor.execute("UPDATE users SET username = ?, phone_key = ? WHERE id = ?", (uname, key, row[0]))
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(lower(username))")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_key ON users(phone_key)")
+
+    # One-time passwords sent by SMS. Only a keyed hash of the code is stored.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS otp_challenges (
+        id TEXT PRIMARY KEY,
+        purpose TEXT NOT NULL CHECK(purpose IN ('signup', 'login')),
+        phone_key TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        consumed INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_challenges(phone_key, created_at);")
 
     # Vehicles table (for drivers)
     cursor.execute("""
@@ -65,7 +108,7 @@ def init_db():
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS wallets (
         user_id TEXT PRIMARY KEY,
-        balance REAL NOT NULL DEFAULT 100.0,
+        balance REAL NOT NULL DEFAULT 0.0,
         currency TEXT NOT NULL DEFAULT 'INR',
         updated_at REAL NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE

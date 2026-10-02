@@ -27,11 +27,12 @@ services:
       - key: PUBLIC_BASE_URL
         sync: false
       # Portfolio demo: creates the demo personas on an empty database.
-      # Set DEMO_PASSWORD in the dashboard so the README password doesn't work here.
+      # Demo personas sign in by SMS code like everyone else.
       - key: SEED_DEMO_DATA
         value: "1"
-      - key: DEMO_PASSWORD
-        sync: false
+      # "1" shows a fake moving vehicle driven from the UI. Leave "0": real trips use the driver's phone GPS.
+      - key: DEMO_SIMULATE_MOVEMENT
+        value: "0"
       # "1" lets reviewers top up with fake money. Leave "0" for anything real.
       - key: PAYMENTS_DEMO_MODE
         value: "0"

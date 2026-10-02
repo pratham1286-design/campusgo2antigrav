@@ -18,42 +18,193 @@
 <body>
   <div id="app-root" class="app-container">
 
-    <!-- ================= LOGIN SCREEN ================= -->
+    <!-- ================= WELCOME / SIGN UP / LOG IN ================= -->
     <div id="login-screen" class="login-screen">
-      <div class="login-card">
-        <div class="brand-section" style="justify-content:center; margin-bottom:18px;">
-          <div class="brand-logo">
-            <span class="logo-dot"></span>
-            <span class="brand-title">Campus<span class="brand-accent">Go</span></span>
+      <div class="auth-shell">
+
+        <div class="auth-brand">
+          <span class="logo-dot"></span>
+          <span class="brand-title">Campus<span class="brand-accent">Go</span></span>
+        </div>
+
+        <!-- Step: welcome -->
+        <section class="auth-panel" id="auth-welcome" data-panel="welcome">
+          <div class="auth-hero" aria-hidden="true">
+            <svg viewBox="0 0 360 250" xmlns="http://www.w3.org/2000/svg" class="hero-svg">
+              <!-- sky -->
+              <rect width="360" height="250" rx="26" fill="#FFF4EC"/>
+              <circle cx="292" cy="56" r="26" fill="#FFC56B"/>
+              <circle cx="292" cy="56" r="38" fill="#FFC56B" opacity=".25"/>
+              <g fill="#fff">
+                <ellipse cx="70" cy="48" rx="30" ry="11"/><ellipse cx="92" cy="40" rx="20" ry="10"/>
+                <ellipse cx="200" cy="30" rx="24" ry="9"/><ellipse cx="218" cy="24" rx="15" ry="8"/>
+              </g>
+              <!-- hills -->
+              <path d="M0 160 Q70 112 140 150 T290 140 T360 150 V250 H0Z" fill="#FFD9B0"/>
+              <path d="M0 180 Q90 140 180 172 T360 168 V250 H0Z" fill="#FFC894"/>
+              <!-- campus building with clock tower -->
+              <g>
+                <rect x="108" y="98" width="120" height="66" rx="4" fill="#fff" stroke="#111827" stroke-width="3"/>
+                <rect x="150" y="62" width="36" height="102" rx="3" fill="#fff" stroke="#111827" stroke-width="3"/>
+                <path d="M146 62 L168 38 L190 62Z" fill="#FF7C00" stroke="#111827" stroke-width="3" stroke-linejoin="round"/>
+                <circle cx="168" cy="82" r="10" fill="#FFF4EC" stroke="#111827" stroke-width="3"/>
+                <path d="M168 76v6l4 3" stroke="#111827" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+                <rect x="160" y="128" width="16" height="36" rx="8" fill="#FF7C00" stroke="#111827" stroke-width="3"/>
+                <g fill="#FFC56B" stroke="#111827" stroke-width="2.5">
+                  <rect x="118" y="112" width="18" height="18" rx="3"/><rect x="200" y="112" width="18" height="18" rx="3"/>
+                  <rect x="118" y="138" width="18" height="18" rx="3"/><rect x="200" y="138" width="18" height="18" rx="3"/>
+                </g>
+              </g>
+              <!-- trees -->
+              <g stroke="#111827" stroke-width="3" stroke-linejoin="round">
+                <rect x="36" y="144" width="7" height="26" fill="#B7791F"/>
+                <circle cx="40" cy="134" r="20" fill="#34D399"/>
+                <rect x="302" y="140" width="7" height="30" fill="#B7791F"/>
+                <circle cx="306" cy="128" r="22" fill="#34D399"/>
+              </g>
+              <!-- road -->
+              <rect x="0" y="186" width="360" height="64" fill="#374151"/>
+              <path d="M0 186 H360" stroke="#111827" stroke-width="3"/>
+              <path d="M12 220 H60 M96 220 H144 M180 220 H228 M264 220 H312" stroke="#FDE68A" stroke-width="4" stroke-linecap="round"/>
+
+              <!-- scooty + rider -->
+              <g class="hero-bob" stroke="#111827" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="56" cy="210" r="15" fill="#fff"/><circle cx="56" cy="210" r="5" fill="#111827"/>
+                <circle cx="124" cy="210" r="15" fill="#fff"/><circle cx="124" cy="210" r="5" fill="#111827"/>
+                <path d="M58 208 L72 184 H112 Q128 184 126 204 L124 208" fill="#FF7C00"/>
+                <path d="M104 184 L112 160 H126" fill="none"/>
+                <rect x="74" y="176" width="30" height="8" rx="4" fill="#111827"/>
+                <!-- rider -->
+                <circle cx="90" cy="134" r="11" fill="#FDBA74"/>
+                <path d="M78 130 Q90 112 102 130Z" fill="#111827"/>
+                <path d="M84 146 Q86 168 88 176 H104 L100 146Z" fill="#3B82F6"/>
+                <path d="M100 152 L118 160" fill="none" stroke="#FDBA74"/>
+              </g>
+
+              <!-- car with a waving passenger -->
+              <g class="hero-bob hero-bob-2" stroke="#111827" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M196 206 V192 Q196 184 206 182 L222 164 Q228 158 238 158 H272 Q282 158 288 166 L302 182 Q314 184 314 194 V206Z" fill="#FF7C00"/>
+                <path d="M226 168 H240 V182 H216Z M248 168 H272 L284 182 H248Z" fill="#E0F2FE"/>
+                <circle cx="230" cy="208" r="14" fill="#fff"/><circle cx="230" cy="208" r="5" fill="#111827"/>
+                <circle cx="284" cy="208" r="14" fill="#fff"/><circle cx="284" cy="208" r="5" fill="#111827"/>
+                <circle cx="259" cy="172" r="6" fill="#FDBA74" stroke-width="2.5"/>
+                <path d="M306 194 h6" stroke="#FDE68A"/>
+              </g>
+
+              <!-- map pin floating above -->
+              <g class="hero-pin" stroke="#111827" stroke-width="3" stroke-linejoin="round">
+                <path d="M262 52 c-14 0 -24 10 -24 23 c0 17 24 38 24 38 s24 -21 24 -38 c0 -13 -10 -23 -24 -23z" fill="#FF7C00"/>
+                <circle cx="262" cy="75" r="8" fill="#fff"/>
+              </g>
+            </svg>
           </div>
-        </div>
-        <p class="login-subtitle">Sign in with your LPU ID to continue</p>
 
-        <div class="input-group">
-          <label>LPU ID</label>
-          <input type="text" id="login-lpu-id-input" placeholder="e.g. 12204592" autocomplete="username">
-        </div>
-        <div class="input-group">
-          <label>Password</label>
-          <input type="password" id="login-password-input" placeholder="Password" autocomplete="current-password">
-        </div>
+          <h1 class="auth-title">Your campus ride,<br>one tap away</h1>
+          <p class="auth-lede">Bikes, scooties and cars for LPU students and teachers.</p>
 
-        <p id="login-error-text" class="login-error hidden"></p>
+          <div class="auth-actions">
+            <button type="button" class="btn-primary-cta" id="auth-go-login">Log In</button>
+            <button type="button" class="btn-outline-cta" id="auth-go-signup">Sign Up</button>
+          </div>
+        </section>
 
-        <button id="login-submit-btn" class="btn-primary-cta">Log In</button>
+        <!-- Step: sign up - name & username -->
+        <section class="auth-panel hidden" data-panel="signup-name">
+          <button type="button" class="auth-back" data-back="welcome" aria-label="Back">&larr; Back</button>
+          <div class="auth-steps"><span class="on"></span><span></span><span></span></div>
+          <h2 class="auth-heading">Create your account</h2>
+          <p class="auth-sub">Tell us your name and pick a username.</p>
 
-        <div class="login-demo-hint">
-          <strong>Reviewer / demo access:</strong> log in with any LPU ID below and password
-          <code>CampusGo@2026</code>
-          <ul>
-            <li>FAC-10822 &mdash; Dr. Raman Sharma (Teacher)</li>
-            <li>12204592 &mdash; Aarav Mehta (Student Rider)</li>
-            <li>12301982 &mdash; Kavya Patel (Low Balance)</li>
-            <li>12108843 &mdash; Simran Kaur (Driver)</li>
-            <li>12019934 &mdash; Vikram Singh (Driver)</li>
-            <li>11904421 &mdash; Harpreet Singh (Driver)</li>
-          </ul>
-        </div>
+          <div class="input-group">
+            <label for="signup-name-input">Full name</label>
+            <input type="text" id="signup-name-input" placeholder="e.g. Aarav Mehta" autocomplete="name" maxlength="60">
+          </div>
+
+          <div id="username-suggest-wrap" class="hidden">
+            <p class="auth-hint">Suggested usernames, free right now. Tap one:</p>
+            <div id="username-suggestions" class="chip-row"></div>
+          </div>
+
+          <div class="input-group">
+            <label for="signup-username-input">Username</label>
+            <input type="text" id="signup-username-input" placeholder="Choose a suggestion or type your own" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20">
+            <p id="username-status" class="field-status"></p>
+          </div>
+
+          <p class="login-error hidden" data-error="signup-name"></p>
+          <button type="button" class="btn-primary-cta" id="signup-name-next">Next</button>
+        </section>
+
+        <!-- Step: sign up - role, LPU ID & mobile -->
+        <section class="auth-panel hidden" data-panel="signup-details">
+          <button type="button" class="auth-back" data-back="signup-name" aria-label="Back">&larr; Back</button>
+          <div class="auth-steps"><span class="on"></span><span class="on"></span><span></span></div>
+          <h2 class="auth-heading">Verify it's you</h2>
+          <p class="auth-sub">We'll text a code to your mobile number.</p>
+
+          <div class="segmented" role="radiogroup" aria-label="I am a">
+            <button type="button" class="seg-btn active" data-usertype="student" role="radio" aria-checked="true">Student</button>
+            <button type="button" class="seg-btn" data-usertype="teacher" role="radio" aria-checked="false">Teacher</button>
+          </div>
+
+          <div class="input-group">
+            <label for="signup-lpu-input" id="signup-lpu-label">LPU ID</label>
+            <input type="text" id="signup-lpu-input" placeholder="e.g. 12204592" autocomplete="off" inputmode="numeric" maxlength="20">
+          </div>
+          <div class="input-group">
+            <label for="signup-phone-input">Mobile number</label>
+            <div class="phone-field"><span>+91</span>
+              <input type="tel" id="signup-phone-input" placeholder="10-digit number" autocomplete="tel-national" inputmode="numeric" maxlength="14">
+            </div>
+          </div>
+
+          <p class="login-error hidden" data-error="signup-details"></p>
+          <button type="button" class="btn-primary-cta" id="signup-send-otp">Send OTP</button>
+        </section>
+
+        <!-- Step: log in -->
+        <section class="auth-panel hidden" data-panel="login">
+          <button type="button" class="auth-back" data-back="welcome" aria-label="Back">&larr; Back</button>
+          <h2 class="auth-heading">Welcome back</h2>
+          <p class="auth-sub">Enter your LPU ID and the mobile number on your account.</p>
+
+          <div class="input-group">
+            <label for="login-lpu-input">LPU ID</label>
+            <input type="text" id="login-lpu-input" placeholder="e.g. 12204592 or FAC-10822" autocomplete="username" maxlength="20">
+          </div>
+          <div class="input-group">
+            <label for="login-phone-input">Mobile number</label>
+            <div class="phone-field"><span>+91</span>
+              <input type="tel" id="login-phone-input" placeholder="10-digit number" autocomplete="tel-national" inputmode="numeric" maxlength="14">
+            </div>
+          </div>
+
+          <p class="login-error hidden" data-error="login"></p>
+          <button type="button" class="btn-primary-cta" id="login-send-otp">Send OTP</button>
+          <p class="auth-switch">New to CampusGo? <button type="button" class="link-btn" id="login-to-signup">Sign up</button></p>
+        </section>
+
+        <!-- Step: enter the SMS code (shared by sign up and log in) -->
+        <section class="auth-panel hidden" data-panel="otp">
+          <button type="button" class="auth-back" id="otp-back" aria-label="Back">&larr; Back</button>
+          <h2 class="auth-heading">Enter the code</h2>
+          <p class="auth-sub">We sent a 6-digit code to <strong id="otp-phone-hint"></strong>.</p>
+
+          <div class="otp-boxes" id="otp-boxes">
+            <input type="text" inputmode="numeric" maxlength="1" autocomplete="one-time-code" aria-label="Digit 1">
+            <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 2">
+            <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 3">
+            <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 4">
+            <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 5">
+            <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 6">
+          </div>
+
+          <p id="otp-demo-note" class="demo-otp hidden"></p>
+          <p class="login-error hidden" data-error="otp"></p>
+          <button type="button" class="btn-primary-cta" id="otp-verify-btn">Verify &amp; Continue</button>
+          <p class="auth-switch"><span id="otp-resend-timer"></span> <button type="button" class="link-btn hidden" id="otp-resend-btn">Resend code</button></p>
+        </section>
+
       </div>
     </div>
 
@@ -835,7 +986,7 @@
           <div class="input-row">
             <div class="input-group">
               <label>Departure Time</label>
-              <input type="text" id="route-time-input" placeholder="e.g., 17:30 Today" value="17:30 Today">
+              <input type="datetime-local" id="route-time-input">
             </div>
             <div class="input-group">
               <label>Number of Seats Offered</label>

@@ -23,6 +23,7 @@ const AppState = {
   activeRide: null,
   activeCockpitRouteId: null,
   activeCockpitIsHost: false,
+  driverOnline: false,
   ratingRideId: null,
   ratingValue: 5,
   currentUpiRef: null,
@@ -32,7 +33,7 @@ const AppState = {
   driverMarkers: [],
   activeMarkers: {},
   activePolyline: null,
-  timers: { drivers: null, queue: null, qr: null }
+  timers: { drivers: null, queue: null, qr: null, gps: null }
 };
 
 // --- Small helpers ---
@@ -143,6 +144,7 @@ async function apiGet(url) {
 
 function showLoginScreen() {
   $('login-screen').classList.remove('hidden');
+  if (typeof resetAuthForms === 'function') resetAuthForms();
 }
 
 function hideLoginScreen() {
@@ -170,51 +172,6 @@ async function tryResumeSession() {
   }
 }
 
-async function handleLogin() {
-  const lpuId = $('login-lpu-id-input').value.trim();
-  const password = $('login-password-input').value;
-  const errorEl = $('login-error-text');
-  const btn = $('login-submit-btn');
-  errorEl.classList.add('hidden');
-
-  if (!lpuId || !password) {
-    errorEl.textContent = 'Enter your LPU ID and password.';
-    errorEl.classList.remove('hidden');
-    return;
-  }
-
-  btn.disabled = true;
-  btn.textContent = 'Signing In...';
-
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lpu_id: lpuId, password })
-    });
-    const data = await res.json();
-
-    if (!res.ok) {
-      errorEl.textContent = data.error || 'Login failed';
-      errorEl.classList.remove('hidden');
-      return;
-    }
-
-    AppState.authToken = data.token;
-    AppState.currentUser = data.user;
-    storeToken(data.token);
-    $('login-password-input').value = '';
-    await onLoginSuccess();
-  } catch (err) {
-    console.error('Login failed:', err);
-    errorEl.textContent = 'Could not reach the server. Please try again.';
-    errorEl.classList.remove('hidden');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Log In';
-  }
-}
-
 function clearTimers() {
   Object.keys(AppState.timers).forEach((key) => {
     clearInterval(AppState.timers[key]);
@@ -223,7 +180,17 @@ function clearTimers() {
   });
 }
 
+async function handleLogoutClick() {
+  try {
+    await apiPost('/api/auth/logout');
+  } catch (err) {
+    // Offline: still sign out locally.
+  }
+  handleLogout();
+}
+
 function handleLogout() {
+  AppState.driverOnline = false;
   clearTimers();
   AppState.authToken = null;
   AppState.currentUser = null;
@@ -243,7 +210,29 @@ async function onLoginSuccess() {
   refreshNearbyDrivers();
   clearInterval(AppState.timers.drivers);
   AppState.timers.drivers = setInterval(refreshNearbyDrivers, 30000);
+  clearInterval(AppState.timers.gps);
+  AppState.timers.gps = setInterval(reportDriverLocation, 15000);
   await checkActiveRide();
+}
+
+// --- Driver GPS ---
+// The server trusts only the position the driver's own phone reports: it decides who can be
+// matched, when a pickup starts, and whether a trip can be completed.
+function driverNeedsToReport() {
+  const ride = AppState.activeRide;
+  return AppState.driverOnline
+    || Boolean(ride && ride.is_rider === false)
+    || Boolean(AppState.activeCockpitRouteId && AppState.activeCockpitIsHost);
+}
+
+async function reportDriverLocation() {
+  if (!AppState.currentUser || !driverNeedsToReport()) return;
+  const pos = await getBrowserPosition(8000);
+  if (!pos) return;
+  const { ok, data } = await apiPost('/api/driver/location', pos);
+  if (ok && data.ride_status === 'in_progress' && AppState.activeRide && AppState.activeRide.status !== 'in_progress') {
+    checkActiveRide();
+  }
 }
 
 // Re-fetches the user's own record (wallet, role, vehicle) after changes.
@@ -264,12 +253,338 @@ function setWalletBalance(balance) {
   updateUserUI();
 }
 
-function initAuthHandlers() {
-  $('login-submit-btn').addEventListener('click', handleLogin);
-  $('login-password-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') handleLogin();
+// --- Welcome / sign up / log in (OTP) ---
+const AuthFlow = {
+  panel: 'welcome',
+  mode: 'login',          // 'login' | 'signup' - which flow the OTP step belongs to
+  userType: 'student',
+  challengeId: null,
+  username: '',
+  usernameOk: false,
+  suggestionTimer: null,
+  availabilityTimer: null,
+  resendTimer: null
+};
+
+function authShow(panel) {
+  AuthFlow.panel = panel;
+  document.querySelectorAll('#login-screen [data-panel]').forEach((el) => {
+    el.classList.toggle('hidden', el.dataset.panel !== panel);
   });
-  $('logout-btn').addEventListener('click', handleLogout);
+  authClearErrors();
+  const focusTarget = {
+    'signup-name': 'signup-name-input',
+    'signup-details': 'signup-lpu-input',
+    'login': 'login-lpu-input'
+  }[panel];
+  if (focusTarget) $(focusTarget).focus();
+  if (panel === 'otp') document.querySelector('#otp-boxes input').focus();
+}
+
+function authClearErrors() {
+  document.querySelectorAll('#login-screen [data-error]').forEach((el) => el.classList.add('hidden'));
+}
+
+function authError(key, message) {
+  const el = document.querySelector(`#login-screen [data-error="${key}"]`);
+  el.textContent = message;
+  el.classList.remove('hidden');
+}
+
+// Runs one async auth call with a disabled/busy button and a friendly network error.
+async function authRun(btn, busyText, errorKey, work) {
+  const idle = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = busyText;
+  try {
+    return await work();
+  } catch (err) {
+    console.error('Auth request failed:', err);
+    authError(errorKey, 'Could not reach the server. Please try again.');
+    return null;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = idle;
+  }
+}
+
+function cleanPhone(value) {
+  return value.replace(/[\s\-()]/g, '');
+}
+
+// --- Sign up: name + username ---
+function setUsernameStatus(text, kind) {
+  const el = $('username-status');
+  el.textContent = text;
+  el.className = `field-status${kind ? ' ' + kind : ''}`;
+}
+
+function markSelectedSuggestion() {
+  document.querySelectorAll('#username-suggestions .chip').forEach((chip) => {
+    chip.classList.toggle('selected', chip.dataset.username === $('signup-username-input').value.trim().toLowerCase());
+  });
+}
+
+async function loadUsernameSuggestions() {
+  const name = $('signup-name-input').value.trim();
+  const wrap = $('username-suggest-wrap');
+  if (name.length < 2) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  const { ok, data } = await apiPost('/api/auth/username-suggestions', { name });
+  if (!ok || !data.suggestions || !data.suggestions.length) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  const row = $('username-suggestions');
+  row.replaceChildren();
+  data.suggestions.forEach((username) => {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip';
+    chip.dataset.username = username;
+    chip.textContent = username;
+    chip.addEventListener('click', () => {
+      $('signup-username-input').value = username;
+      AuthFlow.usernameOk = true;
+      setUsernameStatus('Available', 'ok');
+      markSelectedSuggestion();
+    });
+    row.appendChild(chip);
+  });
+  wrap.classList.remove('hidden');
+  markSelectedSuggestion();
+}
+
+async function checkUsernameAvailable() {
+  const username = $('signup-username-input').value.trim().toLowerCase();
+  markSelectedSuggestion();
+  AuthFlow.usernameOk = false;
+  if (!username) {
+    setUsernameStatus('', '');
+    return;
+  }
+  const { ok, data } = await apiPost('/api/auth/username-available', { username });
+  if ($('signup-username-input').value.trim().toLowerCase() !== username) return; // stale reply
+  if (!ok) {
+    setUsernameStatus(data.error || 'Could not check this username', 'bad');
+    return;
+  }
+  AuthFlow.usernameOk = data.available;
+  setUsernameStatus(data.available ? 'Available' : data.reason, data.available ? 'ok' : 'bad');
+}
+
+async function signupNameNext() {
+  const name = $('signup-name-input').value.trim();
+  const username = $('signup-username-input').value.trim().toLowerCase();
+  if (!/^[A-Za-z][A-Za-z .'\-]{1,59}$/.test(name)) {
+    authError('signup-name', 'Enter your full name using letters only.');
+    return;
+  }
+  if (!username) {
+    authError('signup-name', 'Pick a username from the suggestions or type your own.');
+    return;
+  }
+  await checkUsernameAvailable();
+  if (!AuthFlow.usernameOk) {
+    authError('signup-name', $('username-status').textContent || 'That username is not available.');
+    return;
+  }
+  AuthFlow.username = username;
+  authShow('signup-details');
+}
+
+// --- OTP step ---
+function startResendCountdown(seconds) {
+  clearInterval(AuthFlow.resendTimer);
+  const label = $('otp-resend-timer');
+  const btn = $('otp-resend-btn');
+  let left = seconds;
+  btn.classList.add('hidden');
+  label.textContent = `Resend code in ${left}s`;
+  AuthFlow.resendTimer = setInterval(() => {
+    left -= 1;
+    if (left <= 0) {
+      clearInterval(AuthFlow.resendTimer);
+      label.textContent = '';
+      btn.classList.remove('hidden');
+    } else {
+      label.textContent = `Resend code in ${left}s`;
+    }
+  }, 1000);
+}
+
+function showOtpStep(reply) {
+  AuthFlow.challengeId = reply.challenge_id;
+  $('otp-phone-hint').textContent = reply.phone_hint;
+  document.querySelectorAll('#otp-boxes input').forEach((box) => { box.value = ''; });
+  const note = $('otp-demo-note');
+  if (reply.demo_otp) {
+    note.replaceChildren('Demo mode, no SMS sent. Your code is ');
+    const code = document.createElement('code');
+    code.textContent = reply.demo_otp;
+    note.appendChild(code);
+    note.classList.remove('hidden');
+  } else {
+    note.classList.add('hidden');
+  }
+  authShow('otp');
+  startResendCountdown(reply.resend_after || 30);
+}
+
+function readOtp() {
+  return Array.from(document.querySelectorAll('#otp-boxes input')).map((b) => b.value).join('');
+}
+
+function initOtpBoxes() {
+  const boxes = Array.from(document.querySelectorAll('#otp-boxes input'));
+  boxes.forEach((box, i) => {
+    box.addEventListener('input', () => {
+      box.value = box.value.replace(/\D/g, '').slice(-1);
+      if (box.value && i < boxes.length - 1) boxes[i + 1].focus();
+      if (readOtp().length === boxes.length) verifyOtp();
+    });
+    box.addEventListener('keydown', (e) => {
+      if (e.key === 'Backspace' && !box.value && i > 0) boxes[i - 1].focus();
+      if (e.key === 'Enter') verifyOtp();
+    });
+    box.addEventListener('paste', (e) => {
+      const digits = (e.clipboardData.getData('text') || '').replace(/\D/g, '').slice(0, boxes.length);
+      if (!digits) return;
+      e.preventDefault();
+      digits.split('').forEach((d, j) => { boxes[j].value = d; });
+      boxes[Math.min(digits.length, boxes.length - 1)].focus();
+      if (digits.length === boxes.length) verifyOtp();
+    });
+  });
+}
+
+async function requestOtp(btn, errorKey) {
+  const isSignup = AuthFlow.mode === 'signup';
+  const url = isSignup ? '/api/auth/signup/start' : '/api/auth/login/start';
+  const payload = isSignup
+    ? {
+        name: $('signup-name-input').value.trim(),
+        username: AuthFlow.username,
+        user_type: AuthFlow.userType,
+        lpu_id: $('signup-lpu-input').value.trim(),
+        phone: cleanPhone($('signup-phone-input').value)
+      }
+    : { lpu_id: $('login-lpu-input').value.trim(), phone: cleanPhone($('login-phone-input').value) };
+
+  if (!payload.lpu_id || !payload.phone) {
+    authError(errorKey, 'Enter your LPU ID and mobile number.');
+    return;
+  }
+  const result = await authRun(btn, 'Sending code...', errorKey, () => apiPost(url, payload));
+  if (!result) return;
+  if (!result.ok) {
+    authError(errorKey, result.data.error || 'Could not send the code.');
+    return;
+  }
+  showOtpStep(result.data);
+}
+
+async function verifyOtp() {
+  const btn = $('otp-verify-btn');
+  if (btn.disabled) return;
+  const code = readOtp();
+  if (code.length !== 6) {
+    authError('otp', 'Enter the 6-digit code.');
+    return;
+  }
+  const url = AuthFlow.mode === 'signup' ? '/api/auth/signup/verify' : '/api/auth/login/verify';
+  const result = await authRun(btn, 'Verifying...', 'otp', () => apiPost(url, { challenge_id: AuthFlow.challengeId, otp: code }));
+  if (!result) return;
+  if (!result.ok) {
+    authError('otp', result.data.error || 'Verification failed.');
+    if (['OTP_EXPIRED', 'OTP_LOCKED'].includes(result.data.code)) {
+      clearInterval(AuthFlow.resendTimer);
+      $('otp-resend-timer').textContent = '';
+      $('otp-resend-btn').classList.remove('hidden');
+    } else {
+      document.querySelectorAll('#otp-boxes input').forEach((box) => { box.value = ''; });
+      document.querySelector('#otp-boxes input').focus();
+    }
+    return;
+  }
+  clearInterval(AuthFlow.resendTimer);
+  AppState.authToken = result.data.token;
+  AppState.currentUser = result.data.user;
+  storeToken(result.data.token);
+  resetAuthForms();
+  await onLoginSuccess();
+}
+
+function resetAuthForms() {
+  document.querySelectorAll('#login-screen input').forEach((input) => { input.value = ''; });
+  AuthFlow.challengeId = null;
+  AuthFlow.username = '';
+  AuthFlow.usernameOk = false;
+  $('username-suggest-wrap').classList.add('hidden');
+  setUsernameStatus('', '');
+  setUserType('student');
+  authShow('welcome');
+}
+
+function setUserType(type) {
+  AuthFlow.userType = type;
+  document.querySelectorAll('#login-screen .seg-btn').forEach((btn) => {
+    const active = btn.dataset.usertype === type;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-checked', String(active));
+  });
+  $('signup-lpu-label').textContent = type === 'student' ? 'LPU ID (registration number)' : 'Faculty ID';
+  $('signup-lpu-input').placeholder = type === 'student' ? 'e.g. 12204592' : 'e.g. FAC-10822';
+  $('signup-lpu-input').inputMode = type === 'student' ? 'numeric' : 'text';
+}
+
+function initAuthHandlers() {
+  $('auth-go-login').addEventListener('click', () => { AuthFlow.mode = 'login'; authShow('login'); });
+  $('auth-go-signup').addEventListener('click', () => { AuthFlow.mode = 'signup'; authShow('signup-name'); });
+  $('login-to-signup').addEventListener('click', () => { AuthFlow.mode = 'signup'; authShow('signup-name'); });
+
+  document.querySelectorAll('#login-screen [data-back]').forEach((btn) => {
+    btn.addEventListener('click', () => authShow(btn.dataset.back));
+  });
+  $('otp-back').addEventListener('click', () => {
+    clearInterval(AuthFlow.resendTimer);
+    authShow(AuthFlow.mode === 'signup' ? 'signup-details' : 'login');
+  });
+
+  $('signup-name-input').addEventListener('input', () => {
+    clearTimeout(AuthFlow.suggestionTimer);
+    AuthFlow.suggestionTimer = setTimeout(loadUsernameSuggestions, 350);
+  });
+  $('signup-username-input').addEventListener('input', () => {
+    clearTimeout(AuthFlow.availabilityTimer);
+    AuthFlow.usernameOk = false;
+    setUsernameStatus('', '');
+    markSelectedSuggestion();
+    AuthFlow.availabilityTimer = setTimeout(checkUsernameAvailable, 400);
+  });
+  $('signup-name-next').addEventListener('click', signupNameNext);
+  $('signup-username-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') signupNameNext(); });
+
+  document.querySelectorAll('#login-screen .seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setUserType(btn.dataset.usertype));
+  });
+  $('signup-send-otp').addEventListener('click', () => requestOtp($('signup-send-otp'), 'signup-details'));
+  $('login-send-otp').addEventListener('click', () => requestOtp($('login-send-otp'), 'login'));
+  ['signup-phone-input', 'signup-lpu-input'].forEach((id) => {
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') requestOtp($('signup-send-otp'), 'signup-details'); });
+  });
+  ['login-lpu-input', 'login-phone-input'].forEach((id) => {
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') requestOtp($('login-send-otp'), 'login'); });
+  });
+
+  $('otp-verify-btn').addEventListener('click', verifyOtp);
+  $('otp-resend-btn').addEventListener('click', () => {
+    requestOtp($('otp-resend-btn'), 'otp');
+  });
+  initOtpBoxes();
+  $('logout-btn').addEventListener('click', handleLogoutClick);
 }
 
 window.initializeCustomLocationDropdowns = initializeCustomLocationDropdowns;
@@ -936,6 +1251,7 @@ function updateRideControls(status, isRider) {
   const completeBtn = $('complete-ride-btn');
   const cancellable = ['queued', 'matched', 'arriving'].includes(status);
   cancelBtn.classList.toggle('hidden', !cancellable);
+  $('sim-telemetry-btn').classList.toggle('hidden', !(AppState.config && AppState.config.demo_simulation) || isRider);
   cancelBtn.querySelector('span').textContent = isRider ? 'Cancel Ride (Refund)' : 'Release Ride';
   completeBtn.classList.remove('hidden');
   completeBtn.disabled = status !== 'in_progress';
@@ -991,7 +1307,7 @@ function clearActiveMap() {
   }
 }
 
-// --- Simulation step (scheduled cockpit OR on-demand ride) ---
+// --- Demo-only simulation step (server refuses it unless DEMO_SIMULATE_MOVEMENT=1) ---
 async function advanceTelemetryStep() {
   if (AppState.activeCockpitRouteId) {
     const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/telemetry-step`);
@@ -1115,20 +1431,20 @@ async function resolveSosLocation() {
   // 2. Without GPS: the driver's live position during a ride.
   const ride = AppState.activeRide;
   if (ride && ride.driver_live_lat && ride.status === 'in_progress') {
-    return { lat: ride.driver_live_lat, lng: ride.driver_live_lng, name: `En route from ${ride.pickup_name} (approx.)` };
+    return { lat: ride.driver_live_lat, lng: ride.driver_live_lng, name: `En route from ${ride.pickup_name}`, approximate: true };
   }
   if (ride) {
-    return { lat: ride.pickup_lat, lng: ride.pickup_lng, name: `${ride.pickup_name} (approx.)` };
+    return { lat: ride.pickup_lat, lng: ride.pickup_lng, name: ride.pickup_name, approximate: true };
   }
-  // 3. Last resort: the pickup selected on the booking form.
-  const p = AppState.landmarks[AppState.pickupKey] || { lat: LPU_COORDS[0], lng: LPU_COORDS[1], name: 'LPU Campus' };
-  return { lat: p.lat, lng: p.lng, name: `${p.name} (approx., GPS unavailable)` };
+  // 3. No fix and no ride: say so instead of guessing a place.
+  return { lat: null, lng: null, name: 'Location unavailable', approximate: true };
 }
 
 const DELIVERY_LABELS = {
   sent: '✓ Texted',
   failed: '✗ Sending failed',
   not_sent: 'Not texted',
+  rate_limited: 'Not texted (limit reached)',
   invalid_number: 'Invalid number'
 };
 
@@ -1142,6 +1458,7 @@ async function handleTriggerSOS() {
       ride_id: AppState.activeRide ? AppState.activeRide.id : null,
       lat: loc.lat,
       lng: loc.lng,
+      approximate: Boolean(loc.approximate),
       location_name: loc.name
     });
     if (!ok) {
@@ -1344,6 +1661,7 @@ async function loadDriverEarnings() {
     $('driver-total-earned').textContent = money(data.total_earnings);
     $('driver-total-trips').textContent = data.total_trips;
     $('driver-rating-val').textContent = data.avg_rating.toFixed(1);
+    AppState.driverOnline = data.is_online;
     $('driver-online-toggle').checked = data.is_online;
     $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
     $('driver-requests-section').classList.toggle('hidden', !data.has_vehicle);
@@ -1355,7 +1673,8 @@ async function loadDriverEarnings() {
 
 async function handleToggleOnline(event) {
   const wantOnline = event.target.checked;
-  const { ok, data } = await apiPost('/api/driver/toggle-online', { is_online: wantOnline });
+  const pos = wantOnline ? await getBrowserPosition() : null;
+  const { ok, data } = await apiPost('/api/driver/toggle-online', { is_online: wantOnline, ...(pos || {}) });
   if (!ok) {
     event.target.checked = !wantOnline;
     if (data.code === 'VEHICLE_REQUIRED') {
@@ -1365,7 +1684,11 @@ async function handleToggleOnline(event) {
     }
     return;
   }
+  AppState.driverOnline = data.is_online;
   $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
+  if (data.is_online && !pos) {
+    alert('Allow location access in your browser. Without your live position riders cannot be matched to you.');
+  }
   refreshNearbyDrivers();
   fetchFareQuotes();
 }
@@ -1479,7 +1802,7 @@ function routeCardHtml(r, pinned) {
     <div class="route-card-header">
       <div>
         <div class="route-dest-title">${esc(r.origin)} ➔ ${esc(r.destination)}</div>
-        <div style="font-size:0.75rem; color:var(--text-secondary);">Departure: <strong>${esc(r.departure_time)}</strong></div>
+        <div style="font-size:0.75rem; color:var(--text-secondary);">Departure: <strong>${esc(fmtDeparture(r.departure_time))}</strong></div>
         ${r.notes ? `<div style="font-size:0.7rem; color:var(--text-muted);">${esc(r.notes)}</div>` : ''}
       </div>
       <div class="route-price-tag">₹${Number(r.price_per_seat).toFixed(0)} <span style="font-size:0.6rem; color:var(--text-muted);">/seat</span></div>
@@ -1590,6 +1913,20 @@ async function joinCityLinkRoute(routeId, seats) {
     alert(`Confirmed! ${seats} seat(s) booked for ₹${money(data.fare_paid)}. ${data.remaining_seats} seat(s) remaining.`);
   }
   await loadCityLinkRoutes();
+}
+
+function toLocalInputValue(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function defaultDeparture() {
+  return toLocalInputValue(new Date(Date.now() + 2 * 3600 * 1000));
+}
+
+function fmtDeparture(value) {
+  const d = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value || '') ? new Date(value) : null;
+  return d ? d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : value;
 }
 
 async function postCityLinkRoute() {
@@ -1813,6 +2150,8 @@ function initEventHandlers() {
   $('cancel-queued-ride-btn').addEventListener('click', handleCancelRide);
   $('cancel-ride-btn').addEventListener('click', handleCancelRide);
   $('sim-telemetry-btn').addEventListener('click', advanceTelemetryStep);
+  if (!(AppState.config && AppState.config.demo_simulation)) $('sim-telemetry-btn').classList.add('hidden');
+  $('route-time-input').value = defaultDeparture();
   $('complete-ride-btn').addEventListener('click', handleCompleteRide);
 
   // Rating

@@ -84,12 +84,12 @@ python -m unittest test_campusgo test_enhancements test_security
 ```bash
 cd backend
 python seed_data.py          # wipes and loads demo data (use --if-empty to keep existing data)
-PAYMENTS_DEMO_MODE=1 python app.py
+PAYMENTS_DEMO_MODE=1 OTP_DEMO_MODE=1 python app.py
 ```
-Open [http://127.0.0.1:5000](http://127.0.0.1:5000). `PAYMENTS_DEMO_MODE=1` lets you try top-ups with fake money.
+Open [http://127.0.0.1:5000](http://127.0.0.1:5000). `PAYMENTS_DEMO_MODE=1` lets you try top-ups with fake money. `OTP_DEMO_MODE=1` shows the SMS code on screen instead of texting it (ignored once an SMS gateway is configured).
 
 ### 3. Demo personas
-Every seeded account uses the password in `DEMO_PASSWORD`, which defaults to **`CampusGo@2026`** for local use.
+Log in with the LPU ID and mobile number below, then enter the code shown on screen (`OTP_DEMO_MODE=1`). The numbers are the ones in `seed_data.py`: Dr. Raman `9876543210`, Aarav `9812345678`, Kavya `9823456789`, Simran `9834567890`, Vikram `9845678901`, Harpreet `9856789012`.
 
 - **Dr. Raman Sharma** (`FAC-10822`): Teacher rider, Faculty Priority badge ⭐, ₹350 balance.
 - **Aarav Mehta** (`12204592`): Student rider, B.Tech CSE, ₹150 balance.
@@ -102,9 +102,13 @@ Every seeded account uses the password in `DEMO_PASSWORD`, which defaults to **`
 
 ## 🔐 Security & Deployment Notes
 
-- **Login is real.** Every API call except login, landmarks, config and the public share link needs a signed `Authorization: Bearer <token>` header. The acting user always comes from the token, never from the request body.
+- **Sign up and log in use SMS one-time passwords.** Sign up collects name, a unique username (with suggestions), LPU ID and an OTP-verified mobile number; log in asks for LPU ID + mobile number + OTP. Codes are 6 digits, expire after 5 minutes, allow 5 tries, are stored only as a keyed hash, and can be resent every 30 seconds (5 texts per number per hour). Real delivery needs `FAST2SMS_API_KEY` or the Twilio settings; with neither, and no `OTP_DEMO_MODE`, the API answers 503 instead of issuing codes.
+- **Sessions are real.** Every API call except login, landmarks, config and the public share link needs a signed `Authorization: Bearer <token>` header. The acting user always comes from the token, never from the request body.
+- **Trips use real GPS.** Drivers' phones report their position (`/api/driver/location`). A ride starts when the driver is at the pickup, and the driver can complete it only once their phone shows them at the drop-off (the rider can always confirm arrival). Drivers who stop reporting for 2 minutes are not matched. `DEMO_SIMULATE_MOVEMENT=1` turns on a demo-only fake-movement button and skips these checks; keep it off in real use.
+- **Teacher priority needs approval.** Anyone can sign up as a teacher, but queue priority is granted only after an admin approves the account (`/api/admin/faculty/pending`, `/api/admin/faculty/<id>/approve`, same `X-Admin-Key` as payments). SOS alerts can be reviewed and resolved at `/api/admin/sos`.
+- **Stale requests are cleaned up.** Ride requests unmatched for 30 minutes and carpools 6 hours past departure are cancelled and refunded automatically. `POST /api/auth/logout` signs the user out everywhere.
 - **`SECRET_KEY` is required** in any deployment. The app refuses to start with a known placeholder or a key shorter than 32 characters. `render.yaml` generates one. For Docker, `docker compose up` fails until you set it.
-- **Demo data is opt-in.** `SEED_DEMO_DATA=1` creates the demo personas only when the database is empty. Set `DEMO_PASSWORD` on any public deployment so the README password doesn't work there.
+- **Demo data is opt-in.** `SEED_DEMO_DATA=1` creates the demo personas only when the database is empty. Demo personas sign in with an SMS code like everyone else (set `OTP_DEMO_MODE=1` locally to see the code in the reply).
 - **Payments.**
   - `PAYMENTS_DEMO_MODE=1` enables fake-money top-ups for demos. It is ignored whenever real Razorpay keys are configured.
   - With `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` set, card top-ups use Razorpay Checkout and are credited only after the HMAC signature is verified.

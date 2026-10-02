@@ -2,12 +2,7 @@ import os
 import sys
 import time
 import uuid
-from werkzeug.security import generate_password_hash
 from database import init_db, get_db_connection
-
-# Shared password for every seeded demo persona. Override with DEMO_PASSWORD so
-# a public deployment doesn't use the value printed in the README.
-DEMO_PASSWORD = os.environ.get("DEMO_PASSWORD") or "CampusGo@2026"
 
 def seed(if_empty=False):
     """Wipes all data and loads the demo personas. With if_empty=True it only
@@ -129,13 +124,12 @@ def seed(if_empty=False):
         }
     ]
 
-    demo_password_hash = generate_password_hash(DEMO_PASSWORD)
-
     for u in users:
         cur.execute("""
-        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified, is_teacher_priority, department, avatar_url, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (u["id"], u["lpu_id"], u["name"], u["email"], u["phone"], u["user_type"], u["role"], demo_password_hash, u["is_verified"], u["is_teacher_priority"], u["department"], u["avatar_url"], now))
+        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified, is_teacher_priority, department, avatar_url, created_at, username, phone_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (u["id"], u["lpu_id"], u["name"], u["email"], u["phone"], u["user_type"], u["role"], '', u["is_verified"], u["is_teacher_priority"], u["department"], u["avatar_url"], now,
+              u["name"].lower().replace("dr. ", "").replace(" ", "."), "".join(c for c in u["phone"] if c.isdigit())[-10:]))
 
         # Wallet
         cur.execute("""
@@ -272,7 +266,8 @@ def seed(if_empty=False):
     conn.commit()
     conn.close()
     print("Database seeded with realistic LPU community test data!")
-    print(f"Demo login password for every seeded persona: {DEMO_PASSWORD}")
+    print("Demo personas sign in with an SMS code: LPU ID + mobile number (see the README). "
+          "Without an SMS gateway, set OTP_DEMO_MODE=1 locally to see the code in the reply.")
 
 if __name__ == "__main__":
     seed(if_empty="--if-empty" in sys.argv)
