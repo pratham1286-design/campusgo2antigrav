@@ -7,7 +7,76 @@
  * Use textContent, or esc() for every value inside an HTML template string.
  */
 
-const DEFAULT_AVATAR = 'https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120';
+// --- Themed popups (replace native alert/confirm) ---
+function showDialog({ message, confirmText = 'OK', cancelText = null, danger = false }) {
+  return new Promise((resolve) => {
+    const host = document.querySelector('.app-container') || document.body;
+    const text = String(message ?? '');
+    const lower = text.toLowerCase();
+    const isError = /could not|failed|error|busy|allow location|copy failed/.test(lower);
+    const icon = cancelText ? '❓' : (isError ? '⚠️' : (/🎉|🏁|confirmed|added|scheduled|copied|cancelled/.test(lower) ? '✅' : 'ℹ️'));
+
+    const overlay = document.createElement('div');
+    overlay.className = 'app-modal app-dialog';
+    overlay.setAttribute('role', 'alertdialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const card = document.createElement('div');
+    card.className = 'dialog-card';
+    const iconEl = document.createElement('div');
+    iconEl.className = 'dialog-icon' + (danger || isError ? ' is-warn' : '');
+    iconEl.textContent = icon;
+    const msg = document.createElement('p');
+    msg.className = 'dialog-message';
+    msg.textContent = text;
+    const actions = document.createElement('div');
+    actions.className = 'dialog-actions';
+
+    const close = (result) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); close(false); }
+    };
+
+    if (cancelText) {
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'dialog-btn dialog-btn-secondary';
+      cancelBtn.textContent = cancelText;
+      cancelBtn.addEventListener('click', () => close(false));
+      actions.appendChild(cancelBtn);
+    }
+    const okBtn = document.createElement('button');
+    okBtn.className = 'dialog-btn dialog-btn-primary' + (danger ? ' is-danger' : '');
+    okBtn.textContent = confirmText;
+    okBtn.addEventListener('click', () => close(true));
+    actions.appendChild(okBtn);
+
+    backdrop.addEventListener('click', () => close(false));
+    card.append(iconEl, msg, actions);
+    overlay.append(backdrop, card);
+    host.appendChild(overlay);
+    document.addEventListener('keydown', onKey, true);
+    okBtn.focus();
+  });
+}
+
+function showAlert(message) {
+  return showDialog({ message });
+}
+
+function showConfirm(message) {
+  return showDialog({ message, confirmText: 'Yes', cancelText: 'No', danger: true });
+}
+
+const DEFAULT_AVATAR = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><rect width="120" height="120" fill="#FFE9D6"/>'
+  + '<circle cx="60" cy="46" r="22" fill="#FF7C00"/><path d="M16 120c4-28 22-42 44-42s40 14 44 42z" fill="#FF7C00"/></svg>'
+);
 const LPU_COORDS = [31.2536, 75.7037];
 
 const AppState = {
@@ -30,10 +99,21 @@ const AppState = {
   homeMap: null,
   activeMap: null,
   homeMarkers: {},
-  driverMarkers: [],
+  driverMarkers: {},
+  customDrop: null,        // a searched address chosen as the CityLink destination: {name, lat, lng}
+  routeLine: null,
+  routeKey: '',
+  routeSeq: 0,
+  placeSeq: 0,
+  trackRouteAt: 0,
+  tripRouteFor: '',
+  activeLeg: null,
+  activeFit: null,
+  roadMinutes: null,
+  trackBusy: false,
   activeMarkers: {},
   activePolyline: null,
-  timers: { drivers: null, queue: null, qr: null, gps: null }
+  timers: { drivers: null, queue: null, qr: null, gps: null, driverPoll: null, track: null }
 };
 
 // --- Small helpers ---
@@ -63,7 +143,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   initializeCustomLocationDropdowns();
   await loadConfig();
   await loadLandmarks();
+  detectUserLocation();
   initEventHandlers();
+  updateZoneBanner();
+  setInterval(updateZoneBanner, 60000);
+  $('location-gate-retry').addEventListener('click', detectUserLocation);
   initAuthHandlers();
   await tryResumeSession();
 });
@@ -206,13 +290,47 @@ async function onLoginSuccess() {
   updateUserUI();
   await loadEmergencyContacts();
   await loadDriverEarnings();
-  fetchFareQuotes();
+  if (AppState.userPosition) applyUserPosition((t) => { $('auto-detected-badge').textContent = t; });
+  else fetchFareQuotes();
   refreshNearbyDrivers();
   clearInterval(AppState.timers.drivers);
-  AppState.timers.drivers = setInterval(refreshNearbyDrivers, 30000);
+  AppState.timers.drivers = setInterval(refreshNearbyDrivers, 8000);
   clearInterval(AppState.timers.gps);
   AppState.timers.gps = setInterval(reportDriverLocation, 15000);
+  clearInterval(AppState.timers.driverPoll);
+  AppState.timers.driverPoll = setInterval(pollDriverWork, 10000);
   await checkActiveRide();
+}
+
+// --- Driver polling ---
+// An online driver is told about work without having to open the Profile tab: a ride the
+// server assigned automatically opens the live ride screen, and waiting requests light a dot.
+function isActiveDriver() {
+  const u = AppState.currentUser;
+  return Boolean(u && (u.role === 'driver' || u.role === 'both') && u.vehicle && AppState.driverOnline);
+}
+
+async function pollDriverWork() {
+  if (!isActiveDriver() || AppState.polling) return;
+  AppState.polling = true;
+  try {
+    if (!AppState.activeRide && !AppState.activeCockpitRouteId) {
+      await checkActiveRide();
+      if (AppState.activeRide && AppState.activeRide.is_rider === false) {
+        showAlert(`🚗 New ride assigned!
+Pick up at ${AppState.activeRide.pickup_name}.`);
+        return;
+      }
+      await loadDriverRequests();
+    }
+  } finally {
+    AppState.polling = false;
+  }
+}
+
+function setRequestsDot(count) {
+  const dot = $('nav-requests-dot');
+  if (dot) dot.classList.toggle('hidden', !count);
 }
 
 // --- Driver GPS ---
@@ -643,6 +761,183 @@ async function loadLandmarks() {
   }
 }
 
+const CURRENT_LOCATION_KEY = 'current_location';
+const NOT_IN_CAMPUS_KEY = 'not_in_campus';
+const CUSTOM_PLACE_KEY = 'custom_place';
+
+// Real GPS coordinates are sent only when the pickup is "My current location".
+function pickupCoords(key) {
+  if (key !== CURRENT_LOCATION_KEY || !AppState.userPosition) return {};
+  return { pickup_lat: AppState.userPosition.lat, pickup_lng: AppState.userPosition.lng };
+}
+
+// Mirrors the server: "My current location" is a campus pickup only near campus.
+function registerCurrentLocation() {
+  const pos = AppState.userPosition;
+  if (!pos) return;
+  let near = Infinity;
+  Object.entries(AppState.landmarks).forEach(([key, loc]) => {
+    if (key === CURRENT_LOCATION_KEY || loc.zone.startsWith('CityLink')) return;
+    near = Math.min(near, distanceKm(pos.lat, pos.lng, loc.lat, loc.lng));
+  });
+  if (near <= 2) {
+    delete AppState.landmarks[CURRENT_LOCATION_KEY];
+    return;
+  }
+  AppState.landmarks[CURRENT_LOCATION_KEY] = {
+    name: 'My current location',
+    lat: pos.lat,
+    lng: pos.lng,
+    zone: 'CityLink-Current',
+    custom: true
+  };
+}
+
+// --- Real location: asks the browser for the user's position ---
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const rad = (d) => (d * Math.PI) / 180;
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2
+    + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lng2 - lng1) / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.sqrt(a));
+}
+
+function requestPosition(highAccuracy, timeoutMs) {
+  return new Promise((resolve) => {
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ pos: { lat: pos.coords.latitude, lng: pos.coords.longitude } }),
+      (err) => resolve({ error: err }),
+      { enableHighAccuracy: highAccuracy, timeout: timeoutMs, maximumAge: 60000 }
+    );
+  });
+}
+
+function showLocationGate(title, message, showRetry = true) {
+  const gate = $('location-gate');
+  if (!gate) return;
+  $('location-gate-title').textContent = title;
+  $('location-gate-msg').textContent = message;
+  $('location-gate-retry').classList.toggle('hidden', !showRetry);
+  gate.classList.remove('hidden');
+}
+
+function hideLocationGate() {
+  const gate = $('location-gate');
+  if (gate) gate.classList.add('hidden');
+}
+
+// Location is compulsory: the app stays behind a gate until a real fix arrives.
+async function detectUserLocation() {
+  if (AppState.locating) return;
+  AppState.locating = true;
+  const badge = $('auto-detected-badge');
+  const setBadge = (text, off) => {
+    if (!badge) return;
+    badge.textContent = text;
+    badge.classList.toggle('off-campus', Boolean(off));
+    badge.classList.remove('hidden');
+  };
+
+  try {
+    if (!navigator.geolocation || window.isSecureContext === false) {
+      setBadge('Needs HTTPS', true);
+      showLocationGate('Secure connection needed',
+        'Your browser only shares location over HTTPS. Open CampusGo through its https:// address and allow location access.', false);
+      return;
+    }
+
+    setBadge('Locating…');
+    showLocationGate('Turn on location', 'CampusGo needs your live location to set your pickup and match nearby riders. Tap Allow when your browser asks.', false);
+
+    let result = await requestPosition(false, 15000);
+    if (!result.pos && result.error && result.error.code !== 1) {
+      result = await requestPosition(true, 20000);
+    }
+    if (!result.pos) {
+      setBadge('Location off', true);
+      const denied = result.error && result.error.code === 1;
+      showLocationGate(
+        denied ? 'Location is blocked' : 'Could not find you',
+        denied
+          ? 'Location access is blocked for this site. Click the lock icon in the address bar, set Location to Allow, then tap Try again.'
+          : 'We could not get your position. Check that GPS or Wi-Fi location is on, then tap Try again.'
+      );
+      return;
+    }
+
+    AppState.userPosition = result.pos;
+    hideLocationGate();
+    applyUserPosition(setBadge);
+    startLocationWatch();
+  } finally {
+    AppState.locating = false;
+  }
+}
+
+function applyUserPosition(setBadge) {
+  const pos = AppState.userPosition;
+  if (!pos) return;
+  let nearestKey = null;
+  let nearest = Infinity;
+  Object.entries(AppState.landmarks).forEach(([key, loc]) => {
+    if (loc.zone.startsWith('CityLink') || loc.custom) return;
+    const d = distanceKm(pos.lat, pos.lng, loc.lat, loc.lng);
+    if (d < nearest) { nearest = d; nearestKey = key; }
+  });
+
+  drawUserMarker();
+  registerCurrentLocation();
+  const onCampus = nearestKey !== null && nearest <= 2;
+  AppState.offCampus = !onCampus;
+  if (onCampus) {
+    // Inside the campus: the pickup is the nearest campus point.
+    AppState.pickupKey = nearestKey;
+  } else {
+    // Outside: Campus Hop keeps showing "Not in campus"; CityLink uses the real position.
+    AppState.pickupKey = AppState.selectedScope === 'campus_hop' ? NOT_IN_CAMPUS_KEY : CURRENT_LOCATION_KEY;
+  }
+  AppState.selectedScope = AppState.selectedScope || 'campus_hop';
+  if (AppState.homeMap) AppState.homeMap.setView([pos.lat, pos.lng], onCampus ? 16 : 13);
+  populateLocationDropdowns();
+  setBadge(onCampus ? 'Auto-detected' : 'Not in campus', !onCampus);
+}
+
+function drawUserMarker() {
+  const pos = AppState.userPosition;
+  if (!AppState.homeMap || !pos) return;
+  if (AppState.userMarker) AppState.homeMap.removeLayer(AppState.userMarker);
+  AppState.userMarker = L.marker([pos.lat, pos.lng], { icon: pinIcon('#2563EB', 'Me') })
+    .addTo(AppState.homeMap).bindPopup('You are here');
+}
+
+// Keeps the position fresh, and brings the gate back if access is revoked.
+function startLocationWatch() {
+  if (AppState.locationWatchId != null) return;
+  AppState.locationWatchId = navigator.geolocation.watchPosition(
+    (p) => {
+      AppState.userPosition = { lat: p.coords.latitude, lng: p.coords.longitude };
+      const wasOff = AppState.offCampus;
+      registerCurrentLocation();
+      drawUserMarker();
+      const nowOff = !AppState.landmarks[CURRENT_LOCATION_KEY] ? false : true;
+      if (wasOff !== undefined && wasOff !== nowOff) {
+        applyUserPosition((text, off) => {
+          const b = $('auto-detected-badge');
+          b.textContent = text;
+          b.classList.toggle('off-campus', Boolean(off));
+        });
+      }
+    },
+    (err) => {
+      if (err.code === 1) {
+        navigator.geolocation.clearWatch(AppState.locationWatchId);
+        AppState.locationWatchId = null;
+        detectUserLocation();
+      }
+    },
+    { enableHighAccuracy: false, maximumAge: 15000, timeout: 30000 }
+  );
+}
+
 // --- Populate Dropdowns based on Scope ---
 function syncCustomLocationDropdowns() {
   document.querySelectorAll('.location-dropdown').forEach((select) => {
@@ -708,10 +1003,15 @@ function initializeCustomLocationDropdowns() {
 
     const positionMenu = () => {
       const triggerRect = trigger.getBoundingClientRect();
-      const spaceBelow = window.innerHeight - triggerRect.bottom - 20;
-      const spaceAbove = triggerRect.top - 20;
+      const boundary = trigger.closest('.bottom-sheet, .modal-card, .app-view');
+      const limit = boundary ? boundary.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+      const navBar = document.querySelector('.bottom-nav-bar');
+      const floor = Math.min(limit.bottom, navBar ? navBar.getBoundingClientRect().top : window.innerHeight);
+      const spaceBelow = floor - triggerRect.bottom - 16;
+      const spaceAbove = triggerRect.top - Math.max(limit.top, 0) - 16;
+      const openUp = spaceBelow < 200 && spaceAbove > spaceBelow;
 
-      if (spaceBelow < 220 && spaceAbove > 220) {
+      if (openUp) {
         menu.style.top = 'auto';
         menu.style.bottom = 'calc(100% + 8px)';
       } else {
@@ -719,8 +1019,15 @@ function initializeCustomLocationDropdowns() {
         menu.style.bottom = 'auto';
       }
 
-      const maxMenuHeight = Math.min(280, Math.max(180, spaceBelow > 220 ? spaceBelow : spaceAbove));
-      menu.style.maxHeight = `${maxMenuHeight}px`;
+      const room = openUp ? spaceAbove : spaceBelow;
+      menu.style.maxHeight = `${Math.min(280, Math.max(140, room))}px`;
+      requestAnimationFrame(() => {
+        const r = menu.getBoundingClientRect();
+        if (!openUp && r.bottom > floor) {
+          const scroller = trigger.closest('.bottom-sheet, .modal-card, .app-view');
+          if (scroller) scroller.scrollTop += r.bottom - floor + 8;
+        }
+      });
     };
 
     trigger.addEventListener('click', (event) => {
@@ -772,29 +1079,64 @@ function populateLocationDropdowns() {
   dropSelect.innerHTML = '';
 
   const isHop = AppState.selectedScope === 'campus_hop';
+  const lockedOut = isHop && AppState.offCampus;
+  $('app-root').dataset.scope = AppState.selectedScope;
+  if (isHop) AppState.customDrop = null;
+
+  if (AppState.offCampus) {
+    // Away from campus: Campus Hop is locked to "Not in campus"; CityLink starts from the real position.
+    if (lockedOut) AppState.pickupKey = NOT_IN_CAMPUS_KEY;
+    else if (AppState.pickupKey === NOT_IN_CAMPUS_KEY) AppState.pickupKey = CURRENT_LOCATION_KEY;
+  } else if (AppState.pickupKey === NOT_IN_CAMPUS_KEY) {
+    AppState.pickupKey = 'uni_mall';
+  }
+
+  if (lockedOut) {
+    const optLocked = document.createElement('option');
+    optLocked.value = NOT_IN_CAMPUS_KEY;
+    optLocked.textContent = '📍 Not in campus';
+    pickupSelect.appendChild(optLocked);
+  }
 
   Object.entries(AppState.landmarks).forEach(([key, loc]) => {
     const isCity = loc.zone.startsWith('CityLink');
-    if ((isHop && !isCity) || (!isHop)) {
+    if (!lockedOut && ((isHop && !isCity) || (!isHop))) {
       const optP = document.createElement('option');
       optP.value = key;
-      optP.textContent = `${loc.name} (${loc.zone})`;
-      pickupSelect.appendChild(optP);
+      optP.textContent = loc.custom ? `📍 ${loc.name}` : `${loc.name} (${loc.zone})`;
+      if (loc.custom) pickupSelect.insertBefore(optP, pickupSelect.firstChild);
+      else pickupSelect.appendChild(optP);
 
-      const optD = document.createElement('option');
-      optD.value = key;
-      optD.textContent = `${loc.name} (${loc.zone})`;
-      dropSelect.appendChild(optD);
+      if (!loc.custom) {
+        const optD = document.createElement('option');
+        optD.value = key;
+        optD.textContent = `${loc.name} (${loc.zone})`;
+        dropSelect.appendChild(optD);
+      }
     }
   });
 
   pickupSelect.value = AppState.pickupKey || 'uni_mall';
-  if (isHop) {
-    dropSelect.value = AppState.dropKey || 'block_34';
-  } else {
-    dropSelect.value = 'jalandhar_bus_stand';
-    AppState.dropKey = 'jalandhar_bus_stand';
+  if (pickupSelect.value !== AppState.pickupKey && pickupSelect.options.length) {
+    pickupSelect.value = pickupSelect.options[pickupSelect.options.length > 1 && pickupSelect.options[0].value === CURRENT_LOCATION_KEY ? 1 : 0].value;
+    AppState.pickupKey = pickupSelect.value;
   }
+  const hasOption = (key) => Array.from(dropSelect.options).some((o) => o.value === key);
+  if (isHop) {
+    dropSelect.value = hasOption(AppState.dropKey) ? AppState.dropKey : 'block_34';
+  } else if (AppState.customDrop) {
+    dropSelect.value = '';
+  } else {
+    const isCityKey = (key) => hasOption(key) && Boolean(AppState.landmarks[key] && AppState.landmarks[key].zone.startsWith('CityLink'));
+    dropSelect.value = isCityKey(AppState.dropKey) ? AppState.dropKey : 'jalandhar_bus_stand';
+  }
+  if (isHop && dropSelect.value === pickupSelect.value) {
+    // Never default the destination to the pickup itself (e.g. when standing at Block 34).
+    const other = Array.from(dropSelect.options).find((o) => o.value !== pickupSelect.value);
+    if (other) dropSelect.value = other.value;
+  }
+  AppState.dropKey = AppState.customDrop && !isHop ? CUSTOM_PLACE_KEY : dropSelect.value;
+  syncDropSearchInput();
 
   setTimeout(() => {
     initializeCustomLocationDropdowns();
@@ -814,6 +1156,7 @@ function populatePlannedRouteDropdowns() {
   destinationSelect.innerHTML = '';
 
   Object.entries(AppState.landmarks).forEach(([key, location]) => {
+    if (location.custom) return;
     const option = document.createElement('option');
     option.value = location.name;
     option.textContent = `${location.name} (${location.zone})`;
@@ -871,16 +1214,17 @@ function renderMapLandmarks() {
   Object.values(AppState.homeMarkers).forEach((m) => AppState.homeMap.removeLayer(m));
   AppState.homeMarkers = {};
 
-  const p = AppState.landmarks[AppState.pickupKey];
+  const p = pickupPlace();
   if (p) {
     AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#10B981', 'P') })
       .addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${esc(p.name)}`);
   }
-  const d = AppState.landmarks[AppState.dropKey];
+  const d = dropPlace();
   if (d) {
     AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#FF7C00', 'D') })
       .addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${esc(d.name)}`);
   }
+  drawHomeRoute();
 }
 
 // Shows drivers who are actually online and free, as reported by the server.
@@ -889,13 +1233,279 @@ async function refreshNearbyDrivers() {
   try {
     const { ok, data } = await apiGet('/api/drivers/nearby');
     if (!ok) return;
-    AppState.driverMarkers.forEach((m) => AppState.homeMap.removeLayer(m));
-    AppState.driverMarkers = data.drivers.map((dr) => L.marker([dr.lat, dr.lng], { icon: vehicleIcon(dr.category) })
-      .addTo(AppState.homeMap)
-      .bindPopup(`<b>${esc(dr.first_name)}</b> (${esc(dr.category)})<br>Available`));
+    AppState.availableDrivers = data.drivers;
+    renderAvailableRiders();
+    // Markers are moved, not redrawn, so drivers glide across the map between updates.
+    const seen = new Set();
+    data.drivers.forEach((dr) => {
+      seen.add(dr.key);
+      const existing = AppState.driverMarkers[dr.key];
+      if (existing) {
+        existing.setLatLng([dr.lat, dr.lng]);
+      } else {
+        AppState.driverMarkers[dr.key] = L.marker([dr.lat, dr.lng], { icon: vehicleIcon(dr.category) })
+          .addTo(AppState.homeMap)
+          .bindPopup(`<b>${esc(dr.first_name)}</b> (${esc(dr.category)})<br>Available`);
+      }
+    });
+    Object.keys(AppState.driverMarkers).forEach((key) => {
+      if (!seen.has(key)) {
+        AppState.homeMap.removeLayer(AppState.driverMarkers[key]);
+        delete AppState.driverMarkers[key];
+      }
+    });
   } catch (err) {
     console.error('Failed to load nearby drivers:', err);
   }
+}
+
+// --- Destination (CityLink: any place, or a popular one) and route drawing ---
+function pickupPlace() {
+  if (AppState.pickupKey === NOT_IN_CAMPUS_KEY) return null;
+  return AppState.landmarks[AppState.pickupKey] || null;
+}
+
+function dropPlace() {
+  if (AppState.selectedScope === 'citylink' && AppState.customDrop) return AppState.customDrop;
+  return AppState.landmarks[AppState.dropKey] || null;
+}
+
+function dropPayload() {
+  if (AppState.selectedScope === 'citylink' && AppState.customDrop) {
+    const d = AppState.customDrop;
+    return { drop_key: CUSTOM_PLACE_KEY, drop_lat: d.lat, drop_lng: d.lng, drop_name: d.name };
+  }
+  return { drop_key: $('drop-select').value };
+}
+
+function syncDropSearchInput() {
+  const input = $('drop-search-input');
+  if (!input || document.activeElement === input) return;
+  const d = dropPlace();
+  input.value = d ? d.name : '';
+}
+
+function popularDestinations() {
+  return Object.entries(AppState.landmarks)
+    .filter(([, loc]) => loc.zone.startsWith('CityLink') && !loc.custom)
+    .map(([key, loc]) => ({ key, name: loc.name, detail: loc.zone.replace('CityLink-', '') }));
+}
+
+// Typed words are matched against the popular destinations first (whole words, then word starts).
+function matchPopular(query) {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return popularDestinations();
+  return popularDestinations()
+    .map((p) => {
+      const hay = `${p.name} ${p.detail}`.toLowerCase();
+      const tokens = hay.split(/[^a-z0-9]+/);
+      let score = 0;
+      words.forEach((w) => {
+        if (tokens.includes(w)) score += 2;
+        else if (tokens.some((t) => t.startsWith(w))) score += 1.5;
+        else if (hay.includes(w)) score += 1;
+        else score -= 10;
+      });
+      if (hay.startsWith(words[0])) score += 1;
+      return { ...p, score };
+    })
+    .filter((p) => p.score > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+function suggestionButton(name, detail, onPick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'drop-suggestion';
+  b.setAttribute('role', 'option');
+  const n = document.createElement('span');
+  n.className = 'drop-suggestion-name';
+  n.textContent = name;
+  b.appendChild(n);
+  if (detail) {
+    const d = document.createElement('span');
+    d.className = 'drop-suggestion-detail';
+    d.textContent = detail;
+    b.appendChild(d);
+  }
+  b.addEventListener('click', onPick);
+  return b;
+}
+
+function renderDropSuggestions(query, places, status) {
+  const box = $('drop-suggestions');
+  box.replaceChildren();
+  const addHeading = (text) => {
+    const h = document.createElement('div');
+    h.className = 'drop-suggestions-heading';
+    h.textContent = text;
+    box.appendChild(h);
+  };
+  const popular = matchPopular(query);
+  if (popular.length) {
+    addHeading('POPULAR DESTINATIONS');
+    popular.slice(0, query ? 4 : 30).forEach((p) => {
+      box.appendChild(suggestionButton(p.name, p.detail, () => chooseDrop({ key: p.key })));
+    });
+  }
+  if (places && places.length) {
+    addHeading('PLACES');
+    places.forEach((p) => {
+      box.appendChild(suggestionButton(p.name, p.detail, () => chooseDrop({ custom: { name: p.label || p.name, lat: p.lat, lng: p.lng } })));
+    });
+  }
+  if (status) {
+    const st = document.createElement('div');
+    st.className = 'drop-suggestions-status';
+    st.textContent = status;
+    box.appendChild(st);
+  }
+  box.classList.toggle('hidden', !box.children.length);
+}
+
+function chooseDrop(choice) {
+  if (choice.custom) {
+    AppState.customDrop = choice.custom;
+    AppState.dropKey = CUSTOM_PLACE_KEY;
+    $('drop-select').value = '';
+  } else {
+    AppState.customDrop = null;
+    AppState.dropKey = choice.key;
+    $('drop-select').value = choice.key;
+    syncCustomLocationDropdowns();
+  }
+  $('drop-suggestions').classList.add('hidden');
+  $('drop-search-input').blur();
+  syncDropSearchInput();
+  fetchFareQuotes();
+}
+
+let dropSearchTimer = null;
+async function searchDropPlaces(query) {
+  const seq = ++AppState.placeSeq;
+  renderDropSuggestions(query, [], query.length >= 3 ? 'Searching…' : '');
+  if (query.length < 3) return;
+  const pos = AppState.userPosition;
+  const near = pos ? `&lat=${pos.lat}&lng=${pos.lng}` : '';
+  const { ok, data } = await apiGet(`/api/places/search?q=${encodeURIComponent(query)}${near}`);
+  if (seq !== AppState.placeSeq) return;  // a newer search replaced this one
+  if (!ok) {
+    renderDropSuggestions(query, [], 'Place search is unavailable right now. Pick a popular destination.');
+    return;
+  }
+  renderDropSuggestions(query, data.places, data.places.length ? '' : 'No other places found. Try a different spelling.');
+}
+
+function initDropSearch() {
+  const input = $('drop-search-input');
+  input.addEventListener('focus', () => {
+    input.select();
+    // On small phones the suggestions open below the fold, so bring the box to the top of the panel.
+    setTimeout(() => input.scrollIntoView({ block: 'start', behavior: 'smooth' }), 150);
+    const current = dropPlace();
+    searchDropPlaces(current && input.value === current.name ? '' : input.value.trim());
+  });
+  input.addEventListener('input', () => {
+    clearTimeout(dropSearchTimer);
+    const q = input.value.trim();
+    if (q.length < 3) { searchDropPlaces(q); return; }
+    renderDropSuggestions(q, [], 'Searching…');
+    dropSearchTimer = setTimeout(() => searchDropPlaces(q), 650);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const first = $('drop-suggestions').querySelector('.drop-suggestion');
+      if (first) first.click();
+    } else if (event.key === 'Escape') {
+      $('drop-suggestions').classList.add('hidden');
+      input.blur();
+    }
+  });
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('#drop-search-box')) {
+      $('drop-suggestions').classList.add('hidden');
+      syncDropSearchInput();
+    }
+  });
+}
+
+// Road route for the selected trip, drawn on the home map with its distance and time.
+const roadRouteCache = {};
+async function fetchRoadRoute(a, b) {
+  const key = [a.lat, a.lng, b.lat, b.lng].map((v) => Number(v).toFixed(3)).join(',');
+  if (roadRouteCache[key]) return roadRouteCache[key];
+  const q = `a_lat=${a.lat}&a_lng=${a.lng}&b_lat=${b.lat}&b_lng=${b.lng}`;
+  const { ok, data } = await apiGet(`/api/route?${q}`);
+  if (!ok) return null;
+  roadRouteCache[key] = data;
+  return data;
+}
+
+async function drawHomeRoute() {
+  const map = AppState.homeMap;
+  if (!map || !AppState.currentUser) return;
+  const p = pickupPlace();
+  const d = dropPlace();
+  const chip = $('route-info-chip');
+  const key = p && d ? [p.lat, p.lng, d.lat, d.lng].join(',') : '';
+  if (key === AppState.routeKey) return;
+  AppState.routeKey = key;
+  AppState.roadMinutes = null;
+  if (AppState.routeLine) { map.removeLayer(AppState.routeLine); AppState.routeLine = null; }
+  chip.classList.add('hidden');
+  if (!key) return;
+
+  const seq = ++AppState.routeSeq;
+  const straight = [[p.lat, p.lng], [d.lat, d.lng]];
+  AppState.routeLine = L.polyline(straight, { color: '#FF7C00', weight: 4, opacity: 0.7, dashArray: '6, 8' }).addTo(map);
+  map.fitBounds(straight, { padding: [40, 40] });
+
+  const route = await fetchRoadRoute(p, d);
+  if (!route || seq !== AppState.routeSeq) return;
+  if (AppState.routeLine) map.removeLayer(AppState.routeLine);
+  AppState.routeLine = L.polyline(route.points, { color: '#FF7C00', weight: 5, opacity: 0.9 }).addTo(map);
+  map.fitBounds(AppState.routeLine.getBounds(), { padding: [40, 40] });
+  chip.textContent = `${route.km} km • ${route.minutes} min by road`;
+  chip.classList.remove('hidden');
+  AppState.roadMinutes = route.minutes;
+  if (AppState.quotes) updateServicesDisplay({ quotes: AppState.quotes });
+}
+
+// Zone badge and class-change rush banner reflect the real pickup zone and the real clock.
+function isRushHour(now = new Date()) {
+  const m = now.getHours() * 60 + now.getMinutes();
+  return (m >= 510 && m <= 555) || (m >= 765 && m <= 810) || (m >= 1005 && m <= 1065);
+}
+
+function updateZoneBanner() {
+  const zoneText = $('current-zone-text');
+  const rush = $('rush-indicator');
+  if (!zoneText || !rush) return;
+  const pickup = AppState.landmarks[AppState.pickupKey];
+  if (AppState.pickupKey === NOT_IN_CAMPUS_KEY || (pickup && pickup.custom)) {
+    zoneText.textContent = 'Outside campus';
+  } else {
+    zoneText.textContent = pickup ? pickup.zone.replace(/^Zone-/, '') + ' Zone' : 'Select pickup';
+  }
+  rush.classList.toggle('hidden', !isRushHour());
+}
+
+// Live availability of riders (drivers) for the selected vehicle on the home booking panel.
+function renderAvailableRiders() {
+  const note = $('available-riders-note');
+  if (!note) return;
+  const drivers = AppState.availableDrivers;
+  if (!drivers) { note.classList.add('hidden'); return; }
+  const count = drivers.filter((d) => d.category === AppState.selectedService).length;
+  const pickup = pickupPlace();
+  const drop = dropPlace();
+  const path = pickup && drop ? `${pickup.name} → ${drop.name}` : 'your route';
+  note.classList.remove('hidden');
+  note.classList.toggle('none', count === 0);
+  note.textContent = count
+    ? `${count} ${AppState.selectedService} rider${count > 1 ? 's' : ''} available now for ${path}`
+    : `No ${AppState.selectedService} riders online right now. You'll be queued for ${path}.`;
 }
 
 // --- Server-side fare quotes ---
@@ -903,16 +1513,26 @@ async function fetchFareQuotes() {
   if (!AppState.currentUser) return;
 
   const pickupKey = $('pickup-select').value;
-  const dropKey = $('drop-select').value;
+  const extra = dropPayload();
   AppState.pickupKey = pickupKey;
-  AppState.dropKey = dropKey;
+  AppState.dropKey = extra.drop_key;
   renderMapLandmarks();
+  renderAvailableRiders();
+  updateZoneBanner();
+
+  if (pickupKey === NOT_IN_CAMPUS_KEY) {
+    AppState.quotes = null;
+    $('selected-service-summary').textContent = 'You are not in campus. Switch to CityLink to ride from here.';
+    $('wallet-warning-banner').classList.add('hidden');
+    return;
+  }
 
   try {
     const { ok, data } = await apiPost('/api/rides/quote', {
       pickup_key: pickupKey,
-      drop_key: dropKey,
-      scope: AppState.selectedScope
+      ...extra,
+      scope: AppState.selectedScope,
+      ...pickupCoords(pickupKey)
     });
     if (!ok) {
       AppState.quotes = null;
@@ -942,7 +1562,7 @@ function updateServicesDisplay(data) {
     const q = quotes[srv];
     if (!q) return;
     $(`fare-${srv}`).textContent = q.total_fare.toFixed(0);
-    $(`eta-${srv}`).textContent = `~${q.estimated_minutes} min`;
+    $(`eta-${srv}`).textContent = `~${AppState.roadMinutes || q.estimated_minutes} min`;
     $(`avail-${srv}`).textContent = `${q.available_drivers} driver${q.available_drivers === 1 ? '' : 's'} online`;
   });
 
@@ -1058,10 +1678,10 @@ async function handleAddContact() {
 }
 
 async function handleRemoveContact(contactId) {
-  if (!confirm('Remove this emergency contact?')) return;
+  if (!(await showConfirm('Remove this emergency contact?'))) return;
   const res = await apiFetch(`/api/user/emergency-contacts/${encodeURIComponent(contactId)}`, { method: 'DELETE' });
   if (!res.ok) {
-    alert('Could not remove contact');
+    showAlert('Could not remove contact');
     return;
   }
   await loadEmergencyContacts();
@@ -1104,7 +1724,7 @@ async function handleBookRide() {
   if (!AppState.currentUser) return;
   const quote = AppState.quotes ? AppState.quotes[AppState.selectedService] : null;
   if (!quote) {
-    alert($('selected-service-summary').textContent || 'Choose a valid pickup and drop first.');
+    showAlert($('selected-service-summary').textContent || 'Choose a valid pickup and drop first.');
     return;
   }
   if (!quote.has_sufficient_balance) {
@@ -1115,14 +1735,15 @@ async function handleBookRide() {
 
   const btn = $('find-ride-btn');
   btn.disabled = true;
-  $('find-ride-text').textContent = 'Matching...';
+  $('find-ride-text').textContent = 'Sending request...';
 
   try {
     const { ok, status, data } = await apiPost('/api/rides/book', {
       pickup_key: AppState.pickupKey,
-      drop_key: AppState.dropKey,
+      ...dropPayload(),
       service_type: AppState.selectedService,
-      scope: AppState.selectedScope
+      scope: AppState.selectedScope,
+      ...pickupCoords(AppState.pickupKey)
     });
 
     if (!ok) {
@@ -1130,27 +1751,27 @@ async function handleBookRide() {
         $('topup-custom-input').value = Math.ceil((data.deficit || 0) + 20);
         openModal('modal-topup');
       } else if (data.code === 'CONCURRENT_RIDE_EXISTS') {
-        alert('You already have a ride in progress. Check the Activity tab to view or cancel it.');
+        showAlert('You already have a ride in progress. Check the Activity tab to view or cancel it.');
         await checkActiveRide();
         switchView('view-activity');
       } else {
-        alert(data.error || 'Failed to book ride');
+        showAlert(data.error || 'Failed to book ride');
       }
       return;
     }
 
     setWalletBalance(data.wallet_balance);
-    if (data.status === 'queued') {
-      alert(`All nearby drivers are busy. You are #${data.queue_position} in the queue.${data.is_priority ? ' (Teacher Priority Applied ⭐)' : ''}\nYour fare is held and fully refunded if you cancel.`);
-      await checkActiveRide();
-      switchView('view-activity');
-    } else {
-      await checkActiveRide();
-      switchView('view-active-ride');
-    }
+    const n = Number(data.drivers_notified || 0);
+    showAlert(n > 0
+      ? `Request sent to ${n} nearby driver${n > 1 ? 's' : ''}. You'll be matched as soon as one accepts.${data.is_priority ? ' (Teacher Priority Applied ⭐)' : ''}
+Your fare is held and fully refunded if you cancel.`
+      : `No drivers are online right now, but your request is open and the first driver to accept gets it.${data.is_priority ? ' (Teacher Priority Applied ⭐)' : ''}
+Your fare is held and fully refunded if you cancel.`);
+    await checkActiveRide();
+    switchView('view-activity');
   } catch (err) {
     console.error('Book ride failed:', err);
-    alert('Could not reach the server. Please try again.');
+    showAlert('Could not reach the server. Please try again.');
   } finally {
     btn.disabled = false;
     $('find-ride-text').textContent = 'Find Ride';
@@ -1184,11 +1805,11 @@ async function handleCancelRide() {
   const question = isRider
     ? 'Cancel this ride? Your held fare will be refunded in full.'
     : 'Release this ride? It will go back to the queue for another driver.';
-  if (!confirm(question)) return;
+  if (!(await showConfirm(question))) return;
 
   const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(ride.id)}/cancel`);
   if (!ok) {
-    alert(data.error || 'Could not cancel the ride');
+    showAlert(data.error || 'Could not cancel the ride');
     return;
   }
   AppState.activeRide = null;
@@ -1224,7 +1845,7 @@ async function loadActivityHistory() {
           <span class="tx-desc"></span>
           <span class="tx-date">${esc(date)}</span>
         </div>
-        <strong class="tx-amount ${amount < 0 ? 'negative' : ''}">${amount < 0 ? '-' : '+'}₹${Math.abs(amount).toFixed(2)}</strong>
+        <strong class="tx-amount ${amount < 0 ? 'negative' : 'positive'}">${amount < 0 ? '-' : '+'}₹${Math.abs(amount).toFixed(2)}</strong>
       `;
       item.querySelector('.tx-desc').textContent = transaction.description || transaction.type;
       container.appendChild(item);
@@ -1294,8 +1915,23 @@ function renderActiveRide(ride) {
     AppState.activeMarkers.driver = L.marker(drCoords, { icon: vehicleIcon(ride.service_type, 32) }).addTo(AppState.activeMap);
     AppState.activePolyline = L.polyline([pCoords, dCoords], { color: '#FF7C00', weight: 5, opacity: 0.8, dashArray: '8, 8' })
       .addTo(AppState.activeMap);
-    AppState.activeMap.fitBounds([pCoords, dCoords], { padding: [40, 40] });
+    fitActiveMap(ride);
   }
+  AppState.trackRouteAt = 0;
+  AppState.tripRouteFor = '';
+  updateLiveTracking(ride);
+  startRideTracking();
+}
+
+// While the driver is coming, frame driver + pickup; once the trip starts, driver + destination.
+function fitActiveMap(ride) {
+  if (!AppState.activeMap) return;
+  const target = rideTarget(ride);
+  const points = [[target.lat, target.lng]];
+  if (ride.driver_live_lat != null) points.push([ride.driver_live_lat, ride.driver_live_lng]);
+  else points.push([ride.pickup_lat, ride.pickup_lng], [ride.drop_lat, ride.drop_lng]);
+  AppState.activeFit = points;
+  AppState.activeMap.fitBounds(points, { padding: [50, 50], maxZoom: 16 });
 }
 
 function clearActiveMap() {
@@ -1305,6 +1941,103 @@ function clearActiveMap() {
     AppState.activeMap.removeLayer(AppState.activePolyline);
     AppState.activePolyline = null;
   }
+  if (AppState.activeLeg) {
+    AppState.activeMap.removeLayer(AppState.activeLeg);
+    AppState.activeLeg = null;
+  }
+}
+
+// --- Live trip tracking (driver position, road route and ETA, refreshed every few seconds) ---
+function startRideTracking() {
+  if (AppState.timers.track) return;
+  AppState.timers.track = setInterval(trackActiveRide, 5000);
+}
+
+function stopRideTracking() {
+  clearInterval(AppState.timers.track);
+  AppState.timers.track = null;
+}
+
+function rideTarget(ride) {
+  const arriving = ride.status === 'matched' || ride.status === 'arriving';
+  return arriving
+    ? { lat: ride.pickup_lat, lng: ride.pickup_lng, arriving }
+    : { lat: ride.drop_lat, lng: ride.drop_lng, arriving };
+}
+
+async function updateLiveTracking(ride) {
+  if (!AppState.activeMap) return;
+  const hasDriver = ride.driver_live_lat != null && ride.driver_live_lng != null;
+  const driverAt = hasDriver ? [ride.driver_live_lat, ride.driver_live_lng] : null;
+  if (driverAt && AppState.activeMarkers.driver) AppState.activeMarkers.driver.setLatLng(driverAt);
+
+  const target = rideTarget(ride);
+  if (!driverAt) return;
+  const km = distanceKm(driverAt[0], driverAt[1], target.lat, target.lng);
+  const sub = $('cockpit-telemetry-sub');
+  const baseText = target.arriving ? 'Driver is' : 'Destination is';
+  sub.textContent = `${baseText} ${km.toFixed(1)} km away`;
+
+  // The road route and ETA come from the server; asked at most every 15 seconds.
+  const now = Date.now();
+  if (now - AppState.trackRouteAt < 15000) return;
+  AppState.trackRouteAt = now;
+  const route = await fetchRoadRoute({ lat: driverAt[0], lng: driverAt[1] }, target);
+  if (!route || !AppState.activeRide || AppState.activeRide.id !== ride.id) return;
+  if (AppState.activeLeg) AppState.activeMap.removeLayer(AppState.activeLeg);
+  AppState.activeLeg = L.polyline(route.points, { color: '#2563EB', weight: 5, opacity: 0.85 }).addTo(AppState.activeMap);
+  sub.textContent = `${baseText} ${route.km} km away • about ${route.minutes} min`;
+
+  // Once per ride, the whole trip (pickup to destination) replaces the straight dashed line.
+  if (AppState.tripRouteFor !== ride.id) {
+    AppState.tripRouteFor = ride.id;
+    const trip = await fetchRoadRoute({ lat: ride.pickup_lat, lng: ride.pickup_lng }, { lat: ride.drop_lat, lng: ride.drop_lng });
+    if (trip && AppState.activeRide && AppState.activeRide.id === ride.id) {
+      if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
+      AppState.activePolyline = L.polyline(trip.points, { color: '#FF7C00', weight: 4, opacity: 0.6, dashArray: '2, 8' }).addTo(AppState.activeMap);
+    }
+  }
+}
+
+async function trackActiveRide() {
+  if (!AppState.activeRide || !AppState.currentUser || AppState.activeCockpitRouteId) {
+    stopRideTracking();
+    return;
+  }
+  if (AppState.trackBusy) return;
+  AppState.trackBusy = true;
+  try {
+    const { ok, data } = await apiGet('/api/rides/active');
+    if (!ok) return;
+    const ride = data.active_ride;
+    if (!AppState.activeRide) return;
+
+    if (!ride || ride.id !== AppState.activeRide.id) {
+      // The ride finished or was cancelled from the other side.
+      AppState.activeRide = null;
+      stopRideTracking();
+      clearActiveMap();
+      showAlert('This ride has ended. You can see it in your Activity tab.');
+      switchView('view-ride');
+      await refreshCurrentUser();
+      await loadDriverEarnings();
+      fetchFareQuotes();
+      return;
+    }
+    if (ride.status === 'queued') {
+      // The driver released the ride: it is waiting for another driver again.
+      stopRideTracking();
+      await checkActiveRide();
+      switchView('view-activity');
+      return;
+    }
+    const changed = ride.status !== AppState.activeRide.status;
+    AppState.activeRide = ride;
+    if (changed) renderActiveRide(ride);
+    else updateLiveTracking(ride);
+  } finally {
+    AppState.trackBusy = false;
+  }
 }
 
 // --- Demo-only simulation step (server refuses it unless DEMO_SIMULATE_MOVEMENT=1) ---
@@ -1312,7 +2045,7 @@ async function advanceTelemetryStep() {
   if (AppState.activeCockpitRouteId) {
     const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/telemetry-step`);
     if (!ok) {
-      alert(data.error || 'Could not update the trip');
+      showAlert(data.error || 'Could not update the trip');
       return;
     }
     if (AppState.activeMarkers.car) AppState.activeMarkers.car.setLatLng([data.current_lat, data.current_lng]);
@@ -1323,7 +2056,7 @@ async function advanceTelemetryStep() {
   if (!AppState.activeRide) return;
   const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(AppState.activeRide.id)}/telemetry-step`);
   if (!ok) {
-    alert(data.error || 'Could not update the ride');
+    showAlert(data.error || 'Could not update the ride');
     return;
   }
   AppState.activeRide.status = data.status;
@@ -1343,10 +2076,10 @@ async function handleCompleteRide() {
   if (AppState.activeCockpitRouteId) {
     const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/complete`);
     if (!ok) {
-      alert(data.error || 'Could not complete the trip');
+      showAlert(data.error || 'Could not complete the trip');
       return;
     }
-    alert(`🏁 Carpool trip completed! Host payout of ₹${money(data.driver_payout)} added to your wallet.`);
+    showAlert(`🏁 Carpool trip completed! Host payout of ₹${money(data.driver_payout)} added to your wallet.`);
     AppState.activeCockpitRouteId = null;
     switchView('view-citylink');
     await refreshCurrentUser();
@@ -1358,7 +2091,7 @@ async function handleCompleteRide() {
   const rideId = AppState.activeRide.id;
   const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(rideId)}/complete`);
   if (!ok) {
-    alert(data.error || 'Could not complete the ride');
+    showAlert(data.error || 'Could not complete the ride');
     return;
   }
   AppState.activeRide = null;
@@ -1396,7 +2129,7 @@ async function submitRating() {
     tags: tags.join(', ')
   });
   if (!ok && data.code !== 'ALREADY_RATED') {
-    alert(data.error || 'Could not save your rating');
+    showAlert(data.error || 'Could not save your rating');
     return;
   }
   AppState.ratingRideId = null;
@@ -1462,7 +2195,7 @@ async function handleTriggerSOS() {
       location_name: loc.name
     });
     if (!ok) {
-      alert(`${data.error || 'Could not record the SOS.'}\nCall campus security now: ${AppState.config.security_hotline}`);
+      showAlert(`${data.error || 'Could not record the SOS.'}\nCall campus security now: ${AppState.config.security_hotline}`);
       return;
     }
 
@@ -1498,7 +2231,7 @@ async function handleTriggerSOS() {
     openModal('modal-sos');
   } catch (err) {
     console.error('Failed to trigger SOS:', err);
-    alert(`Could not reach the server. Call campus security now: ${AppState.config.security_hotline}`);
+    showAlert(`Could not reach the server. Call campus security now: ${AppState.config.security_hotline}`);
   } finally {
     sosBtn.disabled = false;
   }
@@ -1508,7 +2241,7 @@ async function handleTriggerSOS() {
 function handleShareTrip() {
   const ride = AppState.activeRide;
   if (!ride || !ride.share_token) {
-    alert('Live sharing is available for on-demand rides.');
+    showAlert('Live sharing is available for on-demand rides.');
     return;
   }
   $('share-link-input').value = `${window.location.origin}/track/${encodeURIComponent(ride.share_token)}`;
@@ -1577,7 +2310,7 @@ async function handleConfirmUpiPayment() {
   setWalletBalance(data.new_balance);
   closeModal('modal-topup');
   fetchFareQuotes();
-  alert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
+  showAlert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
 }
 
 function loadRazorpayScript() {
@@ -1604,7 +2337,7 @@ async function verifyRazorpayPayment(orderId, paymentId, signature) {
   setWalletBalance(data.new_balance);
   closeModal('modal-topup');
   fetchFareQuotes();
-  alert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
+  showAlert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
 }
 
 async function handleRazorpayCheckout() {
@@ -1680,26 +2413,34 @@ async function handleToggleOnline(event) {
     if (data.code === 'VEHICLE_REQUIRED') {
       openVehicleModal();
     } else {
-      alert(data.error || 'Could not change your status');
+      showAlert(data.error || 'Could not change your status');
     }
     return;
   }
   AppState.driverOnline = data.is_online;
   $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
   if (data.is_online && !pos) {
-    alert('Allow location access in your browser. Without your live position riders cannot be matched to you.');
+    showAlert('Allow location access in your browser. Without your live position riders cannot be matched to you.');
   }
   refreshNearbyDrivers();
   fetchFareQuotes();
+  if (data.is_online) loadDriverRequests(); else setRequestsDot(0);
 }
 
 async function loadDriverRequests() {
   const list = $('driver-requests-list');
   const { ok, data } = await apiGet('/api/driver/requests');
   if (!ok) {
+    setRequestsDot(0);
     list.innerHTML = `<p class="empty-state">${esc(data.error || 'Requests unavailable')}</p>`;
     return;
   }
+  if (data.offline) {
+    setRequestsDot(0);
+    list.innerHTML = '<p class="empty-state">Go online to see ride requests.</p>';
+    return;
+  }
+  setRequestsDot(data.requests.length);
   if (!data.requests.length) {
     list.innerHTML = '<p class="empty-state">No waiting requests.</p>';
     return;
@@ -1712,6 +2453,7 @@ async function loadDriverRequests() {
       <div>
         <div class="veh-title">${esc(r.pickup_name)} ➔ ${esc(r.drop_name)}</div>
         <div class="veh-sub">${esc(r.rider_name)}${r.is_priority ? ' ⭐ Faculty' : ''} • You earn ₹${money(r.driver_payout)}</div>
+        <div class="veh-sub">${r.distance_to_pickup_km == null ? 'Distance unknown' : `${Number(r.distance_to_pickup_km)} km to pickup`} • ${Number(r.trip_km)} km trip</div>
       </div>
       <button class="btn-sm-primary" data-action="accept-ride" data-id="${esc(r.id)}">Accept</button>
     `;
@@ -1722,7 +2464,7 @@ async function loadDriverRequests() {
 async function handleAcceptRide(rideId) {
   const { ok, data } = await apiPost('/api/driver/accept', { ride_id: rideId });
   if (!ok) {
-    alert(data.error || 'Could not accept this ride');
+    showAlert(data.error || 'Could not accept this ride');
     loadDriverRequests();
     return;
   }
@@ -1875,10 +2617,10 @@ async function handleRouteAction(event) {
     const sel = document.querySelector(`[data-seat-for="${CSS.escape(routeId)}"]`);
     await joinCityLinkRoute(routeId, sel ? parseInt(sel.value, 10) : 1);
   } else if (action === 'leave') {
-    if (!confirm('Leave this trip? Your seat fare will be refunded.')) return;
+    if (!(await showConfirm('Leave this trip? Your seat fare will be refunded.'))) return;
     await routeSimpleAction(routeId, 'leave', (d) => `Booking cancelled. ₹${money(d.refunded)} refunded.`);
   } else if (action === 'cancel-route') {
-    if (!confirm('Cancel this trip? Every passenger will be refunded.')) return;
+    if (!(await showConfirm('Cancel this trip? Every passenger will be refunded.'))) return;
     await routeSimpleAction(routeId, 'cancel', (d) => `Trip cancelled. ${d.refunded_bookings} booking(s) refunded.`);
   }
 }
@@ -1886,10 +2628,10 @@ async function handleRouteAction(event) {
 async function routeSimpleAction(routeId, verb, successMessage) {
   const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/${verb}`);
   if (!ok) {
-    alert(data.error || 'Something went wrong');
+    showAlert(data.error || 'Something went wrong');
     return;
   }
-  alert(successMessage(data));
+  showAlert(successMessage(data));
   await refreshCurrentUser();
   await loadCityLinkRoutes();
 }
@@ -1902,15 +2644,15 @@ async function joinCityLinkRoute(routeId, seats) {
       $('topup-custom-input').value = Math.ceil((data.deficit || 0) + 10);
       openModal('modal-topup');
     } else {
-      alert(data.error || 'Could not join route');
+      showAlert(data.error || 'Could not join route');
     }
     return;
   }
   setWalletBalance(data.wallet_balance);
   if (data.is_pinned) {
-    alert('🎉 ALL SEATS ARE NOW FULL!\n\nThis scheduled ride has been automatically PINNED and is confirmed for departure.');
+    showAlert('🎉 ALL SEATS ARE NOW FULL!\n\nThis scheduled ride has been automatically PINNED and is confirmed for departure.');
   } else {
-    alert(`Confirmed! ${seats} seat(s) booked for ₹${money(data.fare_paid)}. ${data.remaining_seats} seat(s) remaining.`);
+    showAlert(`Confirmed! ${seats} seat(s) booked for ₹${money(data.fare_paid)}. ${data.remaining_seats} seat(s) remaining.`);
   }
   await loadCityLinkRoutes();
 }
@@ -1945,20 +2687,20 @@ async function postCityLinkRoute() {
       closeModal('modal-post-route');
       openVehicleModal();
     } else {
-      alert(data.error || 'Could not publish the route');
+      showAlert(data.error || 'Could not publish the route');
     }
     return;
   }
   closeModal('modal-post-route');
   await loadCityLinkRoutes();
-  alert(`Route scheduled! Offering ${data.total_seats} seat(s) from ${payload.origin} to ${payload.destination}.`);
+  showAlert(`Route scheduled! Offering ${data.total_seats} seat(s) from ${payload.origin} to ${payload.destination}.`);
 }
 
 // --- During-ride cockpit for carpools ---
 async function startConfirmedRoute(routeId) {
   const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/start`);
   if (!ok) {
-    alert(data.error || 'Could not start the trip');
+    showAlert(data.error || 'Could not start the trip');
     return;
   }
   await openDuringRideCockpit(routeId);
@@ -1968,7 +2710,7 @@ async function openDuringRideCockpit(routeId) {
   try {
     const { ok, data } = await apiGet(`/api/routes/${encodeURIComponent(routeId)}/live`);
     if (!ok || !data.cockpit) {
-      alert(data.error || 'Could not open the trip');
+      showAlert(data.error || 'Could not open the trip');
       return;
     }
     const cockpit = data.cockpit;
@@ -2008,7 +2750,8 @@ async function openDuringRideCockpit(routeId) {
       AppState.activeMarkers.car = L.marker(vCoords, { icon: vehicleIcon(cockpit.vehicle_category || 'car', 34, '#F59E0B') }).addTo(AppState.activeMap);
       AppState.activePolyline = L.polyline([oCoords, dCoords], { color: '#F59E0B', weight: 5, opacity: 0.85, dashArray: '8, 8' })
         .addTo(AppState.activeMap);
-      AppState.activeMap.fitBounds([oCoords, dCoords], { padding: [50, 50] });
+      AppState.activeFit = [oCoords, dCoords];
+      AppState.activeMap.fitBounds(AppState.activeFit, { padding: [50, 50] });
     }
 
     switchView('view-active-ride');
@@ -2042,7 +2785,11 @@ function switchView(viewId) {
   } else if (viewId === 'view-ride' && AppState.homeMap) {
     setTimeout(() => AppState.homeMap.invalidateSize(), 150);
   } else if (viewId === 'view-active-ride' && AppState.activeMap) {
-    setTimeout(() => AppState.activeMap.invalidateSize(), 150);
+    // The map was sized while hidden: fix its size, then frame the trip again.
+    setTimeout(() => {
+      AppState.activeMap.invalidateSize();
+      if (AppState.activeFit) AppState.activeMap.fitBounds(AppState.activeFit, { padding: [50, 50], maxZoom: 16 });
+    }, 150);
   }
 }
 
@@ -2120,17 +2867,21 @@ function initEventHandlers() {
       document.querySelectorAll('.service-card').forEach((c) => c.classList.remove('active'));
       card.classList.add('active');
       AppState.selectedService = card.dataset.service;
+      renderAvailableRiders();
       if (AppState.quotes && AppState.currentUser) {
         updateServicesDisplay({ quotes: AppState.quotes });
       }
     });
   });
 
+  initDropSearch();
   $('pickup-select').addEventListener('change', fetchFareQuotes);
   $('drop-select').addEventListener('change', fetchFareQuotes);
   $('swap-locations-btn').addEventListener('click', () => {
     const p = $('pickup-select');
     const d = $('drop-select');
+    if (p.value === CURRENT_LOCATION_KEY || AppState.customDrop) return;
+    if (!Array.from(p.options).some((o) => o.value === d.value) || !Array.from(d.options).some((o) => o.value === p.value)) return;
     const temp = p.value;
     p.value = d.value;
     d.value = temp;
@@ -2142,7 +2893,10 @@ function initEventHandlers() {
   $('header-wallet-btn').addEventListener('click', () => openModal('modal-topup'));
   $('persona-switch-btn').addEventListener('click', () => switchView('view-profile'));
   $('recenter-map-btn').addEventListener('click', () => {
-    if (AppState.homeMap) AppState.homeMap.setView(LPU_COORDS, 16);
+    if (AppState.homeMap) {
+      const c = AppState.userPosition ? [AppState.userPosition.lat, AppState.userPosition.lng] : LPU_COORDS;
+      AppState.homeMap.setView(c, 16);
+    }
   });
 
   // Booking and live ride
@@ -2172,9 +2926,9 @@ function initEventHandlers() {
     input.select();
     try {
       await navigator.clipboard.writeText(input.value);
-      alert('Live tracking link copied to clipboard!');
+      showAlert('Live tracking link copied to clipboard!');
     } catch (err) {
-      alert('Copy failed - select the link and copy it manually.');
+      showAlert('Copy failed - select the link and copy it manually.');
     }
   });
 
@@ -2211,10 +2965,11 @@ function initEventHandlers() {
       const newRole = btn.dataset.role;
       const { ok, data } = await apiPost('/api/user/role', { role: newRole });
       if (!ok) {
-        alert(data.error || 'Could not change role');
+        showAlert(data.error || 'Could not change role');
         return;
       }
       AppState.currentUser.role = newRole;
+      if (newRole === 'rider') setRequestsDot(0);
       updateUserUI();
       if (newRole !== 'rider' && !AppState.currentUser.vehicle) {
         openVehicleModal();

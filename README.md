@@ -28,7 +28,7 @@
 
 ### 3. Peak-Time Zone Queuing
 - Campus partitioned into 4 zones: `Zone-North` (Academic Blocks 30-38), `Zone-South` (Boys Hostels BH1-BH8), `Zone-Central` (Uni-Mall, Uni-Hospital), and `Zone-East` (Girls Hostels GH1-GH6, Law Gate, Main Gate).
-- When no driver is free the ride is queued. Riders can cancel from the Activity tab; drivers see matching requests in their Profile tab and accept them.
+- Every booking goes to a waiting list that online drivers with the right vehicle can see (faculty first, then oldest). Each driver chooses which request to accept, so nothing is assigned automatically. Riders can cancel from the Activity tab for a full refund until a driver accepts.
 - Priority queue evaluation: `(is_teacher_priority DESC, created_at ASC)`.
 
 ### 4. Safety Infrastructure
@@ -104,7 +104,7 @@ Log in with the LPU ID and mobile number below, then enter the code shown on scr
 
 - **Sign up and log in use SMS one-time passwords.** Sign up collects name, a unique username (with suggestions), LPU ID and an OTP-verified mobile number; log in asks for LPU ID + mobile number + OTP. Codes are 6 digits, expire after 5 minutes, allow 5 tries, are stored only as a keyed hash, and can be resent every 30 seconds (5 texts per number per hour). Real delivery needs `FAST2SMS_API_KEY` or the Twilio settings; with neither, and no `OTP_DEMO_MODE`, the API answers 503 instead of issuing codes.
 - **Sessions are real.** Every API call except login, landmarks, config and the public share link needs a signed `Authorization: Bearer <token>` header. The acting user always comes from the token, never from the request body.
-- **Trips use real GPS.** Drivers' phones report their position (`/api/driver/location`). A ride starts when the driver is at the pickup, and the driver can complete it only once their phone shows them at the drop-off (the rider can always confirm arrival). Drivers who stop reporting for 2 minutes are not matched. `DEMO_SIMULATE_MOVEMENT=1` turns on a demo-only fake-movement button and skips these checks; keep it off in real use.
+- **Trips use real GPS.** Drivers' phones report their position (`/api/driver/location`). A ride starts when the driver is at the pickup, and the driver can complete it only once their phone shows them at the drop-off (the rider can always confirm arrival). Drivers who stop reporting for 2 minutes drop out of the available list and stop seeing requests. `DEMO_SIMULATE_MOVEMENT=1` turns on a demo-only fake-movement button and skips these checks; keep it off in real use.
 - **Teacher priority needs approval.** Anyone can sign up as a teacher, but queue priority is granted only after an admin approves the account (`/api/admin/faculty/pending`, `/api/admin/faculty/<id>/approve`, same `X-Admin-Key` as payments). SOS alerts can be reviewed and resolved at `/api/admin/sos`.
 - **Stale requests are cleaned up.** Ride requests unmatched for 30 minutes and carpools 6 hours past departure are cancelled and refunded automatically. `POST /api/auth/logout` signs the user out everywhere.
 - **`SECRET_KEY` is required** in any deployment. The app refuses to start with a known placeholder or a key shorter than 32 characters. `render.yaml` generates one. For Docker, `docker compose up` fails until you set it.
@@ -117,6 +117,9 @@ Log in with the LPU ID and mobile number below, then enter the code shown on scr
     curl -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/pending
     curl -X POST -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/<id>/approve
     ```
+- **Maps.** The home map draws the road route (distance and time) and moves nearby drivers as they drive. On CityLink the destination box searches any place or address inside the 200 km service area (as far as Chandigarh), ranking suggestions by how well they match what was typed, how well known the place is, and how close it is to the rider; the popular destinations are always listed and matched first. While a ride is active, the ride screen shows the driver's live position, the road to the pickup or drop and an ETA, refreshed every 5 seconds. The browser never calls the map services: the server does (`backend/geo.py`), so searches stay private and the service area is enforced server-side. The defaults are the free public OpenStreetMap servers (about one search per second); set `NOMINATIM_URL`, `OSRM_URL` and `GEOCODER_CONTACT` to use your own or a paid provider.
+- **Single worker.** Rate-limit counters live in memory, so run one gunicorn worker (as the Procfile and Dockerfile do); they reset on restart.
+- **Local HTTPS for phone GPS.** Browsers only share location on `https://` or `localhost`. `pip install -r requirements-dev.txt`, then `HTTPS_DEV=1 HOST=0.0.0.0 python app.py`.
 - **SMS.** Without `FAST2SMS_API_KEY` or Twilio credentials, SOS alerts are recorded but no one is texted, and the app tells the user so.
 - **Reverse proxies.** Set `TRUST_PROXY_HOPS` to the number of proxies in front of the app (1 on Render) so rate limits use the real client IP. Set `PUBLIC_BASE_URL` so SOS tracking links use your public domain.
 - **SQLite persistence.** On Render's free plan the database is lost on every deploy or restart. For real persistence use a paid plan with a disk and set `DATABASE_PATH` (see `render.yaml`). Docker Compose persists only the `/app/data` directory, so rebuilt images always run the new code.

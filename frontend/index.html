@@ -13,6 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
   
   <!-- App Styles -->
+  <link rel="icon" type="image/svg+xml" href="avatar-default.svg">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -240,7 +241,7 @@
 
         <!-- Persona Switcher Menu -->
         <button id="persona-switch-btn" class="persona-avatar-btn" title="Profile">
-          <img id="header-avatar" src="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120" alt="Avatar">
+          <img id="header-avatar" src="avatar-default.svg" alt="Avatar">
         </button>
       </div>
     </header>
@@ -253,6 +254,7 @@
         <!-- Live Half-Screen Campus Map -->
         <div class="map-wrapper">
           <div id="campus-map" class="map-canvas"></div>
+          <div id="route-info-chip" class="route-info-chip hidden"></div>
           
           <!-- Map Overlay Controls -->
           <div class="map-overlay-controls">
@@ -261,7 +263,7 @@
                 <polygon points="3 11 22 2 13 21 11 13 3 11"/>
               </svg>
             </button>
-            <div class="zone-badge" id="current-zone-badge">
+            <div class="zone-badge">
               <span class="live-pulse"></span>
               <span id="current-zone-text">Central Zone</span>
             </div>
@@ -277,7 +279,7 @@
         </div>
 
         <!-- Bottom Sheet Booking Container -->
-        <div class="bottom-sheet" id="booking-sheet">
+        <div class="bottom-sheet">
           <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
 
           <!-- Scope Switcher: Campus Hop vs CityLink -->
@@ -321,9 +323,17 @@
               <div class="field-content">
                 <span class="field-label">DESTINATION</span>
                 <select id="drop-select" class="location-dropdown"></select>
+                <!-- CityLink: search any place or address, or tap a popular destination -->
+                <div id="drop-search-box" class="drop-search-box">
+                  <input id="drop-search-input" type="text" class="drop-search-input" placeholder="Search a place or address"
+                         autocomplete="off" maxlength="80" aria-label="Destination">
+                  <div id="drop-suggestions" class="drop-suggestions hidden" role="listbox"></div>
+                </div>
               </div>
             </div>
           </div>
+
+          <div id="available-riders-note" class="available-riders-note hidden"></div>
 
           <!-- Service Selection: EXACTLY 3 Services (Bike, Scooty, Car) -->
           <div class="services-container">
@@ -487,7 +497,7 @@
 
             <!-- Host / Driver Profile Card -->
             <div class="driver-profile-card">
-              <img id="active-driver-avatar" class="driver-avatar" src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=120" alt="Host">
+              <img id="active-driver-avatar" class="driver-avatar" src="avatar-default.svg" alt="Host">
               <div class="driver-info">
                 <div class="driver-name-row">
                   <span id="active-driver-name" class="driver-name">Harpreet Singh (Host)</span>
@@ -495,7 +505,7 @@
                     <svg viewBox="0 0 24 24" fill="currentColor">
                       <path d="M12 2l2.4 2.8 3.7-.4 1.3 3.4 3.4 1.3-.4 3.7 2.8 2.4-2.8 2.4.4 3.7-3.4 1.3-1.3 3.4-3.7-.4L12 22l-2.4-2.8-3.7.4-1.3-3.4-3.4-1.3.4-3.7L1 12l2.8-2.4-.4-3.7 3.4-1.3 1.3-3.4 3.7.4L12 2z"/>
                     </svg>
-                    Verified LPU
+                    Verified driver
                   </span>
                 </div>
                 <div class="vehicle-details">
@@ -602,10 +612,10 @@
             <div class="queue-spinner-ring"></div>
             <div class="queue-details">
               <div class="queue-title-row">
-                <span class="queue-title">Matching with Nearest Driver</span>
+                <span class="queue-title">Waiting for a Driver to Accept</span>
                 <span id="queue-pos-badge" class="queue-pos-badge">Position #1</span>
               </div>
-              <p class="queue-text">Heavy class-change rush in this zone. Your request is indexed and queued gracefully without timing out.</p>
+              <p class="queue-text">Your request is visible to nearby online drivers. The first driver to accept it gets the ride, and you can cancel for a full refund until then.</p>
               <div id="queue-priority-note" class="priority-note hidden">
                 <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
                 <span>Teacher Priority Matching Applied</span>
@@ -628,11 +638,11 @@
         <div class="profile-container">
           <!-- User Profile Card -->
           <div class="profile-header-card">
-            <img id="profile-card-avatar" class="profile-card-avatar" src="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?w=120" alt="Avatar">
+            <img id="profile-card-avatar" class="profile-card-avatar" src="avatar-default.svg" alt="Avatar">
             <div class="profile-card-info">
               <div class="profile-name-row">
                 <h3 id="profile-card-name" class="profile-user-name">Aarav Mehta</h3>
-                <span id="profile-verified-badge" class="verified-pill">Verified LPU</span>
+                <span id="profile-verified-badge" class="verified-pill">Phone verified</span>
               </div>
               <p id="profile-card-department" class="profile-department">B.Tech Computer Science & Engg</p>
               <p id="profile-card-id" class="profile-lpu-id">Reg: 12204592</p>
@@ -654,8 +664,8 @@
             <div class="section-header-flex">
               <h4 class="section-title">Driver Control & Earnings</h4>
               <label class="online-toggle-label">
-                <span id="online-status-text">Online</span>
-                <input type="checkbox" id="driver-online-toggle" checked>
+                <span id="online-status-text">Offline</span>
+                <input type="checkbox" id="driver-online-toggle">
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -766,13 +776,26 @@
       </button>
 
       <button class="nav-tab" data-view="view-profile">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-          <circle cx="12" cy="7" r="4"/>
-        </svg>
+        <div class="nav-icon-wrapper">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+          <span id="nav-requests-dot" class="badge-dot hidden"></span>
+        </div>
         <span class="nav-label">Profile</span>
       </button>
     </nav>
+
+    <!-- Compulsory location gate -->
+    <div id="location-gate" class="location-gate hidden">
+      <div class="location-gate-card">
+        <div class="dialog-icon">📍</div>
+        <h3 id="location-gate-title">Turn on location</h3>
+        <p id="location-gate-msg" class="dialog-message"></p>
+        <button id="location-gate-retry" type="button" class="dialog-btn dialog-btn-primary hidden">Try again</button>
+      </div>
+    </div>
 
     <!-- ================= MODALS & POPUPS ================= -->
 

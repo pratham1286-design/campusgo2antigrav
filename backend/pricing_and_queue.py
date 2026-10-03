@@ -1,5 +1,5 @@
 import math
-import time
+import re
 from datetime import datetime
 
 # LPU Campus Coordinates reference center: 31.2536° N, 75.7037° E
@@ -56,18 +56,63 @@ VALID_SERVICES = ("bike", "scooty", "car")
 def is_city_landmark(landmark: dict) -> bool:
     return landmark["zone"].startswith("CityLink")
 
-def validate_trip(scope: str, pickup_key: str, drop_key: str):
+CURRENT_LOCATION_KEY = "current_location"
+CUSTOM_PLACE_KEY = "custom_place"
+MIN_TRIP_KM = 0.15
+CAMPUS_RADIUS_KM = 2.0
+MAX_SERVICE_RADIUS_KM = 200.0
+
+
+def custom_point(lat, lng, name):
+    """Builds a pickup or drop from real coordinates (GPS fix or a searched address).
+    Inside the campus it takes the nearest landmark's zone; anywhere else it is a CityLink
+    point. Returns (point, error)."""
+    if lat is None or lng is None:
+        return None, "That location is not available. Allow location access or choose a place."
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None, "Invalid location"
+    if lat != lat or lng != lng or not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None, "Invalid location"
+    if haversine_distance_km(lat, lng, 31.2536, 75.7037) > MAX_SERVICE_RADIUS_KM:
+        return None, "That location is outside our service area."
+    key, landmark = find_nearest_campus_landmark(lat, lng)
+    if haversine_distance_km(lat, lng, landmark["lat"], landmark["lng"]) <= CAMPUS_RADIUS_KM and not is_city_landmark(landmark):
+        zone = landmark["zone"]
+    else:
+        zone = "CityLink-Current"
+    label = " ".join(re.sub(r"[\x00-\x1f\x7f<>]", " ", str(name or "")).split())[:120] or "Selected location"
+    return {"name": label, "lat": lat, "lng": lng, "zone": zone}, None
+
+
+def validate_trip(scope: str, pickup_key: str, drop_key: str, pickup_lat=None, pickup_lng=None,
+                  drop_lat=None, drop_lng=None, drop_name=None):
     """Returns (pickup, drop, error). Campus Hop must stay on campus; CityLink
     must have at least one off-campus end, so flat campus pricing can't be
     used for inter-city trips."""
     if scope not in VALID_SCOPES:
         return None, None, "Invalid ride type"
-    pickup = CAMPUS_LANDMARKS.get(pickup_key)
-    drop = CAMPUS_LANDMARKS.get(drop_key)
+    if pickup_key == CURRENT_LOCATION_KEY:
+        pickup, error = custom_point(pickup_lat, pickup_lng, "My current location")
+        if error:
+            return None, None, error
+    else:
+        pickup = CAMPUS_LANDMARKS.get(pickup_key)
+    if drop_key == CUSTOM_PLACE_KEY:
+        if scope != "citylink":
+            return None, None, "Searching for any address is available on CityLink only."
+        drop, error = custom_point(drop_lat, drop_lng, drop_name)
+        if error:
+            return None, None, error
+    else:
+        drop = CAMPUS_LANDMARKS.get(drop_key)
     if not pickup or not drop:
         return None, None, "Invalid pickup or drop location selected"
-    if pickup_key == drop_key:
+    if pickup_key == drop_key and drop_key != CUSTOM_PLACE_KEY:
         return None, None, "Pickup and drop must be different locations"
+    if haversine_distance_km(pickup["lat"], pickup["lng"], drop["lat"], drop["lng"]) < MIN_TRIP_KM:
+        return None, None, "Pickup and drop are too close together"
     if scope == "campus_hop" and (is_city_landmark(pickup) or is_city_landmark(drop)):
         return None, None, "Campus Hop is for on-campus trips only. Use CityLink for off-campus destinations."
     if scope == "citylink" and not (is_city_landmark(pickup) or is_city_landmark(drop)):

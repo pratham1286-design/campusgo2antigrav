@@ -1,4 +1,3 @@
-import os
 import sys
 import time
 import uuid
@@ -270,4 +269,16 @@ def seed(if_empty=False):
           "Without an SMS gateway, set OTP_DEMO_MODE=1 locally to see the code in the reply.")
 
 if __name__ == "__main__":
-    seed(if_empty="--if-empty" in sys.argv)
+    if "--if-empty" in sys.argv:
+        seed(if_empty=True)
+    else:
+        # Seeding wipes every table, so refuse to do it to a database that has real users
+        # unless the caller says so explicitly.
+        init_db()
+        _conn = get_db_connection()
+        _users = _conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        _conn.close()
+        if _users and "--wipe" not in sys.argv:
+            sys.exit(f"Refusing to wipe a database with {_users} user(s). Use --if-empty to seed only an empty "
+                     "database, or --wipe to delete everything first.")
+        seed()

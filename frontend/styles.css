@@ -237,6 +237,7 @@ body {
 
 .map-wrapper {
   height: 44%;
+  flex-shrink: 0;
   position: relative;
   width: 100%;
   background: #E2E8F0;
@@ -416,15 +417,17 @@ body {
 
 /* Bottom Sheet */
 .bottom-sheet {
-  height: 56%;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background-color: var(--bg-card);
   border-top-left-radius: var(--radius-lg);
   border-top-right-radius: var(--radius-lg);
   box-shadow: var(--shadow-sheet);
   display: flex;
   flex-direction: column;
-  padding: 10px 16px 16px;
-  overflow: visible;
+  padding: 10px 16px 28px;
   z-index: 200;
 }
 
@@ -1036,12 +1039,6 @@ body {
   margin-bottom: 12px;
 }
 
-.status-indicator-col {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .pulse-indicator {
   width: 12px;
   height: 12px;
@@ -1062,6 +1059,11 @@ body {
 }
 
 .trip-fare-pill {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  white-space: nowrap;
+  flex-shrink: 0;
   background-color: var(--bg-subtle);
   border: 1px solid var(--border-light);
   padding: 4px 10px;
@@ -1131,19 +1133,6 @@ body {
   font-family: var(--font-mono);
   font-weight: 700;
   color: var(--text-main);
-}
-
-.safety-features-row {
-  margin-top: 4px;
-}
-
-.safety-tag {
-  font-size: 0.62rem;
-  font-weight: 600;
-  background-color: #EDE9FE;
-  color: #6D28D9;
-  padding: 1px 5px;
-  border-radius: 4px;
 }
 
 .trip-waypoints {
@@ -1220,17 +1209,6 @@ body {
   background-color: var(--primary-orange);
   color: white;
   border: none;
-  border-radius: var(--radius-md);
-  padding: 10px 12px;
-  font-size: 0.78rem;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.btn-danger-outline {
-  border: 1px solid var(--border-light);
-  background: transparent;
-  color: var(--status-danger);
   border-radius: var(--radius-md);
   padding: 10px 12px;
   font-size: 0.78rem;
@@ -1474,8 +1452,8 @@ body {
   font-size: 0.85rem;
 }
 
-.tx-amount.negative { color: var(--status-danger); }
 .tx-amount.positive { color: var(--status-success); }
+.tx-amount.negative { color: var(--status-danger); }
 
 /* ==========================================================================
    VIEW 5: PROFILE & DRIVER DASHBOARD
@@ -1772,37 +1750,6 @@ body {
   cursor: pointer;
 }
 
-/* Persona Chips Grid */
-.persona-chips-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
-}
-
-.persona-chip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background-color: var(--bg-canvas);
-  border: 1.5px solid var(--border-light);
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  text-align: left;
-  transition: all 0.15s ease;
-}
-
-.persona-chip.active {
-  border-color: var(--primary-orange);
-  background-color: var(--primary-orange-light);
-}
-
-.persona-chip img {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  object-fit: cover;
-}
 
 .chip-name {
   display: block;
@@ -1812,12 +1759,6 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.chip-role {
-  display: block;
-  font-size: 0.62rem;
-  color: var(--text-muted);
 }
 
 /* --- Bottom Navigation Bar --- */
@@ -2546,19 +2487,6 @@ body {
   background-color: #D97706;
 }
 
-.btn-view-cockpit {
-  width: 100%;
-  background-color: #111827;
-  color: white;
-  border: none;
-  font-size: 0.82rem;
-  font-weight: 800;
-  padding: 10px 14px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  margin-top: 10px;
-}
-
 /* --- Welcome / Sign up / Log in --- */
 .login-screen {
   position: absolute;
@@ -2837,4 +2765,275 @@ button.star-btn {
 #complete-ride-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ==========================================================================
+   THEMED POPUPS (alert / confirm replacements)
+   ========================================================================== */
+
+.app-dialog {
+  align-items: center;
+  padding: 0 24px;
+  z-index: 2000;
+}
+
+.dialog-card {
+  position: relative;
+  width: 100%;
+  max-width: 340px;
+  max-height: 80%;
+  overflow-y: auto;
+  background-color: var(--bg-card);
+  border-radius: 20px;
+  padding: 24px 20px 18px;
+  text-align: center;
+  box-shadow: var(--shadow-lg);
+  animation: dialogPop 0.18s ease-out;
+}
+
+@keyframes dialogPop {
+  from { transform: scale(0.92); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.dialog-icon {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 12px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 1.5rem;
+  background-color: var(--primary-orange-light);
+}
+
+.dialog-icon.is-warn {
+  background-color: var(--status-danger-light);
+}
+
+.dialog-message {
+  margin: 0 0 18px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text-main);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.dialog-btn {
+  flex: 1;
+  border: none;
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition: transform 0.12s ease, background-color 0.15s ease;
+}
+
+.dialog-btn:active {
+  transform: scale(0.97);
+}
+
+.dialog-btn-primary {
+  background-color: var(--primary-orange);
+  color: var(--text-white);
+  box-shadow: 0 6px 14px var(--primary-orange-glow);
+}
+
+.dialog-btn-primary:hover {
+  background-color: var(--primary-orange-hover);
+}
+
+.dialog-btn-primary.is-danger {
+  background-color: var(--status-danger);
+  box-shadow: 0 6px 14px rgba(239, 68, 68, 0.28);
+}
+
+.dialog-btn-secondary {
+  background-color: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+
+.bottom-sheet > * {
+  flex-shrink: 0;
+}
+
+.available-riders-note {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--status-success);
+  background-color: var(--status-success-light);
+}
+
+.available-riders-note.none {
+  color: var(--status-priority);
+  background-color: var(--status-priority-light);
+}
+
+.auto-badge.off-campus {
+  color: var(--status-priority);
+  background-color: var(--status-priority-light);
+}
+
+/* Compulsory location gate: blocks the whole app until a position is found */
+.location-gate {
+  position: absolute;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background-color: var(--bg-canvas);
+}
+
+.location-gate.hidden {
+  display: none;
+}
+
+.location-gate-card {
+  width: 100%;
+  max-width: 340px;
+  text-align: center;
+}
+
+.location-gate-card h3 {
+  margin: 0 0 8px;
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: var(--text-main);
+}
+
+.location-gate-card .dialog-btn {
+  width: 100%;
+}
+
+
+/* ==========================================================================
+   MAP: route chip, live drivers, CityLink destination search
+   ========================================================================== */
+
+.route-info-chip {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 500;
+  padding: 5px 10px;
+  border-radius: var(--radius-full);
+  background-color: rgba(17, 24, 39, 0.88);
+  color: var(--text-white);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.leaflet-marker-icon.driver-car-pin {
+  transition: transform 1.2s linear;
+}
+
+.drop-search-box {
+  display: none;
+  width: 100%;
+}
+
+#app-root[data-scope="citylink"] .drop-search-box {
+  display: block;
+}
+
+#app-root[data-scope="citylink"] .drop-field .custom-location-picker {
+  display: none;
+}
+
+.drop-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 14px;
+  background: var(--bg-card);
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-main);
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
+}
+
+.drop-search-input:focus {
+  outline: none;
+  border-color: rgba(249, 115, 22, 0.6);
+}
+
+.drop-suggestions {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--bg-card);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
+}
+
+.drop-suggestions-heading {
+  padding: 6px 8px 2px;
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.drop-suggestion {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+
+.drop-suggestion:hover,
+.drop-suggestion:focus-visible {
+  background: var(--primary-orange-light);
+  outline: none;
+}
+
+.drop-suggestion-name {
+  display: block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.drop-suggestion-detail {
+  display: block;
+  font-size: 0.64rem;
+  color: var(--text-muted);
+}
+
+.drop-suggestions-status {
+  padding: 8px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+/* The request cards are white inside the dark driver panel, so their text must be dark. */
+.driver-request-card .veh-title {
+  color: var(--text-main);
+}
+
+.driver-request-card .veh-sub {
+  color: var(--text-secondary);
 }

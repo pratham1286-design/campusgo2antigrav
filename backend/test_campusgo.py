@@ -1,6 +1,6 @@
 import unittest
 
-from test_support import ClientMixin, LPU_IDS, departure_in
+from test_support import ClientMixin, departure_in
 
 
 class TestCampusGo(ClientMixin, unittest.TestCase):
@@ -57,6 +57,9 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         ride_id = res.get_json()["ride_id"]
         self.assertEqual(self.balance(rider), before - 15.0)
+        vikram = self.auth_headers("usr_driver_vikram")
+        self.client.post("/api/driver/toggle-online", headers=vikram, json={"is_online": True, "lat": 31.2535, "lng": 75.7038})
+        self.assertEqual(self.client.post("/api/driver/accept", headers=vikram, json={"ride_id": ride_id}).status_code, 200)
 
         # Can't complete before pickup, and can't rate before completion.
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)

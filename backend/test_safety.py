@@ -37,6 +37,28 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 200, res.get_json())
         return res.get_json()
 
+    def accept(self, ride_id):
+        res = self.client.post("/api/driver/accept", headers=self.driver, json={"ride_id": ride_id})
+        self.assertEqual(res.status_code, 200, res.get_json())
+
+    def test_booking_waits_for_a_driver_to_choose_it(self):
+        ride = self.book()
+        self.assertEqual(ride["status"], "queued")
+        self.assertGreaterEqual(ride["drivers_notified"], 1)
+        listed = self.client.get("/api/driver/requests", headers=self.driver).get_json()["requests"]
+        item = next(r for r in listed if r["id"] == ride["ride_id"])
+        self.assertIsNotNone(item["distance_to_pickup_km"])
+        self.assertGreater(item["trip_km"], 0)
+        self.client.post(f"/api/rides/{ride['ride_id']}/cancel", headers=self.rider)  # refund the held fare
+
+    def test_offline_driver_cannot_accept(self):
+        ride_id = self.book()["ride_id"]
+        self.client.post("/api/driver/toggle-online", headers=self.driver, json={"is_online": False})
+        res = self.client.post("/api/driver/accept", headers=self.driver, json={"ride_id": ride_id})
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.get_json()["code"], "DRIVER_OFFLINE")
+        self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.rider)  # refund the held fare
+
     def test_simulation_is_refused_when_disabled(self):
         ride_id = self.book()["ride_id"]
         for headers in (self.rider, self.driver):
@@ -47,7 +69,8 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
     def test_driver_cannot_collect_fare_without_driving(self):
         ride = self.book()
         ride_id = ride["ride_id"]
-        self.assertEqual(ride["status"], "arriving")
+        self.assertEqual(ride["status"], "queued")
+        self.accept(ride_id)
         before = self.balance(self.driver)
 
         # Not started, so completing is refused; arriving at the pickup starts it.
@@ -67,6 +90,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
 
     def test_rider_can_confirm_arrival_even_if_driver_phone_is_silent(self):
         ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
         self.report(UNI_MALL)
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=self.rider).status_code, 200)
 

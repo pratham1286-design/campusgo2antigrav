@@ -1,7 +1,5 @@
 import sqlite3
 import os
-import json
-import time
 
 DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "campusgo.db")
 

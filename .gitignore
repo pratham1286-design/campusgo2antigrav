@@ -20,3 +20,9 @@ backend/server.pid
 backend/*.log
 backend/campusgo.db-wal
 backend/campusgo.db-shm
+
+# Local dev server leftovers
+backend/server.pid
+backend/*.log
+*.log
+.env

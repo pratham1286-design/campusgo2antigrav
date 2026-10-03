@@ -18,6 +18,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+import geo
 import payments
 from database import get_db_connection, init_db
 from emergency_dispatch import (
@@ -64,8 +65,6 @@ ROUTE_GRACE_SECONDS = 6 * 3600     # a carpool is cancelled and refunded this lo
 SWEEP_INTERVAL_SECONDS = 30
 # Campus time is India time; datetime-local inputs send naive local times.
 LOCAL_UTC_OFFSET_MINUTES = int(os.environ.get("LOCAL_UTC_OFFSET_MINUTES", "330") or 330)
-ACTIVE_RIDE_STATUSES = ("queued", "matched", "arriving", "in_progress")
-CANCELLABLE_RIDE_STATUSES = ("queued", "matched", "arriving")
 
 # --- Session tokens ---------------------------------------------------------
 WEAK_SECRET_KEYS = {"dev_only_change_me_in_production", "changeme", "change_me", "secret", "dev", "test"}
@@ -122,6 +121,11 @@ def _handle_api_error(err):
     if err.code:
         payload["code"] = err.code
     return jsonify(payload), err.status
+
+
+@app.errorhandler(geo.GeoError)
+def _handle_geo_error(err):
+    return jsonify({"error": str(err), "code": "MAP_SERVICE"}), 503
 
 
 @app.errorhandler(PaymentError)
@@ -193,6 +197,9 @@ def _security_headers(resp):
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
+    elif request.path.endswith((".js", ".css", ".html")) or request.path == "/":
+        # Always revalidate, so a browser never keeps running an old app.js.
+        resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
@@ -264,6 +271,8 @@ def as_bool(value):
 
 
 # --- Rate limiting --------------------------------------------------------------
+# In-memory and per process: counters reset on restart, and the app must run a single
+# worker (see Procfile/Dockerfile) or each worker would keep its own count.
 RATE_LIMIT_STORE = {}
 _RATE_LOCK = threading.Lock()
 
@@ -972,7 +981,7 @@ def locate():
 def nearby_drivers():
     """Online, free drivers for the home map (no contact details)."""
     rows = get_db().execute("""
-    SELECT dl.lat, dl.lng, v.category, u.name
+    SELECT dl.driver_id, dl.lat, dl.lng, v.category, u.name
     FROM driver_locations dl
     JOIN users u ON u.id = dl.driver_id
     JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
@@ -981,15 +990,51 @@ def nearby_drivers():
       AND dl.driver_id NOT IN (SELECT driver_id FROM rides
                                WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
     """, (fresh_cutoff(), request.auth_user_id)).fetchall()
-    drivers = [{"lat": r["lat"], "lng": r["lng"], "category": r["category"],
+    # "key" lets the map move a driver's marker instead of redrawing it, without revealing the account id.
+    drivers = [{"key": hmac.new(OTP_HMAC_KEY, r["driver_id"].encode(), hashlib.sha256).hexdigest()[:10],
+                "lat": r["lat"], "lng": r["lng"], "category": r["category"],
                 "first_name": (r["name"] or "Driver").split()[0]} for r in rows]
     return jsonify({"drivers": drivers})
+
+
+# --- Map services -----------------------------------------------------------------------------
+@app.route("/api/places/search", methods=["GET"])
+@require_auth
+@rate_limit(max_requests=40, window_seconds=60)
+def search_places():
+    """Address suggestions for a CityLink destination, best match first, inside the service area."""
+    query = geo.clean_query(request.args.get("q"))
+    near = None
+    if request.args.get("lat") and request.args.get("lng"):
+        try:
+            near = (float(request.args["lat"]), float(request.args["lng"]))
+        except ValueError:
+            near = None
+        if near and not (-90 <= near[0] <= 90 and -180 <= near[1] <= 180):
+            near = None
+    return jsonify({"places": geo.search_places(query, near)})
+
+
+@app.route("/api/route", methods=["GET"])
+@require_auth
+@rate_limit(max_requests=40, window_seconds=60)
+def road_route():
+    """Road geometry, distance and time between two points, for drawing the trip on the map."""
+    try:
+        a_lat, a_lng = float(request.args["a_lat"]), float(request.args["a_lng"])
+        b_lat, b_lng = float(request.args["b_lat"]), float(request.args["b_lng"])
+    except (KeyError, ValueError):
+        raise ApiError("Route needs a_lat, a_lng, b_lat and b_lng")
+    return jsonify(geo.road_route(a_lat, a_lng, b_lat, b_lng))
 
 
 # --- Rides ----------------------------------------------------------------------------------
 def _trip_from_request(data):
     scope = data.get("scope", "campus_hop")
-    pickup, drop, error = validate_trip(scope, data.get("pickup_key"), data.get("drop_key"))
+    pickup, drop, error = validate_trip(
+        scope, data.get("pickup_key"), data.get("drop_key"), data.get("pickup_lat"), data.get("pickup_lng"),
+        data.get("drop_lat"), data.get("drop_lng"), data.get("drop_name"),
+    )
     if error:
         raise ApiError(error)
     return scope, pickup, drop
@@ -1015,8 +1060,10 @@ def get_ride_quote():
         drivers = conn.execute("""
         SELECT COUNT(*) AS n FROM driver_locations dl
         JOIN vehicles v ON dl.driver_id = v.user_id AND v.is_active = 1
-        WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ?
-        """, (fresh_cutoff(), service)).fetchone()["n"]
+        WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND dl.driver_id != ?
+          AND dl.driver_id NOT IN (SELECT driver_id FROM rides
+                                   WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
+        """, (fresh_cutoff(), service, request.auth_user_id)).fetchone()["n"]
         fare = calculate_fare(service, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"], pickup["zone"], demand)
         fare["available_drivers"] = drivers
         fare["has_sufficient_balance"] = balance >= fare["total_fare"]
@@ -1061,21 +1108,10 @@ def book_ride():
     # ride ends. It is refunded in full if the rider cancels.
     new_bal = debit_wallet(conn, rider_id, total_fare, ride_id, f"Fare held for Ride #{ride_id[5:13]}")
 
-    matched = conn.execute("""
-    SELECT dl.driver_id, u.name, u.avatar_url, v.model, v.plate_number, v.color, v.has_helmet, v.has_ac
-    FROM driver_locations dl
-    JOIN users u ON dl.driver_id = u.id
-    JOIN vehicles v ON dl.driver_id = v.user_id
-    WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND v.is_active = 1 AND dl.driver_id != ?
-      AND dl.driver_id NOT IN (SELECT driver_id FROM rides
-                               WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
-    ORDER BY (CASE WHEN dl.zone = ? THEN 0 ELSE 1 END), dl.updated_at DESC
-    LIMIT 1
-    """, (fresh_cutoff(), service_type, rider_id, pickup["zone"])).fetchone()
-
+    # Drivers choose which request to take, so a booking always starts in the queue.
     now = time.time()
     is_priority = 1 if rider["is_teacher_priority"] else 0
-    status = "arriving" if matched else "queued"
+    status = "queued"
     conn.execute("""
     INSERT INTO rides (
         id, rider_id, driver_id, service_type, scope,
@@ -1085,25 +1121,25 @@ def book_ride():
         is_priority, share_token, created_at, matched_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        ride_id, rider_id, matched["driver_id"] if matched else None, service_type, scope,
+        ride_id, rider_id, None, service_type, scope,
         pickup["name"], pickup["lat"], pickup["lng"], pickup["zone"],
         drop["name"], drop["lat"], drop["lng"], drop["zone"],
         total_fare, fare_info["base_fare"], fare_info["surge_multiplier"], status,
-        is_priority, f"share_{secrets.token_urlsafe(16)}", now, now if matched else None,
+        is_priority, f"share_{secrets.token_urlsafe(16)}", now, None,
     ))
-    position = queue_position(conn, pickup["zone"], is_priority, now) if status == "queued" else 0
+    position = queue_position(conn, pickup["zone"], is_priority, now)
+    waiting_drivers = conn.execute("""
+    SELECT COUNT(*) AS n FROM driver_locations dl JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
+    WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND dl.driver_id != ?
+    """, (fresh_cutoff(), service_type, rider_id)).fetchone()["n"]
     conn.commit()
-
-    matched_info = None
-    if matched:
-        matched_info = {k: matched[k] for k in ("name", "avatar_url", "model", "plate_number", "color", "has_helmet", "has_ac")}
     return jsonify({
         "success": True,
         "ride_id": ride_id,
         "status": status,
         "is_priority": bool(is_priority),
         "queue_position": position,
-        "matched_driver": matched_info,
+        "drivers_notified": waiting_drivers,
         "fare": total_fare,
         "wallet_balance": round(new_bal, 2),
     })
@@ -1233,7 +1269,6 @@ def cancel_ride(ride_id):
     ride = load_ride_for_participant(conn, ride_id)
     reason = get_text(body(), "reason", max_len=120)
     begin_write(conn)
-    now = time.time()
 
     if request.auth_user_id == ride["rider_id"]:
         refunded = cancel_ride_with_refund(conn, ride, reason or "Cancelled by rider")
@@ -1470,7 +1505,7 @@ def toggle_driver_online():
         lng = CASE WHEN :fix THEN excluded.lng ELSE driver_locations.lng END,
         updated_at = CASE WHEN :fix THEN excluded.updated_at ELSE driver_locations.updated_at END
     """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng, "zone": zone,
-          "now": time.time(), "fix": 1 if has_fix else 0})
+          "now": time.time() if has_fix else 0.0, "fix": 1 if has_fix else 0})
     conn.commit()
     return jsonify({"success": True, "is_online": bool(is_online)})
 
@@ -1482,8 +1517,12 @@ def get_driver_requests():
     conn = get_db()
     sweep_stale(conn)
     vehicle = require_vehicle(conn, request.auth_user_id)
+    online = conn.execute("SELECT is_online FROM driver_locations WHERE driver_id = ?", (request.auth_user_id,)).fetchone()
+    if not (online and online["is_online"]):
+        return jsonify({"requests": [], "offline": True})
     rows = conn.execute("""
     SELECT r.id, r.service_type, r.scope, r.pickup_name, r.pickup_zone, r.drop_name, r.fare,
+           r.pickup_lat, r.pickup_lng, r.drop_lat, r.drop_lng,
            r.is_priority, r.created_at, u.name AS rider_name, u.user_type AS rider_type
     FROM rides r
     JOIN users u ON r.rider_id = u.id
@@ -1491,9 +1530,14 @@ def get_driver_requests():
     ORDER BY r.is_priority DESC, r.created_at ASC
     LIMIT 25
     """, (vehicle["category"], request.auth_user_id)).fetchall()
+    me = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (request.auth_user_id,)).fetchone()
+    has_fix = bool(me and time.time() - me["updated_at"] <= LOCATION_MAX_AGE_SECONDS)
     requests_out = []
     for r in rows:
         item = dict(r)
+        item["trip_km"] = round(haversine_distance_km(item["pickup_lat"], item["pickup_lng"], item["drop_lat"], item["drop_lng"]), 1)
+        item["distance_to_pickup_km"] = round(haversine_distance_km(me["lat"], me["lng"], item.pop("pickup_lat"), item.pop("pickup_lng")), 1) if has_fix else None
+        item.pop("drop_lat"), item.pop("drop_lng")
         item["rider_name"] = (item["rider_name"] or "Rider").split()[0]
         item["driver_payout"] = round(item["fare"] * DRIVER_SHARE, 2)
         requests_out.append(item)
@@ -1512,6 +1556,9 @@ def driver_accept_request():
     conn = get_db()
     vehicle = require_vehicle(conn, driver_id)
     begin_write(conn)
+    online = conn.execute("SELECT is_online FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
+    if not (online and online["is_online"]):
+        raise ApiError("Go online before accepting rides.", 409, "DRIVER_OFFLINE")
     if driver_is_busy(conn, driver_id):
         raise ApiError("Finish your current ride before accepting another", 409, "DRIVER_BUSY")
 
@@ -1522,11 +1569,6 @@ def driver_accept_request():
     if cur.rowcount != 1:
         raise ApiError("This request is no longer available for your vehicle", 409, "NOT_AVAILABLE")
 
-    conn.execute("""
-    INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
-    VALUES (?, 1, 31.2536, 75.7038, 'Zone-Central', 0.0, ?)
-    ON CONFLICT(driver_id) DO UPDATE SET is_online = 1
-    """, (driver_id, time.time()))
     conn.commit()
     return jsonify({"success": True, "ride_id": ride_id, "status": "arriving"})
 
@@ -2141,5 +2183,10 @@ def admin_update_sos(alert_id, action):
 init_db()
 
 if __name__ == "__main__":
-    print("Starting CampusGo API Server on http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # HTTPS_DEV=1 serves a self-signed certificate (needs the `cryptography`
+    # package) so a phone on the same Wi-Fi can use GPS, which browsers only
+    # allow on https:// or localhost. HOST=0.0.0.0 exposes it to the LAN.
+    use_https = os.environ.get("HTTPS_DEV") == "1"
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"Starting CampusGo API Server on {'https' if use_https else 'http'}://{host}:5000")
+    app.run(host=host, port=5000, debug=False, ssl_context="adhoc" if use_https else None)

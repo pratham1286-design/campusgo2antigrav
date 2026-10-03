@@ -25,6 +25,9 @@ services:
       - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
       - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER:-}
+      - NOMINATIM_URL=${NOMINATIM_URL:-}
+      - OSRM_URL=${OSRM_URL:-}
+      - GEOCODER_CONTACT=${GEOCODER_CONTACT:-}
       - CAMPUS_SECURITY_PHONE=${CAMPUS_SECURITY_PHONE:-+91 1824 517000}
     volumes:
       # Only the database directory is persisted, so rebuilt images ship new code.

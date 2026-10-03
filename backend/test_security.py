@@ -184,6 +184,11 @@ class TestRideRules(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.post("/api/driver/accept", headers=simran, json={"ride_id": ride_id}).status_code, 409)
 
         vikram = self.auth_headers("usr_driver_vikram")  # bike
+        offline = self.client.get("/api/driver/requests", headers=vikram).get_json()
+        self.assertEqual(offline["requests"], [])  # an offline driver is not shown requests
+        self.assertTrue(offline["offline"])
+        self.client.post("/api/driver/toggle-online", headers=vikram,
+                         json={"is_online": True, "lat": 31.2535, "lng": 75.7038})
         reqs = self.client.get("/api/driver/requests", headers=vikram).get_json()["requests"]
         self.assertIn(ride_id, [r["id"] for r in reqs])
         self.assertNotIn("share_token", reqs[0])

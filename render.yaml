@@ -42,6 +42,19 @@ services:
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
+      # Logging in needs real SMS: set FAST2SMS_API_KEY (or the Twilio keys) below, otherwise
+      # sign-in answers 503. "1" shows the code on screen instead; only for a throwaway demo,
+      # because anyone who knows a demo ID + number could then log in as that person.
+      - key: OTP_DEMO_MODE
+        value: "0"
+      # Place search and road routes use the free public OpenStreetMap servers by default; set
+      # these for real traffic (see .env.example).
+      - key: GEOCODER_CONTACT
+        sync: false
+      - key: NOMINATIM_URL
+        sync: false
+      - key: OSRM_URL
+        sync: false
       - key: FAST2SMS_API_KEY
         sync: false
       - key: TWILIO_ACCOUNT_SID
