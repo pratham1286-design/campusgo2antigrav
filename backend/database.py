@@ -175,6 +175,13 @@ def init_db():
     );
     """)
 
+    # Ride start PIN: the rider tells it to the driver at pickup; nothing else can start a ride.
+    existing_ride_columns = {row[1] for row in cursor.execute("PRAGMA table_info(rides)").fetchall()}
+    if "start_pin" not in existing_ride_columns:
+        cursor.execute("ALTER TABLE rides ADD COLUMN start_pin TEXT")
+    if "pin_attempts" not in existing_ride_columns:
+        cursor.execute("ALTER TABLE rides ADD COLUMN pin_attempts INTEGER NOT NULL DEFAULT 0")
+
     # Ride ratings & reviews
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS ride_reviews (

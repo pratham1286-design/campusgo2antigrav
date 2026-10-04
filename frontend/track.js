@@ -10,6 +10,7 @@
   const message = document.getElementById('track-message');
   let map = null;
   let driverMarker = null;
+  let routeDrawn = false;
   let timer = null;
 
   function setText(id, value) {
@@ -47,6 +48,11 @@
       setText('track-vehicle', [ride.vehicle_model, ride.vehicle_color, ride.vehicle_plate].filter(Boolean).join(' • '));
 
       ensureMap(ride);
+      if (map && !routeDrawn && Array.isArray(ride.route_points) && ride.route_points.length > 1) {
+        routeDrawn = true;
+        const line = L.polyline(ride.route_points, { color: '#FF7C00', weight: 5, opacity: 0.85 }).addTo(map);
+        map.fitBounds(line.getBounds(), { padding: [30, 30] });
+      }
       if (map && ride.driver_lat && ride.driver_lng) {
         if (!driverMarker) {
           driverMarker = L.circleMarker([ride.driver_lat, ride.driver_lng], { radius: 10, color: '#111827', fillOpacity: 0.9 })

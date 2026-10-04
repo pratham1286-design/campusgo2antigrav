@@ -1,6 +1,10 @@
 import math
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# Rush hours follow campus (India) time, not the server's clock, which is UTC on most hosts.
+CAMPUS_TZ = timezone(timedelta(minutes=int(os.environ.get("LOCAL_UTC_OFFSET_MINUTES", "330") or 330)))
 
 # LPU Campus Coordinates reference center: 31.2536° N, 75.7037° E
 CAMPUS_LANDMARKS = {
@@ -149,7 +153,7 @@ def get_current_surge_multiplier(pickup_zone: str, demand_count: int = 0) -> flo
     Calculates dynamic surge multiplier based on class timetable peak rush
     and real-time demand in the zone.
     """
-    now = datetime.now()
+    now = datetime.now(CAMPUS_TZ)
     hour = now.hour
     minute = now.minute
     total_minutes = hour * 60 + minute

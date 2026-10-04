@@ -65,12 +65,15 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 5}).status_code, 409)
         step = {}
+        driver = self.auth_headers(self.db("SELECT driver_id FROM rides WHERE id = ?", (ride_id,))[0]["driver_id"])
         for _ in range(20):
-            driver = self.auth_headers(self.db("SELECT driver_id FROM rides WHERE id = ?", (ride_id,))[0]["driver_id"])
             step = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=driver).get_json()
-            if step["status"] == "in_progress":
+            if step["distance_remaining_km"] == 0:
                 break
-        self.assertEqual(step["status"], "in_progress")
+        self.assertEqual(step["status"], "arriving")  # at the pickup, the ride still waits for the rider's PIN
+        pin = self.client.get("/api/rides/active", headers=rider).get_json()["active_ride"]["start_pin"]
+        start = self.client.post(f"/api/rides/{ride_id}/start", headers=driver, json={"pin": pin})
+        self.assertEqual(start.status_code, 200, start.get_json())
 
         comp = self.client.post(f"/api/rides/{ride_id}/complete", headers=rider)
         self.assertEqual(comp.status_code, 200)

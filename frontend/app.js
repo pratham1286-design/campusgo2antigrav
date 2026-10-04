@@ -1235,6 +1235,7 @@ async function refreshNearbyDrivers() {
     if (!ok) return;
     AppState.availableDrivers = data.drivers;
     renderAvailableRiders();
+    renderServiceTiles();
     // Markers are moved, not redrawn, so drivers glide across the map between updates.
     const seen = new Set();
     data.drivers.forEach((dr) => {
@@ -1522,6 +1523,7 @@ async function fetchFareQuotes() {
 
   if (pickupKey === NOT_IN_CAMPUS_KEY) {
     AppState.quotes = null;
+    renderServiceTiles();
     $('selected-service-summary').textContent = 'You are not in campus. Switch to CityLink to ride from here.';
     $('wallet-warning-banner').classList.add('hidden');
     return;
@@ -1536,6 +1538,7 @@ async function fetchFareQuotes() {
     });
     if (!ok) {
       AppState.quotes = null;
+      renderServiceTiles();
       $('selected-service-summary').textContent = data.error || 'Choose a valid pickup and drop';
       $('wallet-warning-banner').classList.add('hidden');
       return;
@@ -1545,6 +1548,22 @@ async function fetchFareQuotes() {
   } catch (err) {
     console.error('Failed to fetch fare quotes:', err);
   }
+}
+
+// Price, time and driver count on each vehicle tile. With no fare quote (pickup outside campus, or a
+// quote that failed) no price is shown at all; the live driver count still works.
+function renderServiceTiles() {
+  const quotes = AppState.quotes;
+  const outside = AppState.pickupKey === NOT_IN_CAMPUS_KEY;
+  ['bike', 'scooty', 'car'].forEach((srv) => {
+    const q = quotes && quotes[srv];
+    const card = document.querySelector(`.service-card[data-service="${srv}"]`);
+    if (card) card.classList.toggle('no-quote', !q);
+    $(`fare-${srv}`).textContent = q ? q.total_fare.toFixed(0) : '–';
+    $(`eta-${srv}`).textContent = q ? `~${AppState.roadMinutes || q.estimated_minutes} min` : (outside ? 'Not in campus' : '');
+    const live = AppState.availableDrivers ? AppState.availableDrivers.filter((d) => d.category === srv).length : (q ? q.available_drivers : null);
+    $(`avail-${srv}`).textContent = live === null ? '' : `${live} driver${live === 1 ? '' : 's'} online`;
+  });
 }
 
 function updateServicesDisplay(data) {
@@ -1558,13 +1577,7 @@ function updateServicesDisplay(data) {
     modePill.style.backgroundColor = '#FEF3C7';
   }
 
-  ['bike', 'scooty', 'car'].forEach((srv) => {
-    const q = quotes[srv];
-    if (!q) return;
-    $(`fare-${srv}`).textContent = q.total_fare.toFixed(0);
-    $(`eta-${srv}`).textContent = `~${AppState.roadMinutes || q.estimated_minutes} min`;
-    $(`avail-${srv}`).textContent = `${q.available_drivers} driver${q.available_drivers === 1 ? '' : 's'} online`;
-  });
+  renderServiceTiles();
 
   const selectedQuote = quotes[AppState.selectedService];
   if (selectedQuote) {
@@ -1877,11 +1890,40 @@ function updateRideControls(status, isRider) {
   completeBtn.classList.remove('hidden');
   completeBtn.disabled = status !== 'in_progress';
   completeBtn.title = status === 'in_progress' ? '' : 'Available after pickup';
+  const waiting = ['matched', 'arriving'].includes(status);
+  $('ride-pin-box').classList.toggle('hidden', !(waiting && isRider));
+  $('start-ride-box').classList.toggle('hidden', !(waiting && !isRider));
+}
+
+async function handleStartRide() {
+  const ride = AppState.activeRide;
+  const input = $('start-pin-input');
+  const pin = input.value.trim();
+  if (!ride) return;
+  if (!/^\d{4}$/.test(pin)) {
+    showAlert("Enter the rider's 4-digit PIN.");
+    return;
+  }
+  const btn = $('start-ride-btn');
+  btn.disabled = true;
+  try {
+    const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(ride.id)}/start`, { pin });
+    if (!ok) {
+      showAlert(data.error || 'Could not start the ride');
+      return;
+    }
+    input.value = '';
+    AppState.activeRide.status = data.status;
+    await checkActiveRide();
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderActiveRide(ride) {
   AppState.activeCockpitRouteId = null;
   $('active-trip-fare').textContent = money(ride.fare);
+  $('ride-pin-value').textContent = ride.start_pin || '----';
   $('active-pickup-name').textContent = ride.pickup_name;
   $('active-drop-name').textContent = ride.drop_name;
   $('cockpit-route-title').textContent = `${ride.pickup_name} ➔ ${ride.drop_name}`;
@@ -1972,6 +2014,7 @@ async function updateLiveTracking(ride) {
   if (driverAt && AppState.activeMarkers.driver) AppState.activeMarkers.driver.setLatLng(driverAt);
 
   const target = rideTarget(ride);
+  drawTripRoadRoute(ride);
   if (!driverAt) return;
   const km = distanceKm(driverAt[0], driverAt[1], target.lat, target.lng);
   const sub = $('cockpit-telemetry-sub');
@@ -1987,15 +2030,21 @@ async function updateLiveTracking(ride) {
   if (AppState.activeLeg) AppState.activeMap.removeLayer(AppState.activeLeg);
   AppState.activeLeg = L.polyline(route.points, { color: '#2563EB', weight: 5, opacity: 0.85 }).addTo(AppState.activeMap);
   sub.textContent = `${baseText} ${route.km} km away • about ${route.minutes} min`;
+}
 
-  // Once per ride, the whole trip (pickup to destination) replaces the straight dashed line.
-  if (AppState.tripRouteFor !== ride.id) {
-    AppState.tripRouteFor = ride.id;
+// The whole trip (pickup to destination) on real roads replaces the straight placeholder line.
+// Asked again on the next refresh if the routing service did not answer.
+async function drawTripRoadRoute(ride) {
+  if (!AppState.activeMap || AppState.tripRouteFor === ride.id || AppState.tripRouteBusy) return;
+  AppState.tripRouteBusy = true;
+  try {
     const trip = await fetchRoadRoute({ lat: ride.pickup_lat, lng: ride.pickup_lng }, { lat: ride.drop_lat, lng: ride.drop_lng });
-    if (trip && AppState.activeRide && AppState.activeRide.id === ride.id) {
-      if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
-      AppState.activePolyline = L.polyline(trip.points, { color: '#FF7C00', weight: 4, opacity: 0.6, dashArray: '2, 8' }).addTo(AppState.activeMap);
-    }
+    if (!trip || !AppState.activeRide || AppState.activeRide.id !== ride.id) return;
+    AppState.tripRouteFor = ride.id;
+    if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
+    AppState.activePolyline = L.polyline(trip.points, { color: '#FF7C00', weight: 5, opacity: 0.8 }).addTo(AppState.activeMap);
+  } finally {
+    AppState.tripRouteBusy = false;
   }
 }
 
@@ -2066,7 +2115,9 @@ async function advanceTelemetryStep() {
   const isArriving = data.status === 'arriving' || data.status === 'matched';
   $('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
   if (data.distance_remaining_km !== undefined) {
-    $('cockpit-telemetry-sub').textContent = `${isArriving ? 'Driver is' : 'Destination is'} ${data.distance_remaining_km} km away`;
+    $('cockpit-telemetry-sub').textContent = isArriving && data.distance_remaining_km === 0
+      ? "At the pickup. Ask the rider for their PIN to start."
+      : `${isArriving ? 'Driver is' : 'Destination is'} ${data.distance_remaining_km} km away`;
   }
   updateRideControls(data.status, AppState.activeRide.is_rider !== false);
 }
@@ -2173,6 +2224,20 @@ async function resolveSosLocation() {
   return { lat: null, lng: null, name: 'Location unavailable', approximate: true };
 }
 
+async function handleSosSafe() {
+  const alertId = AppState.sosAlertId;
+  if (alertId) {
+    const { ok, data } = await apiPost(`/api/sos/${encodeURIComponent(alertId)}/resolve`);
+    if (!ok) {
+      showAlert(data.error || 'Could not update the alert');
+      return;
+    }
+  }
+  AppState.sosAlertId = null;
+  closeModal('modal-sos');
+  showAlert('Glad you are safe. Your alert is marked resolved.');
+}
+
 const DELIVERY_LABELS = {
   sent: '✓ Texted',
   failed: '✗ Sending failed',
@@ -2199,6 +2264,7 @@ async function handleTriggerSOS() {
       return;
     }
 
+    AppState.sosAlertId = data.alert_id;
     $('sos-display-location').textContent = loc.name;
     const total = data.contacts_notified.length;
     $('sos-contacts-count').textContent = data.sms_gateway_configured
@@ -2752,6 +2818,12 @@ async function openDuringRideCockpit(routeId) {
         .addTo(AppState.activeMap);
       AppState.activeFit = [oCoords, dCoords];
       AppState.activeMap.fitBounds(AppState.activeFit, { padding: [50, 50] });
+      const hostedId = routeId;
+      fetchRoadRoute({ lat: oCoords[0], lng: oCoords[1] }, { lat: dCoords[0], lng: dCoords[1] }).then((road) => {
+        if (!road || AppState.activeCockpitRouteId !== hostedId) return;
+        if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
+        AppState.activePolyline = L.polyline(road.points, { color: '#F59E0B', weight: 5, opacity: 0.85 }).addTo(AppState.activeMap);
+      });
     }
 
     switchView('view-active-ride');
@@ -2920,6 +2992,9 @@ function initEventHandlers() {
   // SOS and sharing
   $('persistent-sos-btn').addEventListener('click', handleTriggerSOS);
   $('dismiss-sos-btn').addEventListener('click', () => closeModal('modal-sos'));
+  $('sos-safe-btn').addEventListener('click', handleSosSafe);
+  $('start-ride-btn').addEventListener('click', handleStartRide);
+  $('start-pin-input').addEventListener('keydown', (event) => { if (event.key === 'Enter') handleStartRide(); });
   $('share-live-btn').addEventListener('click', handleShareTrip);
   $('copy-share-btn').addEventListener('click', async () => {
     const input = $('share-link-input');

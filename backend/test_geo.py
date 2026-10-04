@@ -100,5 +100,31 @@ class TestCustomDestination(ClientMixin, unittest.TestCase):
         self.assertLessEqual(len(points["name"]), 120)
 
 
+class TestRoadFollowing(unittest.TestCase):
+    L_SHAPE = [[31.0, 75.0], [31.0, 75.1], [31.1, 75.1]]  # east, then north: a road with a corner
+
+    def test_point_along_route_stays_on_the_path(self):
+        east = geo.haversine_distance_km(31.0, 75.0, 31.0, 75.1)
+        north = geo.haversine_distance_km(31.0, 75.1, 31.1, 75.1)
+        corner = geo.point_along_route(self.L_SHAPE, east / (east + north))
+        self.assertAlmostEqual(corner[0], 31.0, places=2)
+        self.assertAlmostEqual(corner[1], 75.1, places=2)
+        self.assertEqual(geo.point_along_route(self.L_SHAPE, 0), [31.0, 75.0])
+        self.assertEqual(geo.point_along_route(self.L_SHAPE, 1), [31.1, 75.1])
+
+    def test_demo_vehicle_follows_road_not_straight_line(self):
+        route = {"points": self.L_SHAPE, "km": 20.0, "minutes": 30}
+        with mock.patch.object(geo, "road_route", return_value=route):
+            lat, lng = geo.step_toward(31.0, 75.0, 31.1, 75.1, 0.25)
+        self.assertAlmostEqual(lat, 31.0, places=3)  # still on the eastbound leg, not cutting the corner
+        self.assertGreater(lng, 75.0)
+
+    def test_demo_vehicle_falls_back_to_straight_line_when_routing_is_down(self):
+        with mock.patch.object(geo, "road_route", side_effect=geo.GeoError("down")):
+            lat, lng = geo.step_toward(31.0, 75.0, 31.1, 75.1, 0.5)
+        self.assertAlmostEqual(lat, 31.05)
+        self.assertAlmostEqual(lng, 75.05)
+
+
 if __name__ == "__main__":
     unittest.main()

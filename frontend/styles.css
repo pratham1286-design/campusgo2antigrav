@@ -851,6 +851,11 @@ body {
   color: var(--text-muted);
 }
 
+/* No fare to show (pickup outside campus): no price, no currency sign, tile reads as not bookable */
+.service-card.no-quote .fare-currency { display: none; }
+.service-card.no-quote .fare-val { color: var(--text-muted); }
+.service-card.no-quote .service-eta { color: var(--text-muted); }
+
 /* Wallet Warning Banner */
 .wallet-warning-banner {
   background-color: var(--status-danger-light);
@@ -1175,6 +1180,44 @@ body {
   font-size: 0.78rem;
   font-weight: 600;
   color: var(--text-main);
+}
+
+.ride-pin-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-md);
+  background-color: var(--primary-orange-light);
+  border: 1px dashed var(--primary-orange);
+  font-size: 0.75rem;
+  color: var(--text-main);
+}
+
+.ride-pin-value {
+  font-family: var(--font-mono);
+  font-size: 1.3rem;
+  letter-spacing: 0.3em;
+}
+
+.start-ride-box {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.start-pin-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  letter-spacing: 0.3em;
+  text-align: center;
 }
 
 .active-actions-row {

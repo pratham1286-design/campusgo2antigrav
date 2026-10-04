@@ -356,7 +356,7 @@
                   </div>
                   <div class="service-fare-badge">
                     <span class="fare-currency">₹</span>
-                    <span class="fare-val" id="fare-bike">15</span>
+                    <span class="fare-val" id="fare-bike">–</span>
                   </div>
                 </div>
                 <div class="service-meta">
@@ -364,8 +364,8 @@
                   <span class="service-desc">Single Rider • Quickest</span>
                 </div>
                 <div class="service-footer">
-                  <span class="service-eta" id="eta-bike">~3 min</span>
-                  <span class="service-driver-avail" id="avail-bike">1 Driver near</span>
+                  <span class="service-eta" id="eta-bike"></span>
+                  <span class="service-driver-avail" id="avail-bike"></span>
                 </div>
               </div>
 
@@ -382,7 +382,7 @@
                   </div>
                   <div class="service-fare-badge">
                     <span class="fare-currency">₹</span>
-                    <span class="fare-val" id="fare-scooty">20</span>
+                    <span class="fare-val" id="fare-scooty">–</span>
                   </div>
                 </div>
                 <div class="service-meta">
@@ -390,8 +390,8 @@
                   <span class="service-desc">Single Rider • Spacious</span>
                 </div>
                 <div class="service-footer">
-                  <span class="service-eta" id="eta-scooty">~4 min</span>
-                  <span class="service-driver-avail" id="avail-scooty">1 Driver near</span>
+                  <span class="service-eta" id="eta-scooty"></span>
+                  <span class="service-driver-avail" id="avail-scooty"></span>
                 </div>
               </div>
 
@@ -408,7 +408,7 @@
                   </div>
                   <div class="service-fare-badge">
                     <span class="fare-currency">₹</span>
-                    <span class="fare-val" id="fare-car">35</span>
+                    <span class="fare-val" id="fare-car">–</span>
                   </div>
                 </div>
                 <div class="service-meta">
@@ -416,8 +416,8 @@
                   <span class="service-desc">Shared Pool • AC Comfort</span>
                 </div>
                 <div class="service-footer">
-                  <span class="service-eta" id="eta-car">~5 min</span>
-                  <span class="service-driver-avail" id="avail-car">1 Driver near</span>
+                  <span class="service-eta" id="eta-car"></span>
+                  <span class="service-driver-avail" id="avail-car"></span>
                 </div>
               </div>
             </div>
@@ -493,6 +493,17 @@
                 <span>Fare: ₹</span>
                 <span id="active-trip-fare">85.00</span>
               </div>
+            </div>
+
+            <!-- Ride PIN: the rider tells it to the driver, who enters it to start the trip -->
+            <div id="ride-pin-box" class="ride-pin-box hidden">
+              <span>Tell your driver this PIN when you get in</span>
+              <strong id="ride-pin-value" class="ride-pin-value">----</strong>
+            </div>
+            <div id="start-ride-box" class="start-ride-box hidden">
+              <input id="start-pin-input" class="start-pin-input" type="text" inputmode="numeric" pattern="[0-9]*"
+                     maxlength="4" autocomplete="off" placeholder="Rider's PIN" aria-label="Rider's 4-digit PIN">
+              <button id="start-ride-btn" class="btn-primary-action">Start Ride</button>
             </div>
 
             <!-- Host / Driver Profile Card -->
@@ -920,7 +931,8 @@
           </div>
 
           <p class="sos-advice" id="sos-advice-text">Campus security is not notified automatically. Call the hotline above and stay in a well-lit, public area.</p>
-          <button id="dismiss-sos-btn" class="btn-secondary-action">Acknowledge & Close</button>
+          <button id="sos-safe-btn" class="btn-primary-action">I'm safe now</button>
+          <button id="dismiss-sos-btn" class="btn-secondary-action">Close (alert stays active)</button>
         </div>
       </div>
     </div>

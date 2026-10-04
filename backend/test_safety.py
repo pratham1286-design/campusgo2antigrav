@@ -19,6 +19,8 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.db("UPDATE rides SET status = 'cancelled' WHERE status IN ('queued', 'matched', 'arriving', 'in_progress')")
+        self.db("UPDATE driver_routes SET status = 'cancelled' WHERE status = 'in_progress'")
+        self.db("UPDATE wallets SET balance = 500 WHERE user_id IN ('usr_student_aarav', 'usr_student_kavya')")
         self.rider = self.auth_headers("usr_student_aarav")
         self.driver = self.auth_headers("usr_driver_vikram")
         self.go_online()
@@ -40,6 +42,12 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
     def accept(self, ride_id):
         res = self.client.post("/api/driver/accept", headers=self.driver, json={"ride_id": ride_id})
         self.assertEqual(res.status_code, 200, res.get_json())
+
+    def rider_pin(self):
+        return self.client.get("/api/rides/active", headers=self.rider).get_json()["active_ride"]["start_pin"]
+
+    def start(self, ride_id, pin):
+        return self.client.post(f"/api/rides/{ride_id}/start", headers=self.driver, json={"pin": pin})
 
     def test_booking_waits_for_a_driver_to_choose_it(self):
         ride = self.book()
@@ -73,9 +81,11 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.accept(ride_id)
         before = self.balance(self.driver)
 
-        # Not started, so completing is refused; arriving at the pickup starts it.
+        # Not started, so completing is refused. Arriving at the pickup does not start it either:
+        # only the rider's PIN does.
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=self.driver).status_code, 409)
-        self.assertEqual(self.report(UNI_MALL)["ride_status"], "in_progress")
+        self.assertEqual(self.report(UNI_MALL)["ride_status"], "arriving")
+        self.assertEqual(self.start(ride_id, self.rider_pin()).status_code, 200)
 
         # Still at the pickup: the driver can't finish the trip, and money hasn't moved.
         res = self.client.post(f"/api/rides/{ride_id}/complete", headers=self.driver)
@@ -92,7 +102,77 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         ride_id = self.book()["ride_id"]
         self.accept(ride_id)
         self.report(UNI_MALL)
+        self.assertEqual(self.start(ride_id, self.rider_pin()).status_code, 200)
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=self.rider).status_code, 200)
+
+    def test_ride_starts_only_with_the_riders_pin_at_the_pickup(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        driver_view = self.client.get("/api/rides/active", headers=self.driver).get_json()["active_ride"]
+        self.assertNotIn("start_pin", driver_view)  # the driver must hear it from the rider
+        pin = self.rider_pin()
+        self.assertRegex(pin, r"^\d{4}$")
+
+        self.report({"lat": 31.2510, "lng": 75.7080})  # main gate, ~0.5 km from the pickup
+        self.assertEqual(self.start(ride_id, pin).get_json()["code"], "NOT_AT_PICKUP")
+        self.report(UNI_MALL)
+        wrong = "0000" if pin != "0000" else "1111"
+        self.assertEqual(self.start(ride_id, wrong).get_json()["code"], "PIN_WRONG")
+        rider_try = self.client.post(f"/api/rides/{ride_id}/start", headers=self.rider, json={"pin": pin})
+        self.assertEqual(rider_try.status_code, 403)
+        self.assertEqual(self.start(ride_id, pin).status_code, 200)
+        self.assertEqual(self.db("SELECT status FROM rides WHERE id = ?", (ride_id,))[0]["status"], "in_progress")
+        self.client.post(f"/api/rides/{ride_id}/complete", headers=self.rider)
+
+    def test_pin_guessing_is_capped(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        self.report(UNI_MALL)
+        pin = self.rider_pin()
+        wrong = "0000" if pin != "0000" else "1111"
+        for _ in range(app_module.START_PIN_MAX_ATTEMPTS):
+            self.start(ride_id, wrong)
+        self.assertEqual(self.start(ride_id, pin).get_json()["code"], "PIN_LOCKED")
+        # Releasing the ride puts it back in the queue with a fresh set of attempts.
+        self.assertEqual(self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.driver).status_code, 200)
+        self.accept(ride_id)
+        self.assertEqual(self.start(ride_id, pin).status_code, 200)
+        self.client.post(f"/api/rides/{ride_id}/complete", headers=self.rider)
+
+    def test_gps_jump_while_driving_is_rejected(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        self.report(UNI_MALL)
+        res = self.client.post("/api/driver/location", headers=self.driver, json={"lat": 31.3190, "lng": 75.5860})
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.get_json()["code"], "GPS_JUMP")
+        self.report(BLOCK_34)  # a short, plausible move is fine
+        self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.rider)
+
+    def test_busy_driver_cannot_swap_vehicle_or_stop_driving(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        veh = self.client.post("/api/user/vehicle", headers=self.driver, json={
+            "category": "car", "model": "Swift", "plate_number": "PB08-AB-1234", "capacity": 4})
+        self.assertEqual(veh.get_json()["code"], "DRIVER_BUSY")
+        role = self.client.post("/api/user/role", headers=self.driver, json={"role": "rider"})
+        self.assertEqual(role.get_json()["code"], "DRIVER_BUSY")
+        self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.rider)
+
+    def test_started_trip_nobody_finished_is_settled(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        self.report(UNI_MALL)
+        self.assertEqual(self.start(ride_id, self.rider_pin()).status_code, 200)
+        before = self.balance(self.driver)
+        self.db("UPDATE rides SET started_at = ? WHERE id = ?", (time.time() - app_module.STALE_TRIP_SECONDS - 60, ride_id))
+        conn = app_module.get_db_connection()
+        try:
+            app_module.sweep_stale(conn, force=True)
+        finally:
+            conn.close()
+        self.assertEqual(self.db("SELECT status FROM rides WHERE id = ?", (ride_id,))[0]["status"], "completed")
+        self.assertEqual(self.balance(self.driver), before + 13.5)
 
     def test_location_needs_both_coordinates(self):
         res = self.client.post("/api/driver/location", headers=self.driver, json={"lat": 31.25})
@@ -133,8 +213,29 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         res = self.client.post(f"/api/routes/{route_id}/complete", headers=host)
         self.assertEqual(res.status_code, 409)
         self.assertEqual(res.get_json()["code"], "NOT_AT_DESTINATION")
+        # Driving to Phagwara takes time; a position there a second later would be rejected as a GPS jump.
+        self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_harpreet'", (time.time() - 590,))
         self.client.post("/api/driver/location", headers=host, json={"lat": 31.2210, "lng": 75.7720})  # Phagwara station
         self.assertEqual(self.client.post(f"/api/routes/{route_id}/complete", headers=host).status_code, 200)
+
+    def test_carpool_host_on_a_trip_cannot_take_a_solo_ride(self):
+        host = self.auth_headers("usr_driver_harpreet")
+        route_id = self.client.post("/api/routes/plan", headers=host, json={
+            "origin": "uni_mall", "destination": "phagwara_station", "departure_time": departure_in(),
+            "total_seats": 2, "price_per_seat": 50}).get_json()["route_id"]
+        self.addCleanup(self.db, "UPDATE driver_routes SET status = 'cancelled' WHERE id = ?", (route_id,))
+        self.client.post(f"/api/routes/{route_id}/join", headers=self.rider, json={"seats": 1})
+        self.client.post("/api/driver/location", headers=host, json=UNI_MALL)
+        self.assertEqual(self.client.post(f"/api/routes/{route_id}/start", headers=host).status_code, 200)
+        self.client.post("/api/driver/toggle-online", headers=host, json={"is_online": True, **UNI_MALL})
+        category = self.db("SELECT category FROM vehicles WHERE user_id = 'usr_driver_harpreet'")[0]["category"]
+        other = self.auth_headers("usr_student_kavya")
+        booked = self.client.post("/api/rides/book", headers=other, json={**TRIP, "service_type": category})
+        self.assertEqual(booked.status_code, 200, booked.get_json())
+        ride_id = booked.get_json()["ride_id"]
+        res = self.client.post("/api/driver/accept", headers=host, json={"ride_id": ride_id})
+        self.assertEqual(res.get_json()["code"], "DRIVER_BUSY")
+        self.client.post(f"/api/rides/{ride_id}/cancel", headers=other)
 
     def test_carpool_rejects_free_text_and_past_departure(self):
         host = self.auth_headers("usr_driver_harpreet")
@@ -194,6 +295,33 @@ class TestIdentityAndSos(ClientMixin, unittest.TestCase):
             self.assertNotIn("demo_otp", body)
             verify = self.client.post("/api/auth/login/verify", json={"challenge_id": body["challenge_id"], "otp": "123456"})
             self.assertEqual(verify.status_code, 400)
+
+    def test_unknown_account_gets_the_same_resend_cooldown(self):
+        with mock.patch.dict(os.environ, {"OTP_DEMO_MODE": "0"}):
+            first = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
+            again = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(again.status_code, 429)
+        self.assertEqual(again.get_json()["code"], "OTP_COOLDOWN")
+
+    def test_removing_primary_contact_promotes_another(self):
+        headers = self.auth_headers("usr_driver_simran")
+        for c in self.client.get("/api/user/emergency-contacts", headers=headers).get_json()["contacts"]:
+            self.client.delete(f"/api/user/emergency-contacts/{c['id']}", headers=headers)
+        first = self.client.post("/api/user/emergency-contacts", headers=headers, json={"name": "Dad", "phone": "9700000011"})
+        self.client.post("/api/user/emergency-contacts", headers=headers, json={"name": "Mum", "phone": "9700000012"})
+        self.client.delete(f"/api/user/emergency-contacts/{first.get_json()['contact_id']}", headers=headers)
+        left = self.client.get("/api/user/emergency-contacts", headers=headers).get_json()["contacts"]
+        self.assertEqual([(c["name"], c["is_primary"]) for c in left], [("Mum", 1)])
+
+    def test_rush_hour_uses_campus_time_not_server_time(self):
+        from datetime import datetime, timezone
+        import pricing_and_queue
+        rush_utc = datetime(2026, 10, 5, 3, 15, tzinfo=timezone.utc)  # 08:45 in India: morning rush
+        fake = mock.MagicMock(wraps=datetime)
+        fake.now.side_effect = lambda tz=None: rush_utc.astimezone(tz) if tz else rush_utc.replace(tzinfo=None)
+        with mock.patch.object(pricing_and_queue, "datetime", fake):
+            self.assertEqual(pricing_and_queue.get_current_surge_multiplier("Zone-Central"), 1.25)
 
     def test_strangers_cannot_exhaust_a_victims_login_attempts(self):
         for _ in range(12):

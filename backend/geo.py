@@ -147,6 +147,9 @@ def search_places(query, near=None, limit=6):
     return results
 
 
+MAX_ROUTE_POINTS = 1500
+
+
 def road_route(a_lat, a_lng, b_lat, b_lng):
     """Road geometry and timing between two points: {"points": [[lat, lng], ...], "km", "minutes"}."""
     for lat, lng in ((a_lat, a_lng), (b_lat, b_lng)):
@@ -162,13 +165,45 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
 
     base = _env("OSRM_URL", "https://router.project-osrm.org")
     url = (f"{base}/route/v1/driving/{a_lng:.5f},{a_lat:.5f};{b_lng:.5f},{b_lat:.5f}"
-           "?overview=simplified&geometries=geojson")
+           "?overview=full&geometries=geojson")
     data = _fetch_json(url)
     try:
         route = data["routes"][0]
-        points = [[round(lat, 5), round(lng, 5)] for lng, lat in route["geometry"]["coordinates"]][:400]
+        coords = route["geometry"]["coordinates"]
+        if len(coords) > MAX_ROUTE_POINTS:  # thin out evenly, keeping both ends, so the whole road stays drawn
+            step = (len(coords) - 1) / (MAX_ROUTE_POINTS - 1)
+            coords = [coords[round(i * step)] for i in range(MAX_ROUTE_POINTS)]
+        points = [[round(lat, 5), round(lng, 5)] for lng, lat in coords]
         result = {"points": points, "km": round(route["distance"] / 1000.0, 1), "minutes": max(1, round(route["duration"] / 60.0))}
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise GeoError("No road route found between those points.") from exc
     _cache_put(key, result)
     return result
+
+
+def point_along_route(points, fraction):
+    """The [lat, lng] lying `fraction` (0..1) of the way along the road path, measured by distance."""
+    if len(points) < 2 or fraction <= 0:
+        return list(points[0])
+    if fraction >= 1:
+        return list(points[-1])
+    legs = [haversine_distance_km(a[0], a[1], b[0], b[1]) for a, b in zip(points, points[1:])]
+    goal = sum(legs) * fraction
+    for (a, b), leg in zip(zip(points, points[1:]), legs):
+        if goal <= leg and leg > 0:
+            t = goal / leg
+            return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        goal -= leg
+    return list(points[-1])
+
+
+def step_toward(cur_lat, cur_lng, target_lat, target_lng, fraction):
+    """Demo vehicle movement: advance `fraction` of the remaining way along the real road path,
+    falling back to a straight line only if the routing service is unavailable."""
+    try:
+        points = road_route(cur_lat, cur_lng, target_lat, target_lng)["points"]
+    except GeoError:
+        points = []
+    if len(points) >= 2:
+        return point_along_route(points, fraction)
+    return [cur_lat + (target_lat - cur_lat) * fraction, cur_lng + (target_lng - cur_lng) * fraction]
