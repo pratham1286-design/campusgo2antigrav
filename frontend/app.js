@@ -137,6 +137,54 @@ function $(id) {
   return document.getElementById(id);
 }
 
+// --- Add to Home Screen ---
+// Offered to every new account the moment signup finishes. Android browsers hand us an install
+// prompt to show from our own button; iPhones have none, so the sheet says which taps to make.
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  hideInstallSheet();
+});
+
+function isInstalledApp() {
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function offerInstall() {
+  if (isInstalledApp()) return;
+  const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const steps = $('install-sheet-steps');
+  if (deferredInstallPrompt) {
+    steps.classList.add('hidden');
+  } else {
+    steps.textContent = isIos
+      ? 'Tap the Share button (the square with an arrow ⬆), then tap "Add to Home Screen".'
+      : 'Open your browser menu (⋮), then tap "Add to Home screen" or "Install app".';
+    steps.classList.remove('hidden');
+  }
+  $('install-sheet-btn').classList.toggle('hidden', !deferredInstallPrompt);
+  $('install-sheet-later').textContent = deferredInstallPrompt ? 'Later' : 'Got it';
+  $('install-sheet').classList.remove('hidden');
+}
+
+function hideInstallSheet() {
+  $('install-sheet').classList.add('hidden');
+}
+
+async function installApp() {
+  const prompt = deferredInstallPrompt;
+  if (!prompt) return;
+  deferredInstallPrompt = null;  // a prompt can be shown only once
+  hideInstallSheet();
+  prompt.prompt();
+  await prompt.userChoice.catch(() => {});
+}
+
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
   // Lets the app be installed (and packaged for the Play Store) and show a page when offline.
@@ -152,6 +200,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateZoneBanner();
   setInterval(updateZoneBanner, 60000);
   $('location-gate-retry').addEventListener('click', detectUserLocation);
+  $('install-sheet-btn').addEventListener('click', installApp);
+  $('install-sheet-later').addEventListener('click', hideInstallSheet);
   initAuthHandlers();
   await tryResumeSession();
 });
@@ -645,10 +695,12 @@ async function verifyOtp() {
     return;
   }
   clearInterval(AuthFlow.resendTimer);
+  const isNewAccount = AuthFlow.mode === 'signup';
   AppState.authToken = result.data.token;
   AppState.currentUser = result.data.user;
   storeToken(result.data.token);
   resetAuthForms();
+  if (isNewAccount) offerInstall();
   await onLoginSuccess();
 }
 
@@ -723,22 +775,31 @@ function initAuthHandlers() {
   $('delete-account-btn').addEventListener('click', handleDeleteAccount);
 }
 
-// --- Map Initialization (OpenStreetMap, no API key needed) ---
+// --- Map Initialization (our own map files, see campus-map.js: no API key or tile server) ---
 function initMaps() {
-  // The tile server comes from the server's config (TILE_URL), and its credit is always shown:
-  // map data licences require it.
-  const tiles = () => L.tileLayer((AppState.config && AppState.config.tile_url) || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: (AppState.config && AppState.config.tile_attribution) || '&copy; OpenStreetMap contributors'
-  });
   AppState.homeMap = L.map('campus-map', { zoomControl: false }).setView(LPU_COORDS, 16);
-  AppState.homeMap.attributionControl.setPrefix(false);
-  tiles().addTo(AppState.homeMap);
+  addCampusBasemap(AppState.homeMap);
   L.control.zoom({ position: 'bottomright' }).addTo(AppState.homeMap);
 
   AppState.activeMap = L.map('active-tracking-map', { zoomControl: false }).setView(LPU_COORDS, 16);
-  AppState.activeMap.attributionControl.setPrefix(false);
-  tiles().addTo(AppState.activeMap);
+  addCampusBasemap(AppState.activeMap);
+}
+
+// Without a routing server the route is an estimate: drawn dashed (a straight line), never as a road.
+function routeLine(route, color, weight, opacity) {
+  return L.polyline(route.points, { color, weight, opacity, dashArray: route.estimated ? '8, 8' : null });
+}
+
+// Turn-by-turn directions come from the driver's own maps app: a plain link, no API key.
+function setNavigateTarget(target, label) {
+  const btn = $('navigate-btn');
+  if (!target) {
+    btn.classList.add('hidden');
+    return;
+  }
+  btn.href = `https://www.google.com/maps/dir/?api=1&destination=${Number(target.lat)},${Number(target.lng)}&travelmode=driving`;
+  btn.querySelector('span').textContent = label;
+  btn.classList.remove('hidden');
 }
 
 // Polling pauses while the app is in a background tab, and catches up the moment it's back.
@@ -1226,11 +1287,37 @@ function renderMapLandmarks() {
       .addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${esc(p.name)}`);
   }
   const d = dropPlace();
+  // A CityLink destination can be dragged to the exact gate or door: searched places are often
+  // a few hundred metres off. Campus Hop stops are fixed (flat fares), so they stay put.
+  const movable = Boolean(d) && AppState.selectedScope === 'citylink';
   if (d) {
-    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#FF7C00', 'D') })
+    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#FF7C00', 'D', movable ? 34 : 24), draggable: movable, autoPan: true })
       .addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${esc(d.name)}`);
+    if (movable) AppState.homeMarkers.drop.on('dragend', (e) => moveDropTo(e.target.getLatLng()));
   }
+  const hint = $('drop-pin-hint');
+  hint.textContent = d && d.moved ? 'Pin moved. Drag D again to adjust.' : 'Drag the D pin to your exact drop point';
+  hint.classList.toggle('hidden', !movable);
   drawHomeRoute();
+}
+
+// The rider dragged the destination pin: the trip now ends exactly there. The place keeps its
+// name, as "Near …" when moved more than a short walk away, so the driver still knows the area.
+function moveDropTo(latlng) {
+  const d = dropPlace();
+  if (!d) return;
+  const base = d.baseName || d.name;
+  const origin = d.origin || { lat: d.lat, lng: d.lng };
+  const far = distanceKm(origin.lat, origin.lng, latlng.lat, latlng.lng) > 0.3;
+  AppState.customDrop = {
+    name: far ? `Near ${base}` : base, baseName: base, origin, moved: true,
+    lat: Number(latlng.lat.toFixed(6)), lng: Number(latlng.lng.toFixed(6))
+  };
+  AppState.dropKey = CUSTOM_PLACE_KEY;
+  $('drop-select').value = '';
+  AppState.keepMapView = true;  // the rider is looking at this spot: don't zoom out to the whole trip
+  syncDropSearchInput();
+  fetchFareQuotes();
 }
 
 // Shows drivers who are actually online and free, as reported by the server.
@@ -1468,14 +1555,16 @@ async function drawHomeRoute() {
   const seq = ++AppState.routeSeq;
   const straight = [[p.lat, p.lng], [d.lat, d.lng]];
   AppState.routeLine = L.polyline(straight, { color: '#FF7C00', weight: 4, opacity: 0.7, dashArray: '6, 8' }).addTo(map);
-  map.fitBounds(straight, { padding: [40, 40] });
+  const keepView = AppState.keepMapView;
+  AppState.keepMapView = false;
+  if (!keepView) map.fitBounds(straight, { padding: [40, 40] });
 
   const route = await fetchRoadRoute(p, d);
   if (!route || seq !== AppState.routeSeq) return;
   if (AppState.routeLine) map.removeLayer(AppState.routeLine);
-  AppState.routeLine = L.polyline(route.points, { color: '#FF7C00', weight: 5, opacity: 0.9 }).addTo(map);
-  map.fitBounds(AppState.routeLine.getBounds(), { padding: [40, 40] });
-  chip.textContent = `${route.km} km • ${route.minutes} min by road`;
+  AppState.routeLine = routeLine(route, '#FF7C00', 5, 0.9).addTo(map);
+  if (!keepView) map.fitBounds(AppState.routeLine.getBounds(), { padding: [40, 40] });
+  chip.textContent = route.estimated ? `About ${route.km} km • ~${route.minutes} min` : `${route.km} km • ${route.minutes} min by road`;
   chip.classList.remove('hidden');
   AppState.roadMinutes = route.minutes;
   if (AppState.quotes) updateServicesDisplay({ quotes: AppState.quotes });
@@ -2017,6 +2106,7 @@ async function updateLiveTracking(ride) {
   if (driverAt && AppState.activeMarkers.driver) AppState.activeMarkers.driver.setLatLng(driverAt);
 
   const target = rideTarget(ride);
+  setNavigateTarget(ride.is_rider === false ? target : null, target.arriving ? 'Navigate to pickup' : 'Navigate to drop');
   drawTripRoadRoute(ride);
   if (!driverAt) return;
   const km = distanceKm(driverAt[0], driverAt[1], target.lat, target.lng);
@@ -2031,8 +2121,8 @@ async function updateLiveTracking(ride) {
   const route = await fetchRoadRoute({ lat: driverAt[0], lng: driverAt[1] }, target);
   if (!route || !AppState.activeRide || AppState.activeRide.id !== ride.id) return;
   if (AppState.activeLeg) AppState.activeMap.removeLayer(AppState.activeLeg);
-  AppState.activeLeg = L.polyline(route.points, { color: '#2563EB', weight: 5, opacity: 0.85 }).addTo(AppState.activeMap);
-  sub.textContent = `${baseText} ${route.km} km away • about ${route.minutes} min`;
+  AppState.activeLeg = routeLine(route, '#2563EB', 5, 0.85).addTo(AppState.activeMap);
+  sub.textContent = `${baseText} ${route.estimated ? 'about ' : ''}${route.km} km away • about ${route.minutes} min`;
 }
 
 // The whole trip (pickup to destination) on real roads replaces the straight placeholder line.
@@ -2045,7 +2135,7 @@ async function drawTripRoadRoute(ride) {
     if (!trip || !AppState.activeRide || AppState.activeRide.id !== ride.id) return;
     AppState.tripRouteFor = ride.id;
     if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
-    AppState.activePolyline = L.polyline(trip.points, { color: '#FF7C00', weight: 5, opacity: 0.8 }).addTo(AppState.activeMap);
+    AppState.activePolyline = routeLine(trip, '#FF7C00', 5, 0.8).addTo(AppState.activeMap);
   } finally {
     AppState.tripRouteBusy = false;
   }
@@ -2811,6 +2901,7 @@ async function openDuringRideCockpit(routeId) {
     $('share-live-btn').classList.add('hidden');
     const completeBtn = $('complete-ride-btn');
     completeBtn.classList.toggle('hidden', !cockpit.is_host);
+    setNavigateTarget(cockpit.is_host ? { lat: cockpit.destination_lat, lng: cockpit.destination_lng } : null, 'Navigate to destination');
     completeBtn.disabled = cockpit.status !== 'in_progress';
 
     if (AppState.activeMap) {
@@ -2830,7 +2921,7 @@ async function openDuringRideCockpit(routeId) {
       fetchRoadRoute({ lat: oCoords[0], lng: oCoords[1] }, { lat: dCoords[0], lng: dCoords[1] }).then((road) => {
         if (!road || AppState.activeCockpitRouteId !== hostedId) return;
         if (AppState.activePolyline) AppState.activeMap.removeLayer(AppState.activePolyline);
-        AppState.activePolyline = L.polyline(road.points, { color: '#F59E0B', weight: 5, opacity: 0.85 }).addTo(AppState.activeMap);
+        AppState.activePolyline = routeLine(road, '#F59E0B', 5, 0.85).addTo(AppState.activeMap);
       });
     }
 

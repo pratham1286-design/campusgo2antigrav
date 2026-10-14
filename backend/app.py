@@ -12,9 +12,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, wraps
-from urllib.parse import urlsplit
 
-from flask import Flask, Response, g, jsonify, request
+from flask import Flask, Response, g, jsonify, request, send_from_directory
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -185,14 +184,10 @@ def _close_db(exc):
 
 
 # --- Map tiles ------------------------------------------------------------------
-# The public OpenStreetMap tile servers forbid heavy use. For real traffic set TILE_URL to a
-# tile provider (MapTiler, Stadia, Thunderforest, a self-hosted server...) and its attribution.
-TILE_URL = os.environ.get("TILE_URL", "").strip() or "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-TILE_ATTRIBUTION = os.environ.get("TILE_ATTRIBUTION", "").strip() or "&copy; OpenStreetMap contributors"
-_tile_host = urlsplit(TILE_URL.replace("{s}", "a")).netloc
-TILE_ORIGIN = f"https://{_tile_host}" if _tile_host else ""
-if "{s}" in TILE_URL:
-    TILE_ORIGIN = f"https://*.{_tile_host.split('.', 1)[1]}" if "." in _tile_host else TILE_ORIGIN
+# The map is drawn from two files of our own (frontend/maps/, cut from the Protomaps OpenStreetMap
+# build by maintenance/build_maps.sh): no outside tile server, API key or usage limit. The browser
+# reads them in small pieces (HTTP range requests), never whole.
+MAP_FILES = ("area.pmtiles", "streets.pmtiles")
 
 # --- Security headers ---------------------------------------------------------
 CONTENT_SECURITY_POLICY = "; ".join([
@@ -200,7 +195,7 @@ CONTENT_SECURITY_POLICY = "; ".join([
     "script-src 'self' https://checkout.razorpay.com https://*.razorpay.com",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
-    f"img-src 'self' data: {TILE_ORIGIN} https://*.razorpay.com",
+    "img-src 'self' data: https://*.razorpay.com",
     "connect-src 'self' https://*.razorpay.com",
     "frame-src https://api.razorpay.com https://checkout.razorpay.com",
     "object-src 'none'",
@@ -622,7 +617,7 @@ def sweep_stale(conn, force=False):
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                 ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
                 ".webmanifest": "application/manifest+json"}
-VERSIONED_ASSETS = ("app.js", "styles.css", "track.js", "leaflet.js", "leaflet.css")
+VERSIONED_ASSETS = ("app.js", "styles.css", "track.js", "leaflet.js", "leaflet.css", "protomaps-leaflet.js", "campus-map.js")
 PUBLIC_FILES = VERSIONED_ASSETS + ("sw.js", "manifest.webmanifest", "offline.html", "favicon.svg", "avatar-default.svg",
                                    "icon-192.png", "icon-512.png", "apple-touch-icon.png")
 _static_files = {}
@@ -693,6 +688,16 @@ def serve_static(name):
     return _static_response(name, versioned=bool(request.args.get("v")))
 
 
+@app.route("/maps/<name>")
+def map_file(name):
+    if name not in MAP_FILES:
+        raise ApiError("Not found", 404)
+    # conditional=True answers the Range requests the map reader makes; the file is refreshed
+    # only every few months, and the reader notices a new copy by its ETag.
+    return send_from_directory(os.path.join(FRONTEND_DIR, "maps"), name, mimetype="application/octet-stream",
+                               conditional=True, max_age=86400)
+
+
 @app.route("/.well-known/assetlinks.json")
 def android_asset_links():
     """Proves to Android that the Play Store app (a Trusted Web Activity) and this site have the same
@@ -721,8 +726,6 @@ def public_config():
         "security_hotline": CAMPUS_SECURITY_PHONE,
         "razorpay_enabled": payments.razorpay_configured(),
         "upi_enabled": bool(payments.upi_vpa()),
-        "tile_url": TILE_URL,
-        "tile_attribution": TILE_ATTRIBUTION,
     })
 
 

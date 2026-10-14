@@ -20,3 +20,4 @@ backend/campusgo.db-shm
 # Local dev server output
 backend/server.pid
 *.log
+maintenance/.cache/

@@ -91,16 +91,7 @@ services:
         sync: false
       - key: ANDROID_CERT_SHA256
         sync: false
-      # Map services. The free public OpenStreetMap servers forbid heavy use: for real traffic
-      # set a tile provider (TILE_URL + TILE_ATTRIBUTION) and hosted routing/search (OSRM_URL,
-      # NOMINATIM_URL). See .env.example.
-      - key: TILE_URL
-        sync: false
-      - key: TILE_ATTRIBUTION
-        sync: false
-      - key: GEOCODER_CONTACT
-        sync: false
-      - key: NOMINATIM_URL
-        sync: false
+      # Maps need no settings: map, place search and routes run inside the app. Optional:
+      # OSRM_URL for a self-hosted road router (see .env.example).
       - key: OSRM_URL
         sync: false

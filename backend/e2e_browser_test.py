@@ -4,14 +4,15 @@
     python e2e_browser_test.py                    (add --headed to watch it)
 
 It starts the app on the test suite's throwaway database and fake SMS gateway (test_support),
-fakes the GPS position, and replaces the outside map services (place search, road routes) with
-canned answers, so it needs no internet and touches no real data. Screenshots are saved to a
+fakes the GPS position, and gives place search a small index of its own; the map and routes
+never leave the app anyway, so it needs no internet and touches no real data. Screenshots are saved to a
 temp folder printed at the end. Exit code is 0 when every check passes.
 """
 import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -22,7 +23,6 @@ from unittest import mock
 from test_support import ADMIN_KEY, LPU_IDS, PHONES, last_otp, load_fixtures
 import geo  # noqa: E402
 from app import app  # noqa: E402
-from pricing_and_queue import haversine_distance_km  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="campusgo_e2e_")
@@ -32,25 +32,18 @@ UNI_MALL = {"lat": 31.2535, "lng": 75.7038}
 PORT = 5059
 BASE = f"http://127.0.0.1:{PORT}"
 HEADED = "--headed" in sys.argv
-PLACES = {
-    "sector": [{"lat": "30.7400", "lon": "76.7825", "name": "Sector 17 Plaza", "importance": 0.6,
-                "display_name": "Sector 17 Plaza, Chandigarh, India"}],
-    "elante": [{"lat": "30.7058", "lon": "76.8012", "name": "Elante Mall", "importance": 0.7,
-                "display_name": "Elante Mall, Industrial Area, Chandigarh, India"}],
-}
+PLACES = [
+    {"name": "Sector 17 Plaza", "label": "Marketplace", "area": "Chandigarh", "importance": 0.6, "lat": 30.7400, "lng": 76.7825},
+    {"name": "Elante Mall", "label": "Mall", "area": "Chandigarh", "importance": 0.7, "lat": 30.7058, "lng": 76.8012},
+]
 
 
-def fake_fetch(url):
-    """Stands in for Nominatim and OSRM."""
-    if "/search?" in url:
-        query = re.search(r"[?&]q=([^&]+)", url).group(1).lower()
-        return next((rows for key, rows in PLACES.items() if key in query), [])
-    m = re.search(r"/driving/([\d.\-]+),([\d.\-]+);([\d.\-]+),([\d.\-]+)", url)
-    a_lng, a_lat, b_lng, b_lat = (float(v) for v in m.groups())
-    km = haversine_distance_km(a_lat, a_lng, b_lat, b_lng)
-    mid = [(a_lng + b_lng) / 2 + 0.01, (a_lat + b_lat) / 2]
-    return {"routes": [{"distance": km * 1000, "duration": km / 40 * 3600,
-                        "geometry": {"coordinates": [[a_lng, a_lat], mid, [b_lng, b_lat]]}}]}
+def make_places_index():
+    path = os.path.join(TMP, "places.db")
+    db = sqlite3.connect(path)
+    geo.write_places(db, PLACES)
+    db.close()
+    return path
 
 
 def api(path, method="GET", body=None, token=None):
@@ -97,11 +90,12 @@ def main():
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)  # no request log lines
     load_fixtures()
-    geo.MIN_UPSTREAM_GAP = 0
+    geo.PLACES_DB = make_places_index()
+    os.environ.pop("OSRM_URL", None)  # routes are the built-in estimate
     server = make_server("127.0.0.1", PORT, app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    with mock.patch.object(geo, "_fetch_json", side_effect=fake_fetch), sync_playwright() as pw:
+    with mock.patch.object(geo, "_fetch_json", side_effect=AssertionError("no outside map service")), sync_playwright() as pw:
         try:
             browser = pw.chromium.launch(channel="chrome", headless=not HEADED)
         except Exception:
@@ -158,6 +152,19 @@ def main():
         page.wait_for_timeout(2500)
         check("fare quote works for the searched place", "₹" in page.locator("#selected-service-summary").inner_text())
         check("road route chip appears", page.locator("#route-info-chip").is_visible(), page.locator("#route-info-chip").inner_text())
+        check("rider is told the drop pin can be dragged", page.locator("#drop-pin-hint").is_visible())
+        before = page.evaluate("[AppState.customDrop.lat, AppState.customDrop.lng]")
+        box = page.locator(".leaflet-marker-draggable").bounding_box()
+        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x - 40, y + 30, steps=8)
+        page.mouse.up()
+        page.wait_for_timeout(2500)
+        after = page.evaluate("[AppState.customDrop.lat, AppState.customDrop.lng, AppState.customDrop.name]")
+        check("dragging the drop pin moves the destination", after[:2] != before, f"{before} -> {after}")
+        check("the moved destination keeps a readable name", "Sector 17" in after[2], after[2])
+        check("fare is re-quoted for the moved pin", "₹" in page.locator("#selected-service-summary").inner_text())
         shot(page, "rider_route")
 
         page.click("#find-ride-btn")

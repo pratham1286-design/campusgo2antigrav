@@ -1,17 +1,18 @@
-"""Place search and road routes for the map, fetched server-side.
+"""Place search and trip routes for the map, all answered on our own server.
 
-The browser never talks to the map services: the server does, so riders' IP addresses and
-searches aren't shared with them, the page needs no extra CSP origins, and the service area
-(200 km around LPU, as far as Chandigarh) is enforced here rather than trusted to the client.
+No outside map service is needed: search reads places.db, an index of the service area's
+named places built from OpenStreetMap by maintenance/build_places.py, and routes are an
+estimate from the straight-line distance. The service area (200 km around LPU, as far as
+Chandigarh) is enforced here rather than trusted to the client.
 
-Defaults use the public OpenStreetMap services, which are free but strictly rate limited
-(Nominatim: 1 request/second, and no heavy use). For real traffic point NOMINATIM_URL and
-OSRM_URL at a hosted or self-hosted instance.
+Optional upgrade: point OSRM_URL at a self-hosted OSRM server and routes follow real roads,
+falling back to the estimate whenever it doesn't answer.
 """
 import difflib
 import json
 import os
 import re
+import sqlite3
 import threading
 import urllib.parse
 import urllib.request
@@ -19,15 +20,10 @@ import urllib.request
 import shared
 from pricing_and_queue import LPU_CENTER as LPU, MAX_SERVICE_RADIUS_KM, haversine_distance_km
 
-# Bounding box that comfortably contains the service radius (about 2 degrees of latitude / 2.2 of longitude).
-_LAT_SPAN = MAX_SERVICE_RADIUS_KM / 111.0
-_LNG_SPAN = MAX_SERVICE_RADIUS_KM / (111.0 * 0.855)
-VIEWBOX = (LPU[1] - _LNG_SPAN, LPU[0] + _LAT_SPAN, LPU[1] + _LNG_SPAN, LPU[0] - _LAT_SPAN)  # left, top, right, bottom
-
-SEARCH_CACHE_TTL = 15 * 60
+PLACES_DB = os.environ.get("PLACES_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "places.db")
 ROUTE_CACHE_TTL = 60 * 60     # roads don't change by the hour
 UPSTREAM_TIMEOUT = 4
-MIN_UPSTREAM_GAP = 1.0        # Nominatim's policy: at most one request per second (for the whole app)
+ROAD_FACTOR = 1.3             # roads are rarely straight: typical road distance / straight-line distance
 # A slow map service must never tie up every request thread: at most this many calls to it run
 # at once per process, and a request that can't get a slot within a moment fails fast instead.
 _upstream_slots = threading.BoundedSemaphore(int(os.environ.get("MAP_UPSTREAM_CONCURRENCY", "3") or 3))
@@ -51,7 +47,7 @@ def _cache_key(parts):
 
 
 def _fetch_json(url):
-    # NOMINATIM_URL / OSRM_URL come from the environment; never let one open a local file.
+    # OSRM_URL comes from the environment; never let one open a local file.
     if not url.startswith(("https://", "http://")):
         raise GeoError("The map service is not configured correctly.")
     if not _upstream_slots.acquire(timeout=0.5):
@@ -91,47 +87,89 @@ def _score(query, name, importance, near_km):
     return 0.5 * similarity + 0.3 * min(1.0, float(importance or 0)) + 0.2 * proximity
 
 
+PLACES_SCHEMA = """
+    CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT, alt TEXT, label TEXT, area TEXT,
+                         importance REAL, lat REAL, lng REAL);
+    CREATE VIRTUAL TABLE places_fts USING fts5(name, alt, area, label, content='places', content_rowid='id',
+                                               tokenize='unicode61 remove_diacritics 2');
+"""
+
+
+def _joined(name):
+    """The name written as one word, so "lawgate" finds "Law Gate" and "greenvalley" "Green Valley"."""
+    words = re.findall(r"\w+", name.lower())
+    return "".join(words) if len(words) > 1 else ""
+
+
+def write_places(db, places):
+    """Fills an empty places index; places are dicts with the PLACES_SCHEMA columns."""
+    db.executescript(PLACES_SCHEMA)
+    db.executemany("INSERT INTO places (name, alt, label, area, importance, lat, lng) VALUES (?,?,?,?,?,?,?)",
+                   [(p["name"], " ; ".join(x for x in (p.get("alt", ""), _joined(p["name"])) if x),
+                     p.get("label", ""), p.get("area", ""), p.get("importance", 0.3), p["lat"], p["lng"]) for p in places])
+    db.execute("INSERT INTO places_fts (rowid, name, alt, area, label) SELECT id, name, alt, area, label FROM places")
+    db.commit()
+
+
+_local = threading.local()  # one read-only connection per thread
+
+
+def _places_db():
+    db = getattr(_local, "db", None)
+    if db is None:
+        if not os.path.exists(PLACES_DB):
+            raise GeoError("Place search is not set up yet.")
+        db = sqlite3.connect(f"file:{urllib.parse.quote(os.path.abspath(PLACES_DB))}?mode=ro", uri=True,
+                             check_same_thread=False)
+        _local.db = db
+    return db
+
+
+def close_places_db():
+    db = getattr(_local, "db", None)
+    if db is not None:
+        _local.db = None
+        db.close()
+
+
 def search_places(query, near=None, limit=6):
     """Suggestions for free-text destinations inside the service area, best match first."""
     query = clean_query(query)
-    if len(query) < 3:
+    words = re.findall(r"\w+", query.lower())
+    if len(query) < 3 or not words:
         return []
     anchor = near if near else LPU
-    key = _cache_key(("search", query.lower(), round(anchor[0], 1), round(anchor[1], 1)))
-    cached = shared.cache_get(key)
-    if cached is not None:
-        return cached
-    if not shared.acquire("nominatim", MIN_UPSTREAM_GAP):
-        raise GeoError("Searching too fast. Keep typing and suggestions will appear.")
+    # Every typed word must start a word of the name, other names, town or kind of place:
+    # "jal bus" finds "Jalandhar Bus Stand", "chandigarh bus stand" finds Chandigarh's bus stands.
+    match = " ".join(f'"{w}"*' for w in words[:6])
+    try:
+        rows = _places_db().execute(
+            "SELECT p.name, p.label, p.area, p.importance, p.lat, p.lng FROM places_fts f "
+            "JOIN places p ON p.id = f.rowid WHERE places_fts MATCH ? "
+            "ORDER BY bm25(places_fts, 10.0, 5.0, 1.0, 1.0) LIMIT 400", (match,)).fetchall()
+    except sqlite3.Error as exc:
+        raise GeoError("Place search is unavailable right now.") from exc
 
-    params = urllib.parse.urlencode({
-        "q": query, "format": "jsonv2", "countrycodes": "in", "limit": 10, "dedupe": 1,
-        "viewbox": ",".join(f"{v:.4f}" for v in VIEWBOX), "bounded": 1, "addressdetails": 0,
-    })
-    rows = _fetch_json(f"{_env('NOMINATIM_URL', 'https://nominatim.openstreetmap.org')}/search?{params}")
-    if not isinstance(rows, list):
-        raise GeoError("The map service returned an unexpected answer.")
-
-    results = []
-    for row in rows:
-        try:
-            lat, lng = float(row["lat"]), float(row["lon"])
-        except (KeyError, TypeError, ValueError):
-            continue
+    results, seen = [], set()
+    for name, label, area, importance, lat, lng in rows:
         if haversine_distance_km(lat, lng, LPU[0], LPU[1]) > MAX_SERVICE_RADIUS_KM:
             continue
-        full = clean_label(row.get("display_name"), 160)
-        title = clean_label(row.get("name") or full.split(",")[0], 80)
-        subtitle = clean_label(", ".join(full.split(",")[1:4]).strip(), 100)
-        score = _score(query, title or full, row.get("importance"), haversine_distance_km(lat, lng, anchor[0], anchor[1]))
-        results.append({"name": title or full, "detail": subtitle, "lat": round(lat, 6), "lng": round(lng, 6),
-                        "label": full[:120], "_score": score})
+        detail = ", ".join(x for x in (label, area if area and area != name else "") if x)
+        score = _score(query, name, importance, haversine_distance_km(lat, lng, anchor[0], anchor[1]))
+        results.append({"name": name, "detail": detail, "lat": lat, "lng": lng,
+                        "label": clean_label(f"{name}, {area}" if area and area != name else name), "_score": score})
     results.sort(key=lambda r: r["_score"], reverse=True)
+    picked = []
     for r in results:
+        key = (r["name"].lower(), round(r["lat"], 2), round(r["lng"], 2))  # one pin per place, not per OSM object
+        if key in seen:
+            continue
+        seen.add(key)
         r.pop("_score")
-    results = results[:limit]
-    shared.cache_put(key, results, SEARCH_CACHE_TTL)
-    return results
+        picked.append(r)
+        if len(picked) == limit:
+            break
+    return picked
 
 
 MAX_ROUTE_POINTS = 1500
@@ -150,7 +188,26 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
     if cached is not None:
         return cached
 
-    base = _env("OSRM_URL", "https://router.project-osrm.org")
+    base = _env("OSRM_URL", "")
+    if not base:
+        return estimated_route(a_lat, a_lng, b_lat, b_lng)
+    try:
+        result = _osrm_route(base, a_lat, a_lng, b_lat, b_lng)
+    except GeoError:
+        return estimated_route(a_lat, a_lng, b_lat, b_lng)
+    shared.cache_put(key, result, ROUTE_CACHE_TTL)
+    return result
+
+
+def estimated_route(a_lat, a_lng, b_lat, b_lng):
+    """A straight line with road-like distance and time, for when no routing server is set up."""
+    km = haversine_distance_km(a_lat, a_lng, b_lat, b_lng) * ROAD_FACTOR
+    speed = 20 if km < 5 else 30 if km < 30 else 50  # km/h: campus lanes, city traffic, highway
+    return {"points": [[round(a_lat, 5), round(a_lng, 5)], [round(b_lat, 5), round(b_lng, 5)]],
+            "km": round(km, 1), "minutes": max(1, round(km / speed * 60)), "estimated": True}
+
+
+def _osrm_route(base, a_lat, a_lng, b_lat, b_lng):
     url = (f"{base}/route/v1/driving/{a_lng:.5f},{a_lat:.5f};{b_lng:.5f},{b_lat:.5f}"
            "?overview=full&geometries=geojson")
     data = _fetch_json(url)
@@ -161,8 +218,6 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
             step = (len(coords) - 1) / (MAX_ROUTE_POINTS - 1)
             coords = [coords[round(i * step)] for i in range(MAX_ROUTE_POINTS)]
         points = [[round(lat, 5), round(lng, 5)] for lng, lat in coords]
-        result = {"points": points, "km": round(route["distance"] / 1000.0, 1), "minutes": max(1, round(route["duration"] / 60.0))}
+        return {"points": points, "km": round(route["distance"] / 1000.0, 1), "minutes": max(1, round(route["duration"] / 60.0))}
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise GeoError("No road route found between those points.") from exc
-    shared.cache_put(key, result, ROUTE_CACHE_TTL)
-    return result

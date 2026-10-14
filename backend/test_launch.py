@@ -114,7 +114,7 @@ class TestStoreListingPages(ClientMixin, unittest.TestCase):
         for leftover in ("pratham1286", "Harpreet", "PB08-CR-9912", "Jalandhar City Bus Stand", "Advance Simulation", "demo"):
             self.assertNotIn(leftover, page)
         self.assertEqual(set(self.client.get("/api/config").get_json()),
-                         {"security_hotline", "razorpay_enabled", "upi_enabled", "tile_url", "tile_attribution"})
+                         {"security_hotline", "razorpay_enabled", "upi_enabled"})
 
     def test_android_app_links_follow_the_play_console_values(self):
         self.assertEqual(self.get("/.well-known/assetlinks.json").status_code, 404)

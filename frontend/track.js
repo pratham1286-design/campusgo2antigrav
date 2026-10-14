@@ -11,7 +11,6 @@
   let map = null;
   let driverMarker = null;
   let routeDrawn = false;
-  let tileConfig = {};
   let timer = null;
 
   function setText(id, value) {
@@ -21,11 +20,7 @@
   function ensureMap(ride) {
     if (map) return;
     map = L.map('track-map').setView([ride.pickup_lat, ride.pickup_lng], 14);
-    map.attributionControl.setPrefix(false);
-    L.tileLayer(tileConfig.tile_url || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: tileConfig.tile_attribution || '&copy; OpenStreetMap contributors'
-    }).addTo(map);
+    addCampusBasemap(map);
     L.circleMarker([ride.pickup_lat, ride.pickup_lng], { radius: 8, color: '#10B981' }).addTo(map).bindTooltip('Pickup');
     L.circleMarker([ride.drop_lat, ride.drop_lng], { radius: 8, color: '#FF7C00' }).addTo(map).bindTooltip('Drop');
     map.fitBounds([[ride.pickup_lat, ride.pickup_lng], [ride.drop_lat, ride.drop_lng]], { padding: [30, 30] });
@@ -55,7 +50,9 @@
       ensureMap(ride);
       if (map && !routeDrawn && Array.isArray(ride.route_points) && ride.route_points.length > 1) {
         routeDrawn = true;
-        const line = L.polyline(ride.route_points, { color: '#FF7C00', weight: 5, opacity: 0.85 }).addTo(map);
+        // Two points means an estimated route (no routing server): a dashed straight line, not a road.
+        const estimated = ride.route_points.length === 2;
+        const line = L.polyline(ride.route_points, { color: '#FF7C00', weight: 5, opacity: 0.85, dashArray: estimated ? '8, 8' : null }).addTo(map);
         map.fitBounds(line.getBounds(), { padding: [30, 30] });
       }
       if (map && ride.driver_lat && ride.driver_lng) {
@@ -71,9 +68,6 @@
     }
   }
 
-  fetch('/api/config').then((r) => r.json()).then((cfg) => { tileConfig = cfg || {}; })
-    .catch(() => {}).finally(() => {
-      refresh();
-      timer = setInterval(() => { if (document.visibilityState !== 'hidden') refresh(); }, 15000);
-    });
+  refresh();
+  timer = setInterval(() => { if (document.visibilityState !== 'hidden') refresh(); }, 15000);
 })();

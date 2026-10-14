@@ -254,6 +254,7 @@
         <div class="map-wrapper">
           <div id="campus-map" class="map-canvas"></div>
           <div id="route-info-chip" class="route-info-chip hidden"></div>
+          <div id="drop-pin-hint" class="drop-pin-hint hidden"></div>
           
           <!-- Map Overlay Controls -->
           <div class="map-overlay-controls">
@@ -504,6 +505,10 @@
                      maxlength="4" autocomplete="off" placeholder="Rider's PIN" aria-label="Rider's 4-digit PIN">
               <button id="start-ride-btn" class="btn-primary-action">Start Ride</button>
             </div>
+            <a id="navigate-btn" class="navigate-btn hidden" target="_blank" rel="noopener">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2 4.5 20.3l.7.7L12 18l6.8 3 .7-.7z"/></svg>
+              <span>Navigate</span>
+            </a>
 
             <!-- Host / Driver Profile Card -->
             <div class="driver-profile-card">
@@ -816,6 +821,24 @@
         <h3 id="location-gate-title">Turn on location</h3>
         <p id="location-gate-msg" class="dialog-message"></p>
         <button id="location-gate-retry" type="button" class="dialog-btn dialog-btn-primary hidden">Try again</button>
+      </div>
+    </div>
+
+    <!-- Add to Home Screen: offered to every new account right after signup -->
+    <div id="install-sheet" class="install-sheet hidden" role="dialog" aria-modal="false" aria-labelledby="install-sheet-title">
+      <div class="install-sheet-card">
+        <div class="install-sheet-head">
+          <img src="icon-192.png" alt="" class="install-sheet-icon" width="48" height="48">
+          <div>
+            <h3 id="install-sheet-title">Add CampusGo to your home screen</h3>
+            <p class="install-sheet-msg">Open it in one tap, full screen, like any other app.</p>
+          </div>
+        </div>
+        <p id="install-sheet-steps" class="install-sheet-steps hidden"></p>
+        <div class="install-sheet-actions">
+          <button id="install-sheet-later" type="button" class="dialog-btn dialog-btn-secondary">Later</button>
+          <button id="install-sheet-btn" type="button" class="dialog-btn dialog-btn-primary">Add to Home Screen</button>
+        </div>
       </div>
     </div>
 
@@ -1137,6 +1160,8 @@
   </div>
 
   <script src="leaflet.js"></script>
+  <script src="protomaps-leaflet.js"></script>
+  <script src="campus-map.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

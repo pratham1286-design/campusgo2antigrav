@@ -1,0 +1,52 @@
+# CampusGo: our own places, added to search on top of OpenStreetMap.
+#
+# Use it for societies, colonies and spots riders ask for that OpenStreetMap doesn't have.
+# One place per line:   Name | Town | latitude, longitude
+#
+# To get the numbers: open Google Maps, long-press the society's main gate (phone) or
+# right-click it (laptop), and copy the two numbers it shows, e.g. 30.73291, 76.67532.
+# Lines starting with # are ignored, so a line stays switched off until you remove its #.
+# After editing, run:  python maintenance/build_places.py
+
+# Lines without a # are live. Pins without a Google Maps check may be a little off; riders can drag the
+# pin to the exact gate, and if you check one on Google Maps, replace its numbers.
+
+# --- Phagwara / LPU ---  (Law Gate, Green Valley and the PGs around LPU come from OpenStreetMap)
+# Urban Estate | Phagwara |
+# Model Town | Phagwara |
+# Hargobind Nagar | Phagwara |
+
+# --- Jalandhar ---
+Urban Estate Phase 1 | Jalandhar | 31.29229, 75.59316
+Urban Estate Phase 2 | Jalandhar | 31.29260, 75.58540
+Basti Sheikh | Jalandhar | 31.31538, 75.53472
+Dakoha | Jalandhar | 31.30879, 75.63971
+# Kalia Colony | Jalandhar |
+# Surya Enclave | Jalandhar |
+# Ekta Vihar | Jalandhar |
+# Lajpat Nagar | Jalandhar |
+# Shaheed Udham Singh Nagar | Jalandhar |
+# Ladowali Road | Jalandhar |
+
+# --- Mohali / Kharar ---  (each pinned at the centre of its sector)
+TDI City | Mohali | 30.73290, 76.67530
+JLPL Sector 82 | Mohali | 30.65497, 76.73298
+Hero Homes | Mohali | 30.68325, 76.69139
+IREO Rise | Mohali | 30.65741, 76.69513
+Mohali Hills (Emaar) | Mohali | 30.65500, 76.67900
+Gillco Valley | Kharar | 30.71037, 76.65333
+Shivalik City | Kharar | 30.72413, 76.65496
+Phase 7 (Sector 61) | Mohali | 30.70505, 76.72604
+DLF Hyde Park | New Chandigarh | 30.78110, 76.75460
+# Bestech Park View | Mohali |
+# Omaxe Cassia | New Chandigarh |
+# Ambika Florence | Mohali |
+
+# --- Zirakpur / Panchkula ---
+Peer Muchalla | Zirakpur | 30.66300, 76.84900
+Baltana | Zirakpur | 30.65700, 76.82300
+Mansa Devi Complex (MDC) | Panchkula | 30.72483, 76.85901
+# Maya Garden City | Zirakpur |
+# Pine Homes | Zirakpur |
+# Green Lotus | Zirakpur |
+# Marbella Grand | Zirakpur |

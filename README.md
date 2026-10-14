@@ -38,7 +38,8 @@ campusgo2antigrav/
 │   ├── app.py                 # Flask API: auth, rides, carpools, wallet, SOS, admin, static files
 │   ├── database.py            # Schema; SQLite (default) or PostgreSQL (DATABASE_URL)
 │   ├── shared.py              # Rate limits, caches, cluster-wide locks; memory or Redis (REDIS_URL)
-│   ├── geo.py                 # Place search and road routes (server-side, cached, throttled)
+│   ├── geo.py                 # Place search (local index) and trip routes (estimate, or OSRM)
+│   ├── places.db              # Place-search index built from OpenStreetMap (maintenance/)
 │   ├── payments.py            # UPI QR, Razorpay orders/signatures/webhook, one-time crediting
 │   ├── emergency_dispatch.py  # SMS gateways (Fast2SMS / Twilio) and the SOS message
 │   ├── pricing_and_queue.py   # Landmarks, trip rules, Campus Hop and CityLink pricing
@@ -51,7 +52,10 @@ campusgo2antigrav/
 │   ├── track.html, track.js             # Public live-trip page
 │   ├── privacy.html, terms.html         # Served at /privacy and /terms
 │   ├── manifest.webmanifest, sw.js, offline.html, favicon.svg, icon-*.png
-│   └── leaflet.js, leaflet.css          # Leaflet 1.9.4 (map library), served locally
+│   ├── leaflet.js, leaflet.css          # Leaflet 1.9.4 (map library), served locally
+│   ├── protomaps-leaflet.js, campus-map.js  # Draws the map from our own files
+│   └── maps/area.pmtiles, maps/streets.pmtiles  # The map of the service area (OpenStreetMap data)
+├── maintenance/               # Rebuilds the map files and place index every few months
 ├── render.yaml, Dockerfile, docker-compose.yml, .env.example
 └── requirements.txt, requirements-dev.txt
 ```
@@ -87,14 +91,14 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost/campusgo_test TEST_REDIS=fake
 
 `TEST_DATABASE_URL` must point at a throwaway database: its tables are wiped.
 
-**Browser test:** `python e2e_browser_test.py` (add `--headed` to watch). It opens Chrome as a rider, a driver and an off-campus rider with faked GPS and map services, and checks booking, the driver accepting, live tracking, the PIN start, top-ups, the account screen and account deletion. It exits non-zero if anything fails.
+**Browser test:** `python e2e_browser_test.py` (add `--headed` to watch). It opens Chrome as a rider, a driver and an off-campus rider with faked GPS, and checks booking, the driver accepting, live tracking, the PIN start, top-ups, the account screen and account deletion. It exits non-zero if anything fails.
 
 ---
 
 ## Deploying
 
 ### Render (recommended)
-`render.yaml` creates the web service (1–4 autoscaling instances), PostgreSQL and a Redis-compatible Key Value store (paid plans). It generates `SECRET_KEY` and `ADMIN_API_KEY`; set the rest in the dashboard: `PUBLIC_BASE_URL`, an SMS gateway, Razorpay live keys + `RAZORPAY_WEBHOOK_SECRET`, and for real traffic a map tile provider (`TILE_URL`, `TILE_ATTRIBUTION`) and hosted search/routing (`NOMINATIM_URL`, `OSRM_URL`, `GEOCODER_CONTACT`).
+`render.yaml` creates the web service (1–4 autoscaling instances), PostgreSQL and a Redis-compatible Key Value store (paid plans). It generates `SECRET_KEY` and `ADMIN_API_KEY`; set the rest in the dashboard: `PUBLIC_BASE_URL`, an SMS gateway, Razorpay live keys + `RAZORPAY_WEBHOOK_SECRET`. Maps need no settings or API keys.
 
 ### Docker
 `SECRET_KEY=... POSTGRES_PASSWORD=... docker compose up -d` runs the app with PostgreSQL and Redis. `.dockerignore` keeps tests, local databases and `.env` out of the image.
@@ -105,7 +109,7 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost/campusgo_test TEST_REDIS=fake
 - Set `TRUST_PROXY_HOPS` to the number of proxies in front of the app (1 on Render) so rate limits see real client IPs.
 - With `DATABASE_URL` (PostgreSQL) and `REDIS_URL` set, gunicorn runs several workers and instances can share state. Without them it falls back to SQLite and one worker. Keep `WEB_CONCURRENCY × DB_POOL_SIZE × instances` under the database's connection limit.
 - Razorpay webhook: in the Razorpay Dashboard (Account & Settings → Webhooks) add `https://your-domain/api/payments/razorpay/webhook` with the `payment.captured` event, and put its secret in `RAZORPAY_WEBHOOK_SECRET`.
-- The free OpenStreetMap tile, search and routing servers forbid heavy use. Switch to a provider before real traffic.
+- Maps use no outside service: the map, place search and route estimates ship with the app (OpenStreetMap data, credited on every map). Refresh them every few months with `maintenance/` (see its README).
 - Every setting is documented in `.env.example`.
 
 ## Admin operations
@@ -140,7 +144,7 @@ curl -H "$A" https://your-domain/api/admin/earnings                             
 The app is an installable web app (PWA). Both stores get a thin native shell around the live site, so app updates ship by deploying the server; no store update is needed.
 
 ### 1. Before submitting to either store
-- [ ] Deploy to production with an empty database and every setting above (live Razorpay keys, SMS gateway, map providers, `PUBLIC_BASE_URL` on HTTPS).
+- [ ] Deploy to production with an empty database and every setting above (live Razorpay keys, SMS gateway, `PUBLIC_BASE_URL` on HTTPS).
 - [ ] Fill in every `[BRACKETED]` value in `frontend/privacy.html` and `frontend/terms.html` (operator name, contact email, address, grievance officer, hosting provider, city) and have both reviewed by a lawyer.
 - [ ] **Reviewer account.** Set `REVIEW_LOGIN_PHONE` (a number you own) and `REVIEW_LOGIN_CODE` (6 digits), then sign up in the app with that number. To give it wallet money without paying: set `CAMPUSGO_UPI_VPA`, start a UPI top-up from that account, tap "I've Paid", and approve the order with the admin API.
 - [ ] Record a short video of a full ride (book → driver accepts → PIN → complete): a ride needs a second person at the pickup, so reviewers can't do it alone.
