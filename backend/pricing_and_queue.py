@@ -125,10 +125,12 @@ def validate_trip(scope: str, pickup_key: str, drop_key: str, pickup_lat=None, p
 
 # Campus Hop Flat Pricing Rules
 FLAT_CAMPUS_HOP = {
-    "bike": 15.0,
-    "scooty": 20.0,
-    "car": 35.0
+    "bike": 14.0,
+    "scooty": 14.0,
+    "car": 14.0
 }
+# Campus Hop drivers get the flat fare minus this fixed platform fee (₹14 fare -> ₹13 payout).
+CAMPUS_HOP_PLATFORM_FEE = 1.0
 
 # CityLink Dynamic Base Rates
 CITYLINK_PRICING = {

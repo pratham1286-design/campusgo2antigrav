@@ -38,7 +38,7 @@ class TestMoneyHoles(ClientMixin, unittest.TestCase):
 
     def test_direct_topup_endpoint_removed(self):
         headers = self.auth_headers("usr_student_kavya")
-        self.assertEqual(self.client.post("/api/wallet/topup", headers=headers, json={"amount": 5000}).status_code, 405)
+        self.assertIn(self.client.post("/api/wallet/topup", headers=headers, json={"amount": 5000}).status_code, (404, 405))
 
     def test_topup_amount_limits(self):
         headers = self.auth_headers("usr_student_kavya")

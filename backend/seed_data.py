@@ -16,6 +16,8 @@ def seed(if_empty=False):
         return
 
     # Clear existing demo data
+    cur.execute("DELETE FROM driver_payouts;")
+    cur.execute("DELETE FROM platform_earnings;")
     cur.execute("DELETE FROM sos_alerts;")
     cur.execute("DELETE FROM route_bookings;")
     cur.execute("DELETE FROM driver_routes;")

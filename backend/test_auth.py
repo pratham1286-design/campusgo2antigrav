@@ -120,7 +120,7 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 503)
 
     def test_old_password_login_is_gone(self):
-        self.assertEqual(self.client.post("/api/auth/login", json={"lpu_id": "12204592", "password": "x"}).status_code, 405)
+        self.assertIn(self.client.post("/api/auth/login", json={"lpu_id": "12204592", "password": "x"}).status_code, (404, 405))
 
 
 if __name__ == "__main__":

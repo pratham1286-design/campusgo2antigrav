@@ -3,3 +3,7 @@ werkzeug~=3.1
 itsdangerous~=2.2
 qrcode~=8.2
 gunicorn~=23.0
+# Production scale: PostgreSQL (DATABASE_URL) and Redis (REDIS_URL). Unused when those aren't set.
+psycopg[binary]~=3.2
+psycopg-pool~=3.2
+redis>=5.0,<9

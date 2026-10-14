@@ -14,9 +14,10 @@
 
 ### 2. 100% Server-Side Validated Pricing & Wallet
 - **Campus Hop (Flat Rates, on-campus trips only)**:
-  - 🏍️ **Bike**: Flat ₹15.00
-  - 🛵 **Scooty**: Flat ₹20.00
-  - 🚗 **Car**: Flat ₹35.00
+  - 🏍️ **Bike**: Flat ₹14.00
+  - 🛵 **Scooty**: Flat ₹14.00
+  - 🚗 **Car**: Flat ₹14.00
+  - The driver earns ₹13.00; the platform keeps a flat ₹1.00.
 - **CityLink (Dynamic Inter-City Commute)**:
   - Base fare + distance fare + peak rush surge multiplier. At least one end must be off campus.
   - Hubs from Kapurthala, Jalandhar and Phagwara along NH-44 through Goraya, Phillaur, Ludhiana, Khanna, Sirhind and Rajpura to Zirakpur, Kharar, Mohali and Chandigarh.
@@ -24,7 +25,7 @@
   - The fare is held from the wallet when a ride is booked and refunded in full if the rider cancels.
   - Returns `402 Payment Required` with the deficit if the balance is insufficient.
   - Every top-up is tied to a server-created payment order; the credited amount comes from that order, and each order or payment ID can be credited only once.
-  - The driver is paid 90% of the fare when the ride is completed.
+  - The driver is paid when the ride is completed: fare minus ₹1 on Campus Hop, 90% of the fare on CityLink.
 
 ### 3. Peak-Time Zone Queuing
 - Campus partitioned into 4 zones: `Zone-North` (Academic Blocks 30-38), `Zone-South` (Boys Hostels BH1-BH8), `Zone-Central` (Uni-Mall, Uni-Hospital), and `Zone-East` (Girls Hostels GH1-GH6, Law Gate, Main Gate).
@@ -45,14 +46,17 @@
 
 ## 🛠️ Tech Stack & Directory Structure
 
-- **Backend**: Python 3, Flask, SQLite3.
-- **Frontend**: Mobile-first web app with Leaflet.js and OpenStreetMap tiles.
+- **Backend**: Python 3, Flask, gunicorn. PostgreSQL + Redis in production; SQLite and in-memory state for local development.
+- **Frontend**: Mobile-first web app with Leaflet.js; map tiles from OpenStreetMap or any provider (`TILE_URL`).
 
 ```
 campusgo2antigrav/
 ├── backend/
 │   ├── app.py                 # Flask REST API, auth, rate limiting, matching & wallet
-│   ├── database.py            # SQLite schema, indexes and connection
+│   ├── database.py            # Schema, indexes, migrations; SQLite or PostgreSQL (DATABASE_URL)
+│   ├── shared.py              # Rate limits, caches, cluster-wide locks; memory or Redis (REDIS_URL)
+│   ├── geo.py                 # Place search and road routes (server-side, cached, throttled)
+│   ├── gunicorn.conf.py       # Workers/threads; several workers only with PostgreSQL + Redis
 │   ├── payments.py            # UPI QR, Razorpay orders/signatures, one-time crediting
 │   ├── emergency_dispatch.py  # SOS message and SMS gateways
 │   ├── pricing_and_queue.py   # Landmarks, flat hop rules, CityLink pricing
@@ -60,7 +64,8 @@ campusgo2antigrav/
 │   ├── test_support.py        # Test setup (temporary database)
 │   ├── test_campusgo.py       # Core flow tests
 │   ├── test_enhancements.py   # Payments / SOS / landmark tests
-│   └── test_security.py       # Regression tests for security fixes
+│   ├── test_security.py       # Regression tests for security fixes
+│   └── test_concurrency.py    # Simultaneous bookings: no oversold seats or overspent wallets
 ├── frontend/
 │   ├── index.html             # Single-page mobile app
 │   ├── styles.css
@@ -77,8 +82,13 @@ campusgo2antigrav/
 The tests create their own temporary database, so they never touch `backend/campusgo.db`.
 ```bash
 cd backend
-python -m unittest test_campusgo test_enhancements test_security
+python -m unittest test_auth test_campusgo test_enhancements test_geo test_safety test_security test_concurrency
 ```
+To run the same tests on PostgreSQL and through a Redis client (needs `requirements-dev.txt`):
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost/campusgo_test TEST_REDIS=fake python -m unittest ...
+```
+`TEST_DATABASE_URL` points at a throwaway database: its tables are wiped.
 
 ### 2. Start the server locally
 ```bash
@@ -111,18 +121,30 @@ Log in with the LPU ID and mobile number below, then enter the code shown on scr
 - **Demo data is opt-in.** `SEED_DEMO_DATA=1` creates the demo personas only when the database is empty. Demo personas sign in with an SMS code like everyone else (set `OTP_DEMO_MODE=1` locally to see the code in the reply).
 - **Payments.**
   - `PAYMENTS_DEMO_MODE=1` enables fake-money top-ups for demos. It is ignored whenever real Razorpay keys are configured.
-  - With `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` set, card top-ups use Razorpay Checkout and are credited only after the HMAC signature is verified.
-  - UPI has no automatic payment confirmation. When a user taps "I've Paid", the order waits for verification. With `ADMIN_API_KEY` set, list pending orders and approve or reject them after checking your bank statement:
+  - With `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` set, top-ups (UPI, cards, NetBanking) go through Razorpay Checkout and are added to the wallet automatically, with nobody approving them. A payment is credited once, by whichever of these sees it first:
+    - the browser's callback, after the HMAC signature is verified;
+    - the webhook `POST /api/payments/razorpay/webhook`. In the Razorpay Dashboard (Account & Settings > Webhooks) add `https://your-app/api/payments/razorpay/webhook` with the `payment.captured` event and put the secret you choose there in `RAZORPAY_WEBHOOK_SECRET`. It needs a public HTTPS address, so it does not fire on `localhost`;
+    - a status check with Razorpay (`POST /api/payments/razorpay/sync`) that the app runs when the user signs in, opens the top-up screen or closes the checkout. This works without a webhook.
+  - The plain UPI QR (paid straight into `CAMPUSGO_UPI_VPA`) has no automatic payment confirmation: a bank does not tell the app about money sent to a personal UPI ID. When a user taps "I've Paid", the order waits for verification. With `ADMIN_API_KEY` set, list pending orders and approve or reject them after checking your bank statement:
     ```bash
     curl -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/pending
     curl -X POST -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payments/<id>/approve
     ```
-- **Maps.** The home map draws the road route (distance and time) and moves nearby drivers as they drive. On CityLink the destination box searches any place or address inside the 200 km service area (as far as Chandigarh), ranking suggestions by how well they match what was typed, how well known the place is, and how close it is to the rider; the popular destinations are always listed and matched first. While a ride is active, the ride screen shows the driver's live position, the road to the pickup or drop and an ETA, refreshed every 5 seconds. The browser never calls the map services: the server does (`backend/geo.py`), so searches stay private and the service area is enforced server-side. The defaults are the free public OpenStreetMap servers (about one search per second); set `NOMINATIM_URL`, `OSRM_URL` and `GEOCODER_CONTACT` to use your own or a paid provider.
+  - Set `CAMPUSGO_UPI_VPA` to your own UPI ID: it is the account every UPI top-up is paid into.
+  - **Platform earnings.** Every completed trip records the platform's cut (₹1 per Campus Hop ride, 10% on CityLink). See the totals and recent trips at `GET /api/admin/earnings`.
+  - **Driver payouts.** Drivers withdraw their ride earnings (never topped-up money) to a UPI ID from the driver dashboard; the amount leaves their wallet at once. Send the money, then mark it paid with the bank's UTR, or reject it to return the money to their wallet:
+    ```bash
+    curl -H "X-Admin-Key: $ADMIN_API_KEY" https://your-app/api/admin/payouts/pending
+    curl -X POST -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" -d '{"utr":"412345678901"}' https://your-app/api/admin/payouts/<id>/paid
+    curl -X POST -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" -d '{"note":"wrong UPI ID"}' https://your-app/api/admin/payouts/<id>/reject
+    ```
+- **Maps.** The home map draws the road route (distance and time) and moves nearby drivers as they drive. On CityLink the destination box searches any place or address inside the 200 km service area (as far as Chandigarh), ranking suggestions by how well they match what was typed, how well known the place is, and how close it is to the rider; the popular destinations are always listed and matched first. While a ride is active, the ride screen shows the driver's live position, the road to the pickup or drop and an ETA, refreshed every 5 seconds. The browser never calls the map services: the server does (`backend/geo.py`), so searches stay private and the service area is enforced server-side. The defaults are the free public OpenStreetMap servers, which forbid heavy use: for real traffic set `TILE_URL` and `TILE_ATTRIBUTION` (map tiles), `OSRM_URL` (routes), `NOMINATIM_URL` (search) and `GEOCODER_CONTACT` to a paid or self-hosted provider. Search is held to one upstream request per second across all processes, routes are cached for an hour, and at most `MAP_UPSTREAM_CONCURRENCY` (default 3) calls to a map service run at once per process, so a slow map service can't tie up the server.
 - **Automated browser test.** `pip install -r requirements-dev.txt`, then `cd backend && python e2e_browser_test.py` (add `--headed` to watch). It starts the app on a throwaway database, opens Chrome as a rider, a driver and an off-campus rider, fakes their GPS and the map services, and checks 26 things end to end (location, destination search, route, booking, the driver choosing the ride, live tracking, starting the ride with the rider's PIN, prices and driver counts off campus, the bottom bar). Exits non-zero if anything fails.
-- **Single worker.** Rate-limit counters live in memory, so run one gunicorn worker (as the Procfile and Dockerfile do); they reset on restart.
+- **Scaling for peak hours.** Production runs on PostgreSQL (`DATABASE_URL`) and Redis (`REDIS_URL`). With both set, gunicorn runs several worker processes (`WEB_CONCURRENCY`, default 2 x CPU cores + 1) and you can run several app instances behind a load balancer; they share all state. Without them the app falls back to SQLite and in-memory limits, and `gunicorn.conf.py` keeps it to one worker. Keep `WEB_CONCURRENCY x DB_POOL_SIZE x instances` under the database's connection limit. Measured on a laptop with the request mix the app's polling produces (3,000 riders, 500 online drivers): one process handles about 300 requests/s; four processes on PostgreSQL about 900 requests/s at a 6 ms median (a peak of 3,000 active users needs roughly 500/s, and background tabs stop polling). Riders see and count only drivers within 5 km, looked up once per ~1 km map cell every few seconds, so the cost of polling doesn't grow with the number of riders. `/healthz` checks the database for load balancers.
+- **Static files.** Pages link `app.js`/`styles.css` with a content hash, so browsers and CDNs cache them for a year and still get a new release immediately; they are served from memory and gzip-compressed. A CDN in front (e.g. Cloudflare) takes this load off the app entirely.
 - **Local HTTPS for phone GPS.** Browsers only share location on `https://` or `localhost`. `pip install -r requirements-dev.txt`, then `HTTPS_DEV=1 HOST=0.0.0.0 python app.py`.
 - **SMS.** Without `FAST2SMS_API_KEY` or Twilio credentials, SOS alerts are recorded but no one is texted, and the app tells the user so.
 - **Reverse proxies.** Set `TRUST_PROXY_HOPS` to the number of proxies in front of the app (1 on Render) so rate limits use the real client IP. Set `PUBLIC_BASE_URL` so SOS tracking links use your public domain.
-- **SQLite persistence.** On Render's free plan the database is lost on every deploy or restart. For real persistence use a paid plan with a disk and set `DATABASE_PATH` (see `render.yaml`). Docker Compose persists only the `/app/data` directory, so rebuilt images always run the new code.
+- **Deploying.** `render.yaml` creates the web service (autoscaling 1-4 instances), a managed PostgreSQL database and a Key Value (Redis) store, all on paid plans; it explains how to fall back to a free single-instance demo. `docker compose up` runs the app with PostgreSQL and Redis. Migrations run once at start-up (`python backend/database.py`) and are safe when several processes start together.
 - **Headers.** Responses carry a strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff` and `strict-origin-when-cross-origin` referrers (OpenStreetMap needs a Referer to serve map tiles). The frontend never inserts server data as raw HTML.
 - See `.env.example` for every setting.

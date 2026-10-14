@@ -139,9 +139,9 @@ function $(id) {
 document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initModals();
+  await loadConfig();
   initMaps();
   initializeCustomLocationDropdowns();
-  await loadConfig();
   await loadLandmarks();
   detectUserLocation();
   initEventHandlers();
@@ -300,6 +300,7 @@ async function onLoginSuccess() {
   clearInterval(AppState.timers.driverPoll);
   AppState.timers.driverPoll = setInterval(pollDriverWork, 10000);
   await checkActiveRide();
+  syncRazorpayPayments();
 }
 
 // --- Driver polling ---
@@ -716,19 +717,38 @@ function initMaps() {
     return;
   }
 
-  AppState.homeMap = L.map('campus-map', { zoomControl: false, attributionControl: false }).setView(LPU_COORDS, 16);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  // The tile server comes from the server's config (TILE_URL), and its credit is always shown:
+  // map data licences require it.
+  const tiles = () => L.tileLayer((AppState.config && AppState.config.tile_url) || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(AppState.homeMap);
+    attribution: (AppState.config && AppState.config.tile_attribution) || '&copy; OpenStreetMap contributors'
+  });
+  AppState.homeMap = L.map('campus-map', { zoomControl: false }).setView(LPU_COORDS, 16);
+  AppState.homeMap.attributionControl.setPrefix(false);
+  tiles().addTo(AppState.homeMap);
   L.control.zoom({ position: 'bottomright' }).addTo(AppState.homeMap);
 
-  AppState.activeMap = L.map('active-tracking-map', { zoomControl: false, attributionControl: false }).setView(LPU_COORDS, 16);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(AppState.activeMap);
+  AppState.activeMap = L.map('active-tracking-map', { zoomControl: false }).setView(LPU_COORDS, 16);
+  AppState.activeMap.attributionControl.setPrefix(false);
+  tiles().addTo(AppState.activeMap);
 }
+
+// Polling pauses while the app is in a background tab, and catches up the moment it's back.
+function appHidden() {
+  return document.visibilityState === 'hidden';
+}
+
+function currentViewId() {
+  const view = document.querySelector('.app-view.active-view');
+  return view ? view.id : '';
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (appHidden() || !AppState.currentUser) return;
+  refreshNearbyDrivers();
+  if (AppState.activeRide && AppState.timers.track) trackActiveRide();
+  else if (AppState.timers.queue) checkActiveRide();
+});
 
 function renderMapFallback(elementId, label) {
   const mapElement = $(elementId);
@@ -1229,9 +1249,11 @@ function renderMapLandmarks() {
 
 // Shows drivers who are actually online and free, as reported by the server.
 async function refreshNearbyDrivers() {
-  if (!AppState.homeMap || !AppState.currentUser) return;
+  if (!AppState.homeMap || !AppState.currentUser || appHidden() || currentViewId() !== 'view-ride') return;
+  const from = pickupPlace() || AppState.userPosition;
+  const where = from ? `?lat=${Number(from.lat).toFixed(5)}&lng=${Number(from.lng).toFixed(5)}` : '';
   try {
-    const { ok, data } = await apiGet('/api/drivers/nearby');
+    const { ok, data } = await apiGet(`/api/drivers/nearby${where}`);
     if (!ok) return;
     AppState.availableDrivers = data.drivers;
     renderAvailableRiders();
@@ -1741,7 +1763,7 @@ async function handleBookRide() {
     return;
   }
   if (!quote.has_sufficient_balance) {
-    $('topup-custom-input').value = Math.ceil(quote.deficit + 20);
+    $('topup-custom-input').value = Math.ceil(quote.deficit);
     openModal('modal-topup');
     return;
   }
@@ -1761,7 +1783,7 @@ async function handleBookRide() {
 
     if (!ok) {
       if (status === 402) {
-        $('topup-custom-input').value = Math.ceil((data.deficit || 0) + 20);
+        $('topup-custom-input').value = Math.ceil(data.deficit || 0);
         openModal('modal-topup');
       } else if (data.code === 'CONCURRENT_RIDE_EXISTS') {
         showAlert('You already have a ride in progress. Check the Activity tab to view or cancel it.');
@@ -1800,7 +1822,7 @@ function renderQueueStatus(ride) {
 
   // Poll so the rider moves to the live view as soon as a driver accepts.
   if (!AppState.timers.queue) {
-    AppState.timers.queue = setInterval(checkActiveRide, 10000);
+    AppState.timers.queue = setInterval(() => { if (!appHidden()) checkActiveRide(); }, 10000);
   }
 }
 
@@ -2053,7 +2075,7 @@ async function trackActiveRide() {
     stopRideTracking();
     return;
   }
-  if (AppState.trackBusy) return;
+  if (AppState.trackBusy || appHidden()) return;
   AppState.trackBusy = true;
   try {
     const { ok, data } = await apiGet('/api/rides/active');
@@ -2400,10 +2422,27 @@ async function verifyRazorpayPayment(orderId, paymentId, signature) {
     setTopupStatus(data.error || 'Payment verification failed');
     return;
   }
+  showTopupCredited(data);
+}
+
+function showTopupCredited(data) {
   setWalletBalance(data.new_balance);
   closeModal('modal-topup');
   fetchFareQuotes();
   showAlert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
+}
+
+// Asks the server to check with Razorpay for payments this browser never heard back about
+// (tab closed, phone switched to the UPI app) and adds them to the wallet.
+async function syncRazorpayPayments() {
+  const cfg = AppState.config || {};
+  if (!AppState.currentUser || !cfg.razorpay_enabled || cfg.payments_demo_mode) return;
+  try {
+    const { ok, data } = await apiPost('/api/payments/razorpay/sync');
+    if (ok && data.amount_credited > 0) showTopupCredited(data);
+  } catch (err) {
+    console.error('Failed to check for completed payments:', err);
+  }
 }
 
 async function handleRazorpayCheckout() {
@@ -2435,7 +2474,8 @@ async function handleRazorpayCheckout() {
     name: order.merchant_name,
     description: 'CampusGo wallet top-up',
     prefill: { email: AppState.currentUser.email, contact: AppState.currentUser.phone },
-    handler: (resp) => verifyRazorpayPayment(resp.razorpay_order_id, resp.razorpay_payment_id, resp.razorpay_signature)
+    handler: (resp) => verifyRazorpayPayment(resp.razorpay_order_id, resp.razorpay_payment_id, resp.razorpay_signature),
+    modal: { ondismiss: syncRazorpayPayments }
   });
   checkout.on('payment.failed', (resp) => setTopupStatus(resp.error && resp.error.description ? resp.error.description : 'Payment failed'));
   checkout.open();
@@ -2446,9 +2486,18 @@ function configureTopupModal() {
   $('modal-current-bal').textContent = money(AppState.currentUser.wallet_balance);
   $('confirm-upi-label').textContent = cfg.payments_demo_mode ? 'Simulate Payment (Demo)' : "I've Paid";
   $('rzp-mode-badge').textContent = cfg.payments_demo_mode ? 'RAZORPAY DEMO MODE' : 'RAZORPAY SECURE CHECKOUT';
-  document.querySelector('.pay-method-tab[data-method="razorpay"]').classList.toggle('hidden', !cfg.razorpay_enabled);
+  const upiTab = document.querySelector('.pay-method-tab[data-method="upi"]');
+  const rzpTab = document.querySelector('.pay-method-tab[data-method="razorpay"]');
+  rzpTab.classList.toggle('hidden', !cfg.razorpay_enabled);
+  // The direct QR is always the first choice, but outside demo mode someone has to check the
+  // bank statement before it is credited; Razorpay is the instant one.
+  const upiInstant = Boolean(cfg.payments_demo_mode);
+  upiTab.querySelector('.tab-badge').classList.toggle('hidden', !upiInstant);
+  rzpTab.querySelector('.tab-badge').classList.toggle('hidden', upiInstant);
+  upiTab.querySelector('.tab-label').textContent = upiInstant ? 'UPI QR Code' : 'UPI QR (manual check)';
   setTopupStatus('');
   fetchUpiQr(currentTopupAmount());
+  syncRazorpayPayments();
 }
 
 // --- Driver dashboard ---
@@ -2460,6 +2509,8 @@ async function loadDriverEarnings() {
     $('driver-total-earned').textContent = money(data.total_earnings);
     $('driver-total-trips').textContent = data.total_trips;
     $('driver-rating-val').textContent = data.avg_rating.toFixed(1);
+    $('driver-withdrawable').textContent = money(data.withdrawable);
+    loadDriverPayouts();
     AppState.driverOnline = data.is_online;
     $('driver-online-toggle').checked = data.is_online;
     $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
@@ -2468,6 +2519,34 @@ async function loadDriverEarnings() {
   } catch (err) {
     console.error('Failed to load driver earnings:', err);
   }
+}
+
+async function loadDriverPayouts() {
+  const { ok, data } = await apiGet('/api/driver/payouts');
+  if (!ok) return;
+  $('driver-withdrawable').textContent = money(data.withdrawable);
+  const labels = { requested: 'Waiting to be paid', paid: 'Paid', rejected: 'Returned to wallet' };
+  $('driver-payouts-list').innerHTML = data.payouts.map((p) => `
+    <div class="veh-sub">₹${money(p.amount)} to ${esc(p.upi_id)} • ${labels[p.status] || esc(p.status)}${p.utr ? ` • UTR ${esc(p.utr)}` : ''}</div>
+  `).join('');
+}
+
+async function handleRequestPayout() {
+  const upiId = $('payout-upi-input').value.trim();
+  if (!upiId) {
+    showAlert('Enter the UPI ID the money should be sent to.');
+    return;
+  }
+  const amount = parseFloat($('driver-withdrawable').textContent) || 0;
+  if (!(await showConfirm(`Withdraw ₹${money(amount)} to ${upiId}?`))) return;
+  const { ok, data } = await apiPost('/api/driver/payouts', { upi_id: upiId, amount });
+  if (!ok) {
+    showAlert(data.error || 'Could not request the payout');
+    return;
+  }
+  setWalletBalance(data.wallet_balance);
+  showAlert(`Payout of ₹${money(data.amount)} requested. It will be sent to ${upiId} shortly.`);
+  loadDriverPayouts();
 }
 
 async function handleToggleOnline(event) {
@@ -2856,6 +2935,7 @@ function switchView(viewId) {
     loadDriverEarnings();
   } else if (viewId === 'view-ride' && AppState.homeMap) {
     setTimeout(() => AppState.homeMap.invalidateSize(), 150);
+    refreshNearbyDrivers();
   } else if (viewId === 'view-active-ride' && AppState.activeMap) {
     // The map was sized while hidden: fix its size, then frame the trip again.
     setTimeout(() => {
@@ -3015,6 +3095,7 @@ function initEventHandlers() {
 
   // Driver dashboard
   $('driver-online-toggle').addEventListener('change', handleToggleOnline);
+  $('request-payout-btn').addEventListener('click', handleRequestPayout);
   $('edit-vehicle-btn').addEventListener('click', openVehicleModal);
   $('submit-vehicle-btn').addEventListener('click', handleSaveVehicle);
   $('refresh-requests-btn').addEventListener('click', loadDriverRequests);

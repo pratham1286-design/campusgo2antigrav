@@ -1,3 +1,4 @@
 cryptography~=43.0  # only for HTTPS_DEV=1 local testing (self-signed cert)
 -r requirements.txt
 playwright~=1.48  # only for backend/e2e_browser_test.py (drives your installed Chrome or Edge)
+fakeredis>=2.20  # TEST_REDIS=fake runs the tests through a Redis client

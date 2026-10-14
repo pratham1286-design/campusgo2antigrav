@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 import geo
+import shared
 from test_support import ClientMixin
 
 NOMINATIM_ROWS = [
@@ -17,8 +18,7 @@ CITY_TRIP = {"pickup_key": "uni_mall", "drop_key": "custom_place", "scope": "cit
 class TestPlaceSearch(ClientMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        geo._cache.clear()
-        geo._last_upstream = 0.0
+        shared.reset_memory()
 
     def test_search_filters_to_service_area_and_ranks_by_match(self):
         with mock.patch.object(geo, "_fetch_json", return_value=NOMINATIM_ROWS):

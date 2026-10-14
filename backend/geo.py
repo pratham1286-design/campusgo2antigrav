@@ -13,10 +13,10 @@ import json
 import os
 import re
 import threading
-import time
 import urllib.parse
 import urllib.request
 
+import shared
 from pricing_and_queue import MAX_SERVICE_RADIUS_KM, haversine_distance_km
 
 LPU = (31.2536, 75.7037)
@@ -25,14 +25,13 @@ _LAT_SPAN = MAX_SERVICE_RADIUS_KM / 111.0
 _LNG_SPAN = MAX_SERVICE_RADIUS_KM / (111.0 * 0.855)
 VIEWBOX = (LPU[1] - _LNG_SPAN, LPU[0] + _LAT_SPAN, LPU[1] + _LNG_SPAN, LPU[0] - _LAT_SPAN)  # left, top, right, bottom
 
-CACHE_TTL = 15 * 60
-CACHE_MAX = 500
-UPSTREAM_TIMEOUT = 6
-MIN_UPSTREAM_GAP = 1.0   # Nominatim's policy: at most one request per second
-
-_lock = threading.Lock()
-_cache = {}
-_last_upstream = 0.0
+SEARCH_CACHE_TTL = 15 * 60
+ROUTE_CACHE_TTL = 60 * 60     # roads don't change by the hour
+UPSTREAM_TIMEOUT = 4
+MIN_UPSTREAM_GAP = 1.0        # Nominatim's policy: at most one request per second (for the whole app)
+# A slow map service must never tie up every request thread: at most this many calls to it run
+# at once per process, and a request that can't get a slot within a moment fails fast instead.
+_upstream_slots = threading.BoundedSemaphore(int(os.environ.get("MAP_UPSTREAM_CONCURRENCY", "3") or 3))
 
 
 class GeoError(Exception):
@@ -48,30 +47,21 @@ def _user_agent():
     return f"CampusGo/1.0 ({contact})" if contact else "CampusGo/1.0"
 
 
-def _cache_get(key):
-    with _lock:
-        hit = _cache.get(key)
-        if hit and time.time() - hit[0] < CACHE_TTL:
-            return hit[1]
-        _cache.pop(key, None)
-    return None
-
-
-def _cache_put(key, value):
-    with _lock:
-        if len(_cache) >= CACHE_MAX:
-            for k in sorted(_cache, key=lambda k: _cache[k][0])[: CACHE_MAX // 5]:
-                _cache.pop(k, None)
-        _cache[key] = (time.time(), value)
+def _cache_key(parts):
+    return "geo:" + ":".join(str(p) for p in parts)
 
 
 def _fetch_json(url):
+    if not _upstream_slots.acquire(timeout=0.5):
+        raise GeoError("The map service is busy right now. Please try again in a moment.")
     req = urllib.request.Request(url, headers={"User-Agent": _user_agent(), "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
             return json.loads(resp.read(512 * 1024).decode("utf-8"))
     except Exception as exc:
         raise GeoError("The map service is not responding. Please try again.") from exc
+    finally:
+        _upstream_slots.release()
 
 
 def clean_query(raw):
@@ -105,17 +95,12 @@ def search_places(query, near=None, limit=6):
     if len(query) < 3:
         return []
     anchor = near if near else LPU
-    key = ("search", query.lower(), round(anchor[0], 1), round(anchor[1], 1))
-    cached = _cache_get(key)
+    key = _cache_key(("search", query.lower(), round(anchor[0], 1), round(anchor[1], 1)))
+    cached = shared.cache_get(key)
     if cached is not None:
         return cached
-
-    global _last_upstream
-    with _lock:
-        now = time.time()
-        if now - _last_upstream < MIN_UPSTREAM_GAP:
-            raise GeoError("Searching too fast. Keep typing and suggestions will appear.")
-        _last_upstream = now
+    if not shared.acquire("nominatim", MIN_UPSTREAM_GAP):
+        raise GeoError("Searching too fast. Keep typing and suggestions will appear.")
 
     params = urllib.parse.urlencode({
         "q": query, "format": "jsonv2", "countrycodes": "in", "limit": 10, "dedupe": 1,
@@ -143,7 +128,7 @@ def search_places(query, near=None, limit=6):
     for r in results:
         r.pop("_score")
     results = results[:limit]
-    _cache_put(key, results)
+    shared.cache_put(key, results, SEARCH_CACHE_TTL)
     return results
 
 
@@ -158,8 +143,8 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
     for lat, lng in ((a_lat, a_lng), (b_lat, b_lng)):
         if haversine_distance_km(lat, lng, LPU[0], LPU[1]) > MAX_SERVICE_RADIUS_KM:
             raise GeoError("That point is outside our service area.")
-    key = ("route", round(a_lat, 3), round(a_lng, 3), round(b_lat, 3), round(b_lng, 3))
-    cached = _cache_get(key)
+    key = _cache_key(("route", round(a_lat, 3), round(a_lng, 3), round(b_lat, 3), round(b_lng, 3)))
+    cached = shared.cache_get(key)
     if cached is not None:
         return cached
 
@@ -177,7 +162,7 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
         result = {"points": points, "km": round(route["distance"] / 1000.0, 1), "minutes": max(1, round(route["duration"] / 60.0))}
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise GeoError("No road route found between those points.") from exc
-    _cache_put(key, result)
+    shared.cache_put(key, result, ROUTE_CACHE_TTL)
     return result
 
 

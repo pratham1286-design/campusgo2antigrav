@@ -5,22 +5,40 @@ import logging
 import math
 import os
 import re
+import gzip
 import secrets
-import sqlite3
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from functools import wraps
+from functools import lru_cache, wraps
+from urllib.parse import urlsplit
 
-from flask import Flask, g, jsonify, request, send_from_directory
+from flask import Flask, Response, g, jsonify, request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-import geo
-import payments
-from database import get_db_connection, init_db
+
+def _load_dotenv():
+    """Local runs read settings from the project's .env file (git-ignored). Real environment
+    variables always win, so hosted deployments are unaffected."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".env")
+    if os.environ.get("CAMPUSGO_NO_DOTENV") == "1" or not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            name, sep, value = line.strip().partition("=")
+            if sep and name and not name.startswith("#"):
+                os.environ.setdefault(name.strip(), value.strip().strip("\"'"))
+
+
+_load_dotenv()
+
+import geo  # noqa: E402
+import payments  # noqa: E402
+import shared
+from database import IntegrityError, begin_write, get_db_connection, init_db
 from emergency_dispatch import (
     CAMPUS_SECURITY_PHONE,
     dispatch_emergency_alert,
@@ -30,6 +48,7 @@ from emergency_dispatch import (
 )
 from payments import PaymentError
 from pricing_and_queue import (
+    CAMPUS_HOP_PLATFORM_FEE,
     CAMPUS_LANDMARKS,
     VALID_SERVICES,
     calculate_fare,
@@ -42,7 +61,8 @@ from pricing_and_queue import (
 log = logging.getLogger("campusgo")
 
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
-app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
+# Static files are served by serve_static() below (from memory, compressed, cache-friendly).
+app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # JSON bodies here are tiny
 
 # Behind a reverse proxy (Render, nginx) request.remote_addr is the proxy's IP,
@@ -155,12 +175,6 @@ def get_db():
     return g.db
 
 
-def begin_write(conn):
-    """Takes SQLite's write lock up front so read-check-write sequences on
-    balances and seats can't interleave with another request."""
-    conn.execute("BEGIN IMMEDIATE")
-
-
 @app.teardown_appcontext
 def _close_db(exc):
     conn = g.pop("db", None)
@@ -171,6 +185,16 @@ def _close_db(exc):
             conn.close()
 
 
+# --- Map tiles ------------------------------------------------------------------
+# The public OpenStreetMap tile servers forbid heavy use. For real traffic set TILE_URL to a
+# tile provider (MapTiler, Stadia, Thunderforest, a self-hosted server...) and its attribution.
+TILE_URL = os.environ.get("TILE_URL", "").strip() or "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+TILE_ATTRIBUTION = os.environ.get("TILE_ATTRIBUTION", "").strip() or "&copy; OpenStreetMap contributors"
+_tile_host = urlsplit(TILE_URL.replace("{s}", "a")).netloc
+TILE_ORIGIN = f"https://{_tile_host}" if _tile_host else ""
+if "{s}" in TILE_URL:
+    TILE_ORIGIN = f"https://*.{_tile_host.split('.', 1)[1]}" if "." in _tile_host else TILE_ORIGIN
+
 # --- Security headers ---------------------------------------------------------
 CONTENT_SECURITY_POLICY = "; ".join([
     "default-src 'self'",
@@ -179,7 +203,7 @@ CONTENT_SECURITY_POLICY = "; ".join([
     "style-src 'self' 'unsafe-inline' https://unpkg.com/leaflet@1.9.4/dist/ https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: https://*.tile.openstreetmap.org https://tile.openstreetmap.org "
-    "https://images.unsplash.com https://unpkg.com/leaflet@1.9.4/dist/ https://*.razorpay.com",
+    f"{TILE_ORIGIN} https://images.unsplash.com https://unpkg.com/leaflet@1.9.4/dist/ https://*.razorpay.com",
     "connect-src 'self' https://*.razorpay.com",
     "frame-src https://api.razorpay.com https://checkout.razorpay.com",
     "object-src 'none'",
@@ -200,8 +224,7 @@ def _security_headers(resp):
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
-    elif request.path.endswith((".js", ".css", ".html")) or request.path == "/":
-        # Always revalidate, so a browser never keeps running an old app.js.
+    elif "Cache-Control" not in resp.headers:
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
@@ -274,24 +297,14 @@ def as_bool(value):
 
 
 # --- Rate limiting --------------------------------------------------------------
-# In-memory and per process: counters reset on restart, and the app must run a single
-# worker (see Procfile/Dockerfile) or each worker would keep its own count.
-RATE_LIMIT_STORE = {}
-_RATE_LOCK = threading.Lock()
+# Counters live in Redis when REDIS_URL is set (shared by every process and server), otherwise
+# in this process's memory (single-worker deployments). See shared.py.
+RATE_LIMIT_STORE = shared.RATE_LIMIT_STORE
 
 
 def check_rate(key, max_requests, window_seconds):
-    now = time.time()
-    with _RATE_LOCK:
-        timestamps = [t for t in RATE_LIMIT_STORE.get(key, []) if now - t < window_seconds]
-        if len(timestamps) >= max_requests:
-            RATE_LIMIT_STORE[key] = timestamps
-            raise ApiError("Rate limit exceeded. Please wait a moment before trying again.", 429, "RATE_LIMITED")
-        timestamps.append(now)
-        RATE_LIMIT_STORE[key] = timestamps
-        if len(RATE_LIMIT_STORE) > 5000:
-            for k in [k for k, v in RATE_LIMIT_STORE.items() if not v or now - v[-1] > 3600]:
-                RATE_LIMIT_STORE.pop(k, None)
+    if not shared.hit(key, max_requests, window_seconds):
+        raise ApiError("Rate limit exceeded. Please wait a moment before trying again.", 429, "RATE_LIMITED")
 
 
 def rate_limit(max_requests=15, window_seconds=60):
@@ -306,6 +319,27 @@ def rate_limit(max_requests=15, window_seconds=60):
     return decorator
 
 
+# Each user's current token version, cached briefly so polling requests skip a database
+# round trip. Logging out clears it at once in the process that handled the logout; other
+# processes notice within TOKEN_CHECK_CACHE_SECONDS.
+TOKEN_CHECK_CACHE_SECONDS = 10
+_token_versions = {}
+
+
+def current_token_version(user_id):
+    now = time.time()
+    hit = _token_versions.get(user_id)
+    if hit and hit[0] > now:
+        return hit[1]
+    row = get_db().execute("SELECT token_version FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        return None
+    if len(_token_versions) > 100_000:
+        _token_versions.clear()
+    _token_versions[user_id] = (now + TOKEN_CHECK_CACHE_SECONDS, row["token_version"])
+    return row["token_version"]
+
+
 def require_auth(f):
     """Requires 'Authorization: Bearer <token>'. The acting user always comes
     from the token (request.auth_user_id), never from the request body."""
@@ -315,8 +349,7 @@ def require_auth(f):
         if not auth_header.startswith("Bearer "):
             raise ApiError("Authentication required", 401, "AUTH_REQUIRED")
         payload = verify_session_token(auth_header[7:])
-        row = get_db().execute("SELECT token_version FROM users WHERE id = ?", (payload["u"],)).fetchone() if payload else None
-        if not row or row["token_version"] != payload["v"]:
+        if not payload or current_token_version(payload["u"]) != payload["v"]:
             raise ApiError("Session expired or invalid, please log in again", 401, "AUTH_INVALID")
         request.auth_user_id = payload["u"]
         return f(*args, **kwargs)
@@ -338,7 +371,7 @@ def wallet_balance(conn, user_id):
     return row["balance"] if row else 0.0
 
 
-def debit_wallet(conn, user_id, amount, reference_id, description):
+def debit_wallet(conn, user_id, amount, reference_id, description, tx_type="fare_deduction"):
     """Atomically debits only if the balance covers it. Caller holds the write lock."""
     now = time.time()
     cur = conn.execute(
@@ -355,14 +388,15 @@ def debit_wallet(conn, user_id, amount, reference_id, description):
     new_bal = wallet_balance(conn, user_id)
     conn.execute("""
     INSERT INTO wallet_transactions (id, user_id, amount, type, reference_id, description, balance_after, created_at)
-    VALUES (?, ?, ?, 'fare_deduction', ?, ?, ?, ?)
-    """, (str(uuid.uuid4()), user_id, -amount, reference_id, description, new_bal, now))
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (str(uuid.uuid4()), user_id, -amount, tx_type, reference_id, description, new_bal, now))
     return new_bal
 
 
 def credit_wallet(conn, user_id, amount, tx_type, reference_id, description):
     now = time.time()
-    conn.execute("INSERT OR IGNORE INTO wallets (user_id, balance, updated_at) VALUES (?, 0, ?)", (user_id, now))
+    conn.execute("INSERT INTO wallets (user_id, balance, updated_at) VALUES (?, 0, ?) ON CONFLICT (user_id) DO NOTHING",
+                 (user_id, now))
     conn.execute("UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?", (amount, now, user_id))
     new_bal = wallet_balance(conn, user_id)
     conn.execute("""
@@ -507,6 +541,29 @@ def cancel_route_with_refunds(conn, route, why):
     return len(bookings)
 
 
+def driver_payout_for(scope, fare):
+    """Campus Hop keeps a flat platform fee; CityLink and carpools keep PLATFORM_SHARE."""
+    if scope == "campus_hop":
+        return round(max(0.0, fare - CAMPUS_HOP_PLATFORM_FEE), 2)
+    return round(fare * DRIVER_SHARE, 2)
+
+
+def record_platform_earning(conn, source, reference_id, scope, fare, payout, now):
+    conn.execute("""
+    INSERT INTO platform_earnings (id, source, reference_id, scope, fare, driver_payout, amount, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (str(uuid.uuid4()), source, reference_id, scope, fare, payout, round(fare - payout, 2), now))
+
+
+def withdrawable_balance(conn, user_id):
+    """Drivers can cash out what they earned, never money they topped up themselves."""
+    earned = conn.execute("""
+    SELECT COALESCE(SUM(amount), 0.0) AS total FROM wallet_transactions
+    WHERE user_id = ? AND type IN ('driver_payout', 'withdrawal')
+    """, (user_id,)).fetchone()["total"]
+    return round(max(0.0, min(earned, wallet_balance(conn, user_id))), 2)
+
+
 def settle_ride(conn, ride, now):
     """Completes a started ride and pays the driver. Returns the payout, or None if it had
     already moved on. Caller holds the write lock."""
@@ -521,8 +578,9 @@ def settle_ride(conn, ride, now):
     # Rides booked before that rule existed are charged now instead.
     if not fare_was_held(conn, ride):
         debit_wallet(conn, ride["rider_id"], ride["fare"], ride["id"], f"CampusGo Ride #{ride['id'][5:13]}")
-    payout = round(ride["fare"] * DRIVER_SHARE, 2)
+    payout = driver_payout_for(ride["scope"], ride["fare"])
     credit_wallet(conn, ride["driver_id"], payout, "driver_payout", ride["id"], f"Payout for Ride #{ride['id'][5:13]}")
+    record_platform_earning(conn, "ride", ride["id"], ride["scope"], ride["fare"], payout, now)
     return payout
 
 
@@ -541,6 +599,7 @@ def settle_route(conn, route, now):
     payout = round(revenue * DRIVER_SHARE, 2)
     if payout > 0:
         credit_wallet(conn, route["driver_id"], payout, "driver_payout", route["id"], f"Carpool Payout: {route['destination']}")
+        record_platform_earning(conn, "carpool", route["id"], "citylink", revenue, payout, now)
     conn.execute(
         "UPDATE route_bookings SET status = 'completed', completed_at = ? WHERE route_id = ? AND status = 'in_progress'",
         (now, route["id"]),
@@ -548,17 +607,13 @@ def settle_route(conn, route, now):
     return revenue, payout
 
 
-_last_sweep = 0.0
-
-
 def sweep_stale(conn, force=False):
     """Frees money and seats stuck in requests nobody served: queued rides older than
-    QUEUE_TTL and carpools long past their departure. Must run outside a transaction."""
-    global _last_sweep
-    now = time.time()
-    if not force and now - _last_sweep < SWEEP_INTERVAL_SECONDS:
+    QUEUE_TTL and carpools long past their departure. Must run outside a transaction.
+    Runs at most once per SWEEP_INTERVAL_SECONDS across all app processes."""
+    if not force and not shared.acquire("sweep", SWEEP_INTERVAL_SECONDS):
         return
-    _last_sweep = now
+    now = time.time()
     ride_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM rides WHERE status = 'queued' AND created_at < ?", (now - QUEUE_TTL_SECONDS,)).fetchall()]
     route_ids = [r["id"] for r in conn.execute(
@@ -593,14 +648,73 @@ def sweep_stale(conn, force=False):
 
 
 # --- Static pages -------------------------------------------------------------------
+# The few frontend files are read once and kept in memory with a gzip copy. Pages link the
+# JS/CSS with ?v=<content hash>, so browsers and CDNs cache those for a year and still pick
+# up a new release immediately; the pages themselves are revalidated with an ETag.
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+_static_files = {}
+_static_lock = threading.RLock()  # re-entered: a page loads its JS/CSS to version them
+
+
+def _load_static(name):
+    path = os.path.join(FRONTEND_DIR, name)
+    mtime = os.path.getmtime(path)
+    cached = _static_files.get(name)
+    if cached and cached["mtime"] == mtime:
+        return cached
+    with _static_lock:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if name.endswith(".html"):
+            text = data.decode("utf-8")
+            for asset in ("app.js", "styles.css", "track.js"):
+                version = _load_static(asset)["etag"].strip('"')
+                text = (text.replace(f'"{asset}"', f'"/{asset}?v={version}"')
+                            .replace(f'"/{asset}"', f'"/{asset}?v={version}"'))
+            data = text.encode("utf-8")
+        entry = {"mtime": mtime, "data": data, "gzip": gzip.compress(data, 6),
+                 "etag": '"' + hashlib.sha256(data).hexdigest()[:16] + '"',
+                 "type": STATIC_TYPES[os.path.splitext(name)[1]]}
+        _static_files[name] = entry
+        return entry
+
+
+def _static_response(name, versioned=False):
+    entry = _load_static(name)
+    headers = {"ETag": entry["etag"], "Vary": "Accept-Encoding",
+               "Cache-Control": "public, max-age=31536000, immutable" if versioned else "no-cache"}
+    if request.headers.get("If-None-Match") == entry["etag"]:
+        return Response(status=304, headers=headers)
+    body = entry["data"]
+    if "gzip" in request.headers.get("Accept-Encoding", "") and len(body) > 1024:
+        body = entry["gzip"]
+        headers["Content-Encoding"] = "gzip"
+    return Response(body, headers=headers, content_type=entry["type"])
+
+
 @app.route("/")
 def index():
-    return send_from_directory(FRONTEND_DIR, "index.html")
+    return _static_response("index.html")
 
 
 @app.route("/track/<share_token>")
 def track_page(share_token):
-    return send_from_directory(FRONTEND_DIR, "track.html")
+    return _static_response("track.html")
+
+
+@app.route("/<name>")
+def serve_static(name):
+    if name not in ("app.js", "styles.css", "track.js", "avatar-default.svg"):
+        raise ApiError("Not found", 404)
+    return _static_response(name, versioned=bool(request.args.get("v")))
+
+
+@app.route("/healthz")
+def healthz():
+    """For load balancers: the app is up and can reach its database."""
+    get_db().execute("SELECT 1").fetchone()
+    return jsonify({"status": "ok"})
 
 
 # --- Public config -------------------------------------------------------------------
@@ -617,6 +731,8 @@ def public_config():
         "demo_simulation": movement_simulation_enabled(),
         "min_topup": payments.MIN_TOPUP,
         "max_topup": payments.MAX_TOPUP,
+        "tile_url": TILE_URL,
+        "tile_attribution": TILE_ATTRIBUTION,
     })
 
 
@@ -849,7 +965,7 @@ def signup_verify():
         VALUES (?, ?, ?, '', ?, ?, 'rider', '', 1, 0, NULL, NULL, ?, ?, ?)
         """, (user_id, payload["lpu_id"], payload["name"], f"+91{key}", payload["user_type"],
               now, payload["username"], key))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         conn.rollback()
         raise ApiError("Someone just took that username, ID or number. Please start again.", 409, "SIGNUP_CONFLICT")
     conn.execute("INSERT INTO wallets (user_id, balance, currency, updated_at) VALUES (?, 0, 'INR', ?)", (user_id, now))
@@ -901,6 +1017,7 @@ def logout():
     conn = get_db()
     conn.execute("UPDATE users SET token_version = token_version + 1 WHERE id = ?", (request.auth_user_id,))
     conn.commit()
+    _token_versions.pop(request.auth_user_id, None)
     return jsonify({"success": True})
 
 
@@ -1053,25 +1170,78 @@ def locate():
     return jsonify({"nearest_key": key, "landmark": landmark, "distance_km": round(distance, 2)})
 
 
-@app.route("/api/drivers/nearby", methods=["GET"])
-@require_auth
-def nearby_drivers():
-    """Online, free drivers for the home map (no contact details)."""
-    rows = get_db().execute("""
+NEARBY_RADIUS_KM = 5.0       # drivers further than this from the rider aren't shown or counted
+NEARBY_LIMIT = 40            # at most this many markers per map
+NEARBY_CACHE_SECONDS = 4     # riders in the same ~1 km cell share one database query
+_nearby_cache = {}
+_nearby_lock = threading.Lock()
+
+
+@lru_cache(maxsize=20000)
+def driver_public_key(driver_id):
+    """Lets the map move a driver's marker instead of redrawing it, without revealing the account id."""
+    return hmac.new(OTP_HMAC_KEY, driver_id.encode(), hashlib.sha256).hexdigest()[:10]
+
+
+def _drivers_in_cell(conn, lat, lng):
+    """Free, online drivers around a ~1 km map cell, cached for a few seconds and shared by
+    every rider in that cell, so polling cost doesn't grow with the number of riders."""
+    cell = (round(lat, 2), round(lng, 2))
+    now = time.time()
+    hit = _nearby_cache.get(cell)
+    if hit and hit[0] > now:
+        return hit[1]
+    reach = NEARBY_RADIUS_KM + 1.0  # covers anyone inside the cell
+    dlat = reach / 111.0
+    dlng = reach / (111.0 * max(0.2, math.cos(math.radians(cell[0]))))
+    rows = conn.execute("""
     SELECT dl.driver_id, dl.lat, dl.lng, v.category, u.name
     FROM driver_locations dl
     JOIN users u ON u.id = dl.driver_id
     JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
-    WHERE dl.is_online = 1 AND dl.updated_at >= ?
-      AND dl.driver_id != ?
-      AND dl.driver_id NOT IN (SELECT driver_id FROM rides
-                               WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
-    """, (fresh_cutoff(), request.auth_user_id)).fetchall()
-    # "key" lets the map move a driver's marker instead of redrawing it, without revealing the account id.
-    drivers = [{"key": hmac.new(OTP_HMAC_KEY, r["driver_id"].encode(), hashlib.sha256).hexdigest()[:10],
-                "lat": r["lat"], "lng": r["lng"], "category": r["category"],
+    WHERE dl.is_online = 1 AND dl.lat BETWEEN ? AND ? AND dl.lng BETWEEN ? AND ? AND dl.updated_at >= ?
+      AND NOT EXISTS (SELECT 1 FROM rides r WHERE r.driver_id = dl.driver_id
+                      AND r.status IN ('matched', 'arriving', 'in_progress'))
+      AND NOT EXISTS (SELECT 1 FROM driver_routes dr WHERE dr.driver_id = dl.driver_id AND dr.status = 'in_progress')
+    """, (cell[0] - dlat, cell[0] + dlat, cell[1] - dlng, cell[1] + dlng, fresh_cutoff())).fetchall()
+    drivers = [{"id": r["driver_id"], "lat": r["lat"], "lng": r["lng"], "category": r["category"],
                 "first_name": (r["name"] or "Driver").split()[0]} for r in rows]
-    return jsonify({"drivers": drivers})
+    with _nearby_lock:
+        if len(_nearby_cache) > 5000:
+            for k in [k for k, v in _nearby_cache.items() if v[0] <= now]:
+                _nearby_cache.pop(k, None)
+        _nearby_cache[cell] = (now + NEARBY_CACHE_SECONDS, drivers)
+    return drivers
+
+
+def drivers_near(conn, lat, lng, exclude_id=None, limit=NEARBY_LIMIT):
+    """Free online drivers within NEARBY_RADIUS_KM of a point, nearest first."""
+    found = []
+    for d in _drivers_in_cell(conn, lat, lng):
+        if d["id"] == exclude_id:
+            continue
+        km = haversine_distance_km(lat, lng, d["lat"], d["lng"])
+        if km <= NEARBY_RADIUS_KM:
+            found.append((km, d))
+    found.sort(key=lambda pair: pair[0])
+    return [d for _, d in found[:limit]] if limit else [d for _, d in found]
+
+
+@app.route("/api/drivers/nearby", methods=["GET"])
+@require_auth
+def nearby_drivers():
+    """Online, free drivers near the rider for the home map (no contact details)."""
+    try:
+        lat = float(request.args.get("lat", geo.LPU[0]))
+        lng = float(request.args.get("lng", geo.LPU[1]))
+    except ValueError:
+        raise ApiError("Invalid position")
+    if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
+        raise ApiError("Invalid position")
+    drivers = [{"key": driver_public_key(d["id"]), "lat": d["lat"], "lng": d["lng"], "category": d["category"],
+                "first_name": d["first_name"]}
+               for d in drivers_near(get_db(), lat, lng, exclude_id=request.auth_user_id)]
+    return jsonify({"drivers": drivers, "radius_km": NEARBY_RADIUS_KM})
 
 
 # --- Map services -----------------------------------------------------------------------------
@@ -1132,15 +1302,10 @@ def get_ride_quote():
     balance = wallet_balance(conn, request.auth_user_id)
     demand = _demand(conn, pickup["zone"])
 
+    nearby = drivers_near(conn, pickup["lat"], pickup["lng"], exclude_id=request.auth_user_id, limit=None)
     quotes = {}
     for service in VALID_SERVICES:
-        drivers = conn.execute("""
-        SELECT COUNT(*) AS n FROM driver_locations dl
-        JOIN vehicles v ON dl.driver_id = v.user_id AND v.is_active = 1
-        WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND dl.driver_id != ?
-          AND dl.driver_id NOT IN (SELECT driver_id FROM rides
-                                   WHERE status IN ('matched', 'arriving', 'in_progress') AND driver_id IS NOT NULL)
-        """, (fresh_cutoff(), service, request.auth_user_id)).fetchone()["n"]
+        drivers = sum(1 for d in nearby if d["category"] == service)
         fare = calculate_fare(service, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"], pickup["zone"], demand)
         fare["available_drivers"] = drivers
         fare["has_sufficient_balance"] = balance >= fare["total_fare"]
@@ -1205,11 +1370,9 @@ def book_ride():
         is_priority, f"share_{secrets.token_urlsafe(16)}", now, None, f"{secrets.randbelow(10000):04d}",
     ))
     position = queue_position(conn, pickup["zone"], is_priority, now)
-    waiting_drivers = conn.execute("""
-    SELECT COUNT(*) AS n FROM driver_locations dl JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
-    WHERE dl.is_online = 1 AND dl.updated_at >= ? AND v.category = ? AND dl.driver_id != ?
-    """, (fresh_cutoff(), service_type, rider_id)).fetchone()["n"]
     conn.commit()
+    waiting_drivers = sum(1 for d in drivers_near(conn, pickup["lat"], pickup["lng"], exclude_id=rider_id, limit=None)
+                          if d["category"] == service_type)
     return jsonify({
         "success": True,
         "ride_id": ride_id,
@@ -1262,19 +1425,26 @@ def get_active_ride():
 @require_auth
 @rate_limit(max_requests=30, window_seconds=60)
 def report_driver_location():
-    """The driver's phone reports its real GPS position. This is the only thing that
-    moves a driver on the map, starts a pickup, or lets a trip be completed."""
+    """The driver's phone reports its real GPS position. This is the only thing that moves a
+    driver on the map, and what the pickup and drop-off checks rely on. Two database round
+    trips in the usual case: drivers send this every 15 seconds."""
     lat, lng = get_coordinates(body())
     driver_id = request.auth_user_id
     conn = get_db()
-    begin_write(conn)
     now = time.time()
+    state = conn.execute("""
+    SELECT dl.lat, dl.lng, dl.updated_at,
+           (SELECT status FROM rides WHERE driver_id = ? AND status IN ('matched', 'arriving', 'in_progress') LIMIT 1)
+               AS ride_status,
+           (SELECT 1 FROM driver_routes WHERE driver_id = ? AND status = 'in_progress' LIMIT 1) AS hosting
+    FROM (SELECT 1) AS one LEFT JOIN driver_locations dl ON dl.driver_id = ?
+    """, (driver_id, driver_id, driver_id)).fetchone()
+    busy = bool(state["ride_status"] or state["hosting"])
     # While driving someone, a position that jumps further than any vehicle could travel is a
     # spoofed or broken fix: it must not be able to reach a pickup or drop-off point.
-    prev = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
-    if prev and prev["updated_at"] and now - prev["updated_at"] < 600 and driver_is_busy(conn, driver_id):
-        jump_km = haversine_distance_km(prev["lat"], prev["lng"], lat, lng)
-        hours = max(now - prev["updated_at"], 1.0) / 3600
+    if busy and state["updated_at"] and now - state["updated_at"] < 600:
+        jump_km = haversine_distance_km(state["lat"], state["lng"], lat, lng)
+        hours = max(now - state["updated_at"], 1.0) / 3600
         if jump_km > 1.0 and jump_km / hours > MAX_PLAUSIBLE_SPEED_KMH:
             raise ApiError("Your GPS position jumped too far. Waiting for a steady location fix.", 409, "GPS_JUMP")
     conn.execute("""
@@ -1282,17 +1452,12 @@ def report_driver_location():
     VALUES (?, 0, ?, ?, 'Zone-Central', 0.0, ?)
     ON CONFLICT(driver_id) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, updated_at = excluded.updated_at
     """, (driver_id, lat, lng, now))
-
-    ride = conn.execute(
-        "SELECT status FROM rides WHERE driver_id = ? AND status IN ('matched', 'arriving', 'in_progress') LIMIT 1",
-        (driver_id,),
-    ).fetchone()
-    # Reaching the pickup does not start the ride: the rider's PIN does (see /start).
-    status = ride["status"] if ride else None
-    conn.execute("UPDATE driver_routes SET current_lat = ?, current_lng = ? WHERE driver_id = ? AND status = 'in_progress'",
-                 (lat, lng, driver_id))
+    if state["hosting"]:
+        conn.execute("UPDATE driver_routes SET current_lat = ?, current_lng = ? WHERE driver_id = ? AND status = 'in_progress'",
+                     (lat, lng, driver_id))
     conn.commit()
-    return jsonify({"success": True, "ride_status": status})
+    # Reaching the pickup does not start the ride: the rider's PIN does (see /start).
+    return jsonify({"success": True, "ride_status": state["ride_status"]})
 
 
 @app.route("/api/rides/<ride_id>/telemetry-step", methods=["POST"])
@@ -1450,7 +1615,7 @@ def rate_ride(ride_id):
         INSERT INTO ride_reviews (id, ride_id, reviewer_id, reviewee_id, rating, tags, comment, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(uuid.uuid4()), ride_id, reviewer_id, reviewee_id, rating, tags, comment, time.time()))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise ApiError("You have already rated this ride", 409, "ALREADY_RATED")
     conn.commit()
     return jsonify({"success": True})
@@ -1606,9 +1771,9 @@ def toggle_driver_online():
     VALUES (:driver, :online, :lat, :lng, :zone, 0.0, :now)
     ON CONFLICT(driver_id) DO UPDATE SET
         is_online = excluded.is_online, zone = excluded.zone,
-        lat = CASE WHEN :fix THEN excluded.lat ELSE driver_locations.lat END,
-        lng = CASE WHEN :fix THEN excluded.lng ELSE driver_locations.lng END,
-        updated_at = CASE WHEN :fix THEN excluded.updated_at ELSE driver_locations.updated_at END
+        lat = CASE WHEN :fix = 1 THEN excluded.lat ELSE driver_locations.lat END,
+        lng = CASE WHEN :fix = 1 THEN excluded.lng ELSE driver_locations.lng END,
+        updated_at = CASE WHEN :fix = 1 THEN excluded.updated_at ELSE driver_locations.updated_at END
     """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng, "zone": zone,
           "now": time.time() if has_fix else 0.0, "fix": 1 if has_fix else 0})
     conn.commit()
@@ -1621,10 +1786,17 @@ def get_driver_requests():
     """Queued requests this driver's vehicle can serve, teachers first."""
     conn = get_db()
     sweep_stale(conn)
-    vehicle = require_vehicle(conn, request.auth_user_id)
-    online = conn.execute("SELECT is_online FROM driver_locations WHERE driver_id = ?", (request.auth_user_id,)).fetchone()
-    if not (online and online["is_online"]):
+    # Vehicle, online status and last position in one round trip.
+    me = conn.execute("""
+    SELECT v.category, dl.is_online, dl.lat, dl.lng, dl.updated_at
+    FROM vehicles v LEFT JOIN driver_locations dl ON dl.driver_id = v.user_id
+    WHERE v.user_id = ? AND v.is_active = 1
+    """, (request.auth_user_id,)).fetchone()
+    if not me:
+        raise ApiError("Register a vehicle in your profile before driving.", 403, "VEHICLE_REQUIRED")
+    if not me["is_online"]:
         return jsonify({"requests": [], "offline": True})
+    vehicle = me
     rows = conn.execute("""
     SELECT r.id, r.service_type, r.scope, r.pickup_name, r.pickup_zone, r.drop_name, r.fare,
            r.pickup_lat, r.pickup_lng, r.drop_lat, r.drop_lng,
@@ -1635,7 +1807,6 @@ def get_driver_requests():
     ORDER BY r.is_priority DESC, r.created_at ASC
     LIMIT 25
     """, (vehicle["category"], request.auth_user_id)).fetchall()
-    me = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (request.auth_user_id,)).fetchone()
     has_fix = bool(me and time.time() - me["updated_at"] <= LOCATION_MAX_AGE_SECONDS)
     requests_out = []
     for r in rows:
@@ -1644,7 +1815,7 @@ def get_driver_requests():
         item["distance_to_pickup_km"] = round(haversine_distance_km(me["lat"], me["lng"], item.pop("pickup_lat"), item.pop("pickup_lng")), 1) if has_fix else None
         item.pop("drop_lat"), item.pop("drop_lng")
         item["rider_name"] = (item["rider_name"] or "Rider").split()[0]
-        item["driver_payout"] = round(item["fare"] * DRIVER_SHARE, 2)
+        item["driver_payout"] = driver_payout_for(item["scope"], item["fare"])
         requests_out.append(item)
     return jsonify({"requests": requests_out})
 
@@ -1699,7 +1870,57 @@ def get_driver_earnings():
         "review_count": rating["review_count"],
         "is_online": bool(loc and loc["is_online"]),
         "has_vehicle": active_vehicle(conn, driver_id) is not None,
+        "withdrawable": withdrawable_balance(conn, driver_id),
     })
+
+
+UPI_ID_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}@[A-Za-z][A-Za-z0-9.-]{1,32}$")
+MIN_PAYOUT = 1.0
+
+
+@app.route("/api/driver/payouts", methods=["GET"])
+@require_auth
+def list_driver_payouts():
+    conn = get_db()
+    rows = conn.execute("""
+    SELECT id, amount, upi_id, status, utr, note, created_at, settled_at FROM driver_payouts
+    WHERE driver_id = ? ORDER BY created_at DESC LIMIT 20
+    """, (request.auth_user_id,)).fetchall()
+    return jsonify({"withdrawable": withdrawable_balance(conn, request.auth_user_id), "payouts": [dict(r) for r in rows]})
+
+
+@app.route("/api/driver/payouts", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=5, window_seconds=60)
+def request_driver_payout():
+    """Moves earnings out of the wallet into a payout request. The admin sends the money by UPI
+    and marks it paid; a rejected request returns the money to the wallet."""
+    data = body()
+    upi_id = get_text(data, "upi_id", required=True, max_len=100, label="UPI ID")
+    if not UPI_ID_RE.match(upi_id):
+        raise ApiError("Enter a valid UPI ID, like name@okaxis")
+    conn = get_db()
+    begin_write(conn)
+    driver_id = request.auth_user_id
+    if conn.execute("SELECT 1 FROM driver_payouts WHERE driver_id = ? AND status = 'requested'", (driver_id,)).fetchone():
+        raise ApiError("You already have a payout request waiting to be paid.", 409, "PAYOUT_PENDING")
+    available = withdrawable_balance(conn, driver_id)
+    if available < MIN_PAYOUT:
+        raise ApiError("You have no ride earnings to withdraw yet.", 402, "INSUFFICIENT_EARNINGS", withdrawable=available)
+    amount = get_number(data, "amount", default=available, lo=MIN_PAYOUT, hi=100000, label="amount")
+    amount = round(amount, 2)
+    if amount > available:
+        raise ApiError(f"You can withdraw up to ₹{available:.2f} of your ride earnings.", 402, "INSUFFICIENT_EARNINGS",
+                       withdrawable=available)
+    payout_id = f"wd_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    new_bal = debit_wallet(conn, driver_id, amount, payout_id, f"Payout to {upi_id}", tx_type="withdrawal")
+    conn.execute("""
+    INSERT INTO driver_payouts (id, driver_id, amount, upi_id, status, created_at) VALUES (?, ?, ?, ?, 'requested', ?)
+    """, (payout_id, driver_id, amount, upi_id, now))
+    conn.commit()
+    return jsonify({"success": True, "payout_id": payout_id, "amount": amount, "status": "requested",
+                    "wallet_balance": round(new_bal, 2)})
 
 
 # --- CityLink scheduled carpools -------------------------------------------------------------
@@ -2013,7 +2234,7 @@ def get_user_active_session():
         SELECT route_id FROM route_bookings WHERE rider_id = ? AND status IN ('confirmed', 'in_progress')
     ))
     AND dr.status IN ('pinned', 'in_progress')
-    ORDER BY dr.started_at DESC LIMIT 1
+    ORDER BY dr.started_at DESC NULLS LAST LIMIT 1
     """, (user_id, user_id, user_id)).fetchone()
     if active_route:
         return jsonify({"active_session": dict(active_route), "session_type": "scheduled_route"})
@@ -2153,9 +2374,95 @@ def razorpay_verify():
     if not payments.verify_razorpay_signature(provider_order_id, payment_id, signature):
         raise ApiError("Payment signature verification failed", 400, "INVALID_SIGNATURE")
 
-    result = payments.credit_order(conn, order["id"], "razorpay", payment_id)
+    result = payments.settle_razorpay_order(conn, order, payment_id)
     conn.commit()
     return jsonify(result)
+
+
+RAZORPAY_SYNC_WINDOW_SECONDS = 24 * 3600
+RAZORPAY_SYNC_MAX_ORDERS = 3
+
+
+@app.route("/api/payments/razorpay/sync", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=20, window_seconds=60)
+def razorpay_sync():
+    """Asks Razorpay about this user's recent unpaid orders and credits the ones that were
+    paid. Covers a payer whose browser never came back from the payment (closed tab, UPI app
+    switch) on servers where no webhook is set up."""
+    conn = get_db()
+    credited = []
+    if payments.razorpay_live_configured():
+        pending = conn.execute("""
+        SELECT id, provider_order_id, amount FROM payment_orders
+        WHERE user_id = ? AND provider = 'razorpay' AND status = 'created' AND created_at > ?
+        ORDER BY created_at DESC LIMIT ?
+        """, (request.auth_user_id, time.time() - RAZORPAY_SYNC_WINDOW_SECONDS, RAZORPAY_SYNC_MAX_ORDERS)).fetchall()
+        conn.rollback()  # no transaction is held open while talking to Razorpay
+        for row in pending:
+            try:
+                payment_id = payments.fetch_captured_payment(row["provider_order_id"], row["amount"])
+            except PaymentError:
+                break  # gateway unreachable: the next sync or the webhook picks it up
+            if not payment_id:
+                continue
+            begin_write(conn)
+            order = conn.execute("SELECT * FROM payment_orders WHERE id = ?", (row["id"],)).fetchone()
+            try:
+                result = payments.settle_razorpay_order(conn, order, payment_id)
+            except PaymentError:
+                conn.rollback()
+                continue
+            conn.commit()
+            if not result.get("already_credited"):
+                credited.append({"reference_id": order["id"], "amount": order["amount"]})
+    return jsonify({
+        "success": True,
+        "credited": credited,
+        "amount_credited": round(sum(c["amount"] for c in credited), 2),
+        "new_balance": round(wallet_balance(conn, request.auth_user_id), 2),
+    })
+
+
+@app.route("/api/payments/razorpay/webhook", methods=["POST"])
+def razorpay_webhook():
+    """Razorpay calls this when a payment is captured, so the wallet is credited even if the
+    payer's browser never reports back. There is no login: the caller is proven by the HMAC of
+    the raw body, and the amount credited is always the stored order's."""
+    if not payments.webhook_configured():
+        raise ApiError("Not found", 404)
+    raw = request.get_data()
+    if not payments.verify_webhook_signature(raw, request.headers.get("X-Razorpay-Signature", "")):
+        raise ApiError("Invalid webhook signature", 400, "INVALID_SIGNATURE")
+    try:
+        event = json.loads(raw)
+        payment = event["payload"]["payment"]["entity"] if event.get("event") in ("payment.captured", "order.paid") else None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ApiError("Malformed webhook body")
+    # Anything else Razorpay sends is acknowledged so it is not retried.
+    if not isinstance(payment, dict) or payment.get("status") != "captured":
+        return jsonify({"success": True, "ignored": True})
+    provider_order_id, payment_id = payment.get("order_id"), payment.get("id")
+    if not isinstance(provider_order_id, str) or not isinstance(payment_id, str):
+        return jsonify({"success": True, "ignored": True})
+
+    conn = get_db()
+    begin_write(conn)
+    order = conn.execute(
+        "SELECT * FROM payment_orders WHERE provider_order_id = ? AND provider = 'razorpay'", (provider_order_id,)
+    ).fetchone()
+    if not order:
+        return jsonify({"success": True, "ignored": True})
+    if payment.get("amount") != payments.to_paise(order["amount"]):
+        log.error("Razorpay webhook amount mismatch for order %s (payment %s)", order["id"], payment_id)
+        return jsonify({"success": True, "ignored": True})
+    try:
+        payments.settle_razorpay_order(conn, order, payment_id)
+    except PaymentError:
+        # Already settled by the browser callback or an earlier delivery.
+        return jsonify({"success": True, "ignored": True})
+    conn.commit()
+    return jsonify({"success": True})
 
 
 # --- Admin: manual UPI reconciliation ---------------------------------------------------------
@@ -2198,6 +2505,79 @@ def admin_approve_payment(order_id):
     result = payments.credit_order(conn, order_id, "upi")
     conn.commit()
     return jsonify(result)
+
+
+@app.route("/api/admin/earnings", methods=["GET"])
+@require_admin
+def admin_platform_earnings():
+    """The platform's cut (fare minus driver payout) from every completed trip."""
+    conn = get_db()
+    total = conn.execute("""
+    SELECT COUNT(*) AS trips, COALESCE(SUM(amount), 0.0) AS earned, COALESCE(SUM(fare), 0.0) AS collected,
+           COALESCE(SUM(driver_payout), 0.0) AS paid_to_drivers
+    FROM platform_earnings
+    """).fetchone()
+    by_scope = conn.execute("""
+    SELECT scope, COUNT(*) AS trips, COALESCE(SUM(amount), 0.0) AS earned FROM platform_earnings GROUP BY scope
+    """).fetchall()
+    recent = conn.execute("""
+    SELECT source, reference_id, scope, fare, driver_payout, amount, created_at FROM platform_earnings
+    ORDER BY created_at DESC LIMIT 50
+    """).fetchall()
+    owed = conn.execute("SELECT COALESCE(SUM(amount), 0.0) AS total FROM driver_payouts WHERE status = 'requested'").fetchone()
+    return jsonify({
+        "trips": total["trips"],
+        "platform_earned": round(total["earned"], 2),
+        "fares_collected": round(total["collected"], 2),
+        "credited_to_drivers": round(total["paid_to_drivers"], 2),
+        "payout_requests_owed": round(owed["total"], 2),
+        "by_scope": {r["scope"]: {"trips": r["trips"], "earned": round(r["earned"], 2)} for r in by_scope},
+        "recent": [dict(r) for r in recent],
+    })
+
+
+@app.route("/api/admin/payouts/pending", methods=["GET"])
+@require_admin
+def admin_pending_payouts():
+    rows = get_db().execute("""
+    SELECT p.id, p.amount, p.upi_id, p.created_at, u.lpu_id, u.name, u.phone FROM driver_payouts p
+    JOIN users u ON u.id = p.driver_id
+    WHERE p.status = 'requested' ORDER BY p.created_at ASC
+    """).fetchall()
+    return jsonify({"pending": [dict(r) for r in rows]})
+
+
+@app.route("/api/admin/payouts/<payout_id>/paid", methods=["POST"])
+@require_admin
+def admin_mark_payout_paid(payout_id):
+    """Call after sending the money to the driver's UPI ID; pass the bank's UTR as proof."""
+    utr = get_text(body(), "utr", required=True, max_len=64, label="UTR")
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE driver_payouts SET status = 'paid', utr = ?, settled_at = ? WHERE id = ? AND status = 'requested'",
+        (utr, time.time(), payout_id),
+    )
+    if cur.rowcount != 1:
+        raise ApiError("Payout request not found or already settled", 404)
+    conn.commit()
+    return jsonify({"success": True, "status": "paid"})
+
+
+@app.route("/api/admin/payouts/<payout_id>/reject", methods=["POST"])
+@require_admin
+def admin_reject_payout(payout_id):
+    note = get_text(body(), "note", max_len=200)
+    conn = get_db()
+    begin_write(conn)
+    payout = conn.execute("SELECT * FROM driver_payouts WHERE id = ? AND status = 'requested'", (payout_id,)).fetchone()
+    if not payout:
+        raise ApiError("Payout request not found or already settled", 404)
+    conn.execute("UPDATE driver_payouts SET status = 'rejected', note = ?, settled_at = ? WHERE id = ?",
+                 (note or None, time.time(), payout_id))
+    # Booked as a reversed withdrawal so the amount counts as withdrawable earnings again.
+    credit_wallet(conn, payout["driver_id"], payout["amount"], "withdrawal", payout_id, "Payout request returned to wallet")
+    conn.commit()
+    return jsonify({"success": True, "status": "rejected"})
 
 
 @app.route("/api/admin/payments/<order_id>/reject", methods=["POST"])

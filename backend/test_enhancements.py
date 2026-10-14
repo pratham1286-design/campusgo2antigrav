@@ -23,7 +23,10 @@ class TestEnhancements(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(self.balance(headers), before + 250)  # client "amount" is ignored
         replay = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
-        self.assertEqual(replay.status_code, 400)
+        self.assertTrue(replay.get_json()["already_credited"])  # same payment reported twice: no second credit
+        self.assertEqual(self.balance(headers), before + 250)
+        other = self.client.post("/api/payments/razorpay/verify", headers=headers, json={**verify, "payment_id": "pay_demo_2"})
+        self.assertEqual(other.status_code, 400)
         self.assertEqual(self.balance(headers), before + 250)
 
     def test_03_sos_message_format(self):

@@ -442,7 +442,7 @@
           <!-- Primary CTA Button -->
           <button id="find-ride-btn" class="btn-primary-cta">
             <span class="btn-text" id="find-ride-text">Find Ride</span>
-            <span class="btn-subtext" id="selected-service-summary">Bike • Flat ₹15</span>
+            <span class="btn-subtext" id="selected-service-summary">Bike • Flat ₹14</span>
           </button>
         </div>
       </section>
@@ -727,6 +727,20 @@
                 <p class="empty-state">No waiting requests.</p>
               </div>
             </div>
+
+            <!-- Cash out ride earnings to the driver's UPI ID -->
+            <div class="vehicle-info-box" id="driver-payout-section">
+              <div class="vehicle-info-header">
+                <span class="box-title">Withdraw Earnings</span>
+              </div>
+              <div class="veh-sub">Available to withdraw: ₹<span id="driver-withdrawable">0.00</span></div>
+              <div class="input-group">
+                <label for="payout-upi-input">Your UPI ID</label>
+                <input type="text" id="payout-upi-input" placeholder="name@okaxis" maxlength="100" autocomplete="off">
+              </div>
+              <button id="request-payout-btn" class="btn-sm-primary">Request Payout</button>
+              <div id="driver-payouts-list" class="driver-requests-list"></div>
+            </div>
           </div>
 
           <!-- Mandatory Trusted Emergency Contacts -->
@@ -831,6 +845,7 @@
               <span class="tab-label">UPI QR Code</span>
             </button>
             <button class="pay-method-tab" data-method="razorpay">
+              <span class="tab-badge hidden">⚡ Instant</span>
               <span class="tab-label">Razorpay / Cards</span>
             </button>
           </div>
@@ -845,7 +860,7 @@
 
           <div class="input-group">
             <label>Amount (₹)</label>
-            <input type="number" id="topup-custom-input" min="10" max="5000" value="100">
+            <input type="number" id="topup-custom-input" min="1" max="5000" value="100">
           </div>
 
           <!-- TAB 1: UPI QR Scanner Container -->
@@ -856,7 +871,7 @@
               </div>
               <div class="upi-info-col">
                 <span class="upi-vpa-label">Scan with Google Pay, PhonePe, Paytm or BHIM</span>
-                <span class="upi-vpa-val" id="upi-vpa-text">campusgo.lpu@okhdfcbank</span>
+                <span class="upi-vpa-val" id="upi-vpa-text">pratham1286-1@okicici</span>
               </div>
             </div>
 
@@ -868,7 +883,6 @@
                 <span id="confirm-upi-label">I've Paid</span> (₹<span id="qr-pay-amount-label">100</span>)
               </button>
             </div>
-            <p id="topup-status-text" class="modal-desc hidden"></p>
           </div>
 
           <!-- TAB 2: Razorpay Gateway Container -->
@@ -878,12 +892,13 @@
                 <span class="rzp-badge" id="rzp-mode-badge">RAZORPAY</span>
                 <span class="rzp-shield">🔒 256-bit SSL</span>
               </div>
-              <p class="rzp-desc">Pay securely via Credit/Debit Cards, NetBanking, or Digital Wallets with automatic signature verification.</p>
+              <p class="rzp-desc">Pay with any UPI app, Credit/Debit Card or NetBanking. The money is added to your wallet automatically as soon as the payment goes through.</p>
             </div>
             <button id="razorpay-checkout-btn" class="btn-primary-cta">
               Pay via Razorpay (₹<span id="rzp-pay-amount-label">100</span>)
             </button>
           </div>
+          <p id="topup-status-text" class="modal-desc hidden"></p>
         </div>
       </div>
     </div>

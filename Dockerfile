@@ -3,8 +3,7 @@ FROM python:3.12-slim
 # Prevent Python from writing .pyc and buffer stdout
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-# The database lives in its own directory so a volume can persist it without
-# also freezing the application code (mounting over /app/backend did that).
+# Without DATABASE_URL the app uses SQLite here; the directory can be a volume.
 ENV DATABASE_PATH=/app/data/campusgo.db
 
 WORKDIR /app
@@ -24,10 +23,11 @@ USER campusgo
 
 EXPOSE 5000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:5000/api/config || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fs http://localhost:5000/healthz || exit 1
 
 # SECRET_KEY must be set (the app refuses to start with a known placeholder).
-# Demo personas are created only when SEED_DEMO_DATA=1, and only into an empty
-# database, so restarts never wipe real data.
-CMD ["sh", "-c", "if [ \"$SEED_DEMO_DATA\" = \"1\" ]; then python backend/seed_data.py --if-empty; fi && exec gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:5000 app:app"]
+# Migrations run once before the workers start. Demo personas are created only when
+# SEED_DEMO_DATA=1, and only into an empty database, so restarts never wipe real data.
+# Worker count: see backend/gunicorn.conf.py (several workers need DATABASE_URL + REDIS_URL).
+CMD ["sh", "-c", "python backend/database.py && if [ \"$SEED_DEMO_DATA\" = \"1\" ]; then python backend/seed_data.py --if-empty; fi && exec gunicorn --config backend/gunicorn.conf.py"]

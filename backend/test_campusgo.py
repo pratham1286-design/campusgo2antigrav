@@ -19,7 +19,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
             "pickup_key": "uni_mall", "drop_key": "block_34", "scope": "campus_hop"})
         quotes = res.get_json()["quotes"]
         self.assertEqual((quotes["bike"]["total_fare"], quotes["scooty"]["total_fare"], quotes["car"]["total_fare"]),
-                         (15.0, 20.0, 35.0))
+                         (14.0, 14.0, 14.0))
 
         city = self.client.post("/api/rides/quote", headers=headers, json={
             "pickup_key": "uni_mall", "drop_key": "chandigarh_isbt_43", "scope": "citylink"})
@@ -37,7 +37,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
 
         book = self.client.post("/api/rides/book", headers=headers, json=trip)
         self.assertEqual(book.status_code, 200)
-        self.assertEqual(book.get_json()["wallet_balance"], 90.0)  # fare held at booking
+        self.assertEqual(book.get_json()["wallet_balance"], 96.0)  # fare held at booking
         cancel = self.client.post(f"/api/rides/{book.get_json()['ride_id']}/cancel", headers=headers)
         self.assertEqual(cancel.get_json()["wallet_balance"], 110.0)  # refunded in full
 
@@ -56,7 +56,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
             "pickup_key": "uni_mall", "drop_key": "block_34", "service_type": "bike", "scope": "campus_hop"})
         self.assertEqual(res.status_code, 200)
         ride_id = res.get_json()["ride_id"]
-        self.assertEqual(self.balance(rider), before - 15.0)
+        self.assertEqual(self.balance(rider), before - 14.0)
         vikram = self.auth_headers("usr_driver_vikram")
         self.client.post("/api/driver/toggle-online", headers=vikram, json={"is_online": True, "lat": 31.2535, "lng": 75.7038})
         self.assertEqual(self.client.post("/api/driver/accept", headers=vikram, json={"ride_id": ride_id}).status_code, 200)
@@ -77,8 +77,8 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
 
         comp = self.client.post(f"/api/rides/{ride_id}/complete", headers=rider)
         self.assertEqual(comp.status_code, 200)
-        self.assertEqual(comp.get_json()["driver_payout"], 13.5)
-        self.assertEqual(self.balance(rider), before - 15.0)  # no second charge
+        self.assertEqual(comp.get_json()["driver_payout"], 13.0)
+        self.assertEqual(self.balance(rider), before - 14.0)  # no second charge
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)
 
         rate = self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 4, "tags": "Punctual"})

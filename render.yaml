@@ -1,22 +1,57 @@
+# Render blueprint sized for real traffic: several app instances sharing a managed PostgreSQL
+# database and a Redis-compatible Key Value store. These are PAID plans (check Render's pricing
+# page before deploying). For a free throwaway demo, set the web plan to "free", delete the
+# `scaling` block, the Key Value service and the database, and remove DATABASE_URL / REDIS_URL:
+# the app then falls back to SQLite and a single worker (data is lost on every deploy).
+databases:
+  - name: campusgo-db
+    plan: basic-1gb
+    databaseName: campusgo
+    user: campusgo
+    ipAllowList: []          # reachable only from your Render services
+
 services:
+  - type: keyvalue
+    name: campusgo-cache
+    plan: starter
+    ipAllowList: []          # reachable only from your Render services
+    maxmemoryPolicy: volatile-ttl   # every key the app writes expires on its own
+
   - type: web
     name: campusgo-lpu
     runtime: python
     region: singapore
-    plan: free
-    # NOTE: Render's free plan has no persistent disk, so the SQLite file is
-    # lost on every deploy/restart. For real persistence use a paid plan, add:
-    #   disk:
-    #     name: campusgo-data
-    #     mountPath: /var/data
-    #     sizeGB: 1
-    # and set DATABASE_PATH=/var/data/campusgo.db below.
+    plan: standard
+    # More instances at peak hours, fewer when quiet. They share the database and Redis.
+    scaling:
+      minInstances: 1
+      maxInstances: 4
+      targetCPUPercent: 60
     buildCommand: pip install -r requirements.txt
+    # Migrations run once per deploy, then gunicorn starts its workers (backend/gunicorn.conf.py).
     startCommand: >-
+      python backend/database.py &&
       if [ "$SEED_DEMO_DATA" = "1" ]; then python backend/seed_data.py --if-empty; fi &&
-      gunicorn --chdir backend --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
-    healthCheckPath: /api/config
+      gunicorn --config backend/gunicorn.conf.py
+    healthCheckPath: /healthz
     envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: campusgo-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: campusgo-cache
+          property: connectionString
+      # Workers per instance x DB_POOL_SIZE x instances must stay under the database's
+      # connection limit (about 100 on basic plans): 3 x 8 x 4 = 96.
+      - key: WEB_CONCURRENCY
+        value: "3"
+      - key: GUNICORN_THREADS
+        value: "8"
+      - key: DB_POOL_SIZE
+        value: "8"
       - key: SECRET_KEY
         generateValue: true
       - key: ADMIN_API_KEY
@@ -26,8 +61,7 @@ services:
         value: "1"
       - key: PUBLIC_BASE_URL
         sync: false
-      # Portfolio demo: creates the demo personas on an empty database.
-      # Demo personas sign in by SMS code like everyone else.
+      # Creates the demo personas on an empty database. Set "0" for a real launch.
       - key: SEED_DEMO_DATA
         value: "1"
       # "1" shows a fake moving vehicle driven from the UI. Leave "0": real trips use the driver's phone GPS.
@@ -37,18 +71,25 @@ services:
       - key: PAYMENTS_DEMO_MODE
         value: "0"
       - key: CAMPUSGO_UPI_VPA
-        value: campusgo.lpu@okhdfcbank
+        value: pratham1286-1@okicici
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
       # Logging in needs real SMS: set FAST2SMS_API_KEY (or the Twilio keys) below, otherwise
       # sign-in answers 503. "1" shows the code on screen instead; only for a throwaway demo,
       # because anyone who knows a demo ID + number could then log in as that person.
       - key: OTP_DEMO_MODE
         value: "0"
-      # Place search and road routes use the free public OpenStreetMap servers by default; set
-      # these for real traffic (see .env.example).
+      # Map services. The free public OpenStreetMap servers forbid heavy use: for real traffic
+      # set a tile provider (TILE_URL + TILE_ATTRIBUTION) and hosted routing/search (OSRM_URL,
+      # NOMINATIM_URL). See .env.example.
+      - key: TILE_URL
+        sync: false
+      - key: TILE_ATTRIBUTION
+        sync: false
       - key: GEOCODER_CONTACT
         sync: false
       - key: NOMINATIM_URL

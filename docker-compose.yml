@@ -1,23 +1,37 @@
+# Production-shaped stack: the app with several workers, PostgreSQL and Redis.
+#   SECRET_KEY=... POSTGRES_PASSWORD=... docker compose up -d
+# For more capacity run more app containers behind a load balancer (they share Postgres and Redis):
+# drop the "ports" mapping below, run `docker compose up -d --scale campusgo-app=3`, and point
+# nginx / Caddy / your cloud load balancer at the app containers on port 5000.
 services:
   campusgo-app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: campusgo-lpu-app
     restart: unless-stopped
     ports:
       - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       # Required. Generate with: python -c "import secrets; print(secrets.token_hex(32))"
       - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY to a random 64-character value}
-      - DATABASE_PATH=/app/data/campusgo.db
+      - DATABASE_URL=postgresql://campusgo:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/campusgo
+      - REDIS_URL=redis://redis:6379/0
+      # Workers per container (default: 2 x CPU cores + 1, at most 9) and threads per worker.
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-}
+      - GUNICORN_THREADS=${GUNICORN_THREADS:-8}
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-10}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS:-0}
       # Demo data and simulated payments are opt-in.
       - SEED_DEMO_DATA=${SEED_DEMO_DATA:-0}
       - DEMO_SIMULATE_MOVEMENT=${DEMO_SIMULATE_MOVEMENT:-0}
       - PAYMENTS_DEMO_MODE=${PAYMENTS_DEMO_MODE:-0}
-      - CAMPUSGO_UPI_VPA=${CAMPUSGO_UPI_VPA:-campusgo.lpu@okhdfcbank}
+      - CAMPUSGO_UPI_VPA=${CAMPUSGO_UPI_VPA:-pratham1286-1@okicici}
       - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
       - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-}
       - ADMIN_API_KEY=${ADMIN_API_KEY:-}
@@ -28,11 +42,38 @@ services:
       - NOMINATIM_URL=${NOMINATIM_URL:-}
       - OSRM_URL=${OSRM_URL:-}
       - GEOCODER_CONTACT=${GEOCODER_CONTACT:-}
+      - TILE_URL=${TILE_URL:-}
+      - TILE_ATTRIBUTION=${TILE_ATTRIBUTION:-}
       - CAMPUS_SECURITY_PHONE=${CAMPUS_SECURITY_PHONE:-+91 1824 517000}
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=campusgo
+      - POSTGRES_USER=campusgo
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB", "-c", "synchronous_commit=on"]
     volumes:
-      # Only the database directory is persisted, so rebuilt images ship new code.
-      - campusgo-db-data:/app/data
+      - campusgo-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campusgo -d campusgo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Everything the app stores in Redis expires on its own; under memory pressure the
+    # soonest-to-expire keys go first.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
-  campusgo-db-data:
+  campusgo-pg-data:
     driver: local

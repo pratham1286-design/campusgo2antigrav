@@ -22,7 +22,8 @@ from unittest import mock
 
 TMP = tempfile.mkdtemp(prefix="campusgo_e2e_")
 os.environ.update(DATABASE_PATH=os.path.join(TMP, "e2e.db"), SECRET_KEY=secrets.token_hex(32),
-                  OTP_DEMO_MODE="1", PAYMENTS_DEMO_MODE="1", DEMO_SIMULATE_MOVEMENT="1")
+                  OTP_DEMO_MODE="1", PAYMENTS_DEMO_MODE="1", DEMO_SIMULATE_MOVEMENT="1",
+                  CAMPUSGO_NO_DOTENV="1")
 for _var in ("FAST2SMS_API_KEY", "TWILIO_ACCOUNT_SID", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "ADMIN_API_KEY"):
     os.environ.pop(_var, None)
 

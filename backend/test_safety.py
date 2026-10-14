@@ -96,7 +96,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.report(BLOCK_34)
         done = self.client.post(f"/api/rides/{ride_id}/complete", headers=self.driver)
         self.assertEqual(done.status_code, 200, done.get_json())
-        self.assertEqual(self.balance(self.driver), before + 13.5)
+        self.assertEqual(self.balance(self.driver), before + 13.0)
 
     def test_rider_can_confirm_arrival_even_if_driver_phone_is_silent(self):
         ride_id = self.book()["ride_id"]
@@ -172,7 +172,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(self.db("SELECT status FROM rides WHERE id = ?", (ride_id,))[0]["status"], "completed")
-        self.assertEqual(self.balance(self.driver), before + 13.5)
+        self.assertEqual(self.balance(self.driver), before + 13.0)
 
     def test_location_needs_both_coordinates(self):
         res = self.client.post("/api/driver/location", headers=self.driver, json={"lat": 31.25})
@@ -188,7 +188,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_vikram'", (time.time() - 600,))
         before = self.balance(self.rider)
         ride_id = self.book()["ride_id"]
-        self.assertEqual(self.balance(self.rider), before - 15.0)
+        self.assertEqual(self.balance(self.rider), before - 14.0)
         self.db("UPDATE rides SET created_at = ? WHERE id = ?", (time.time() - 3600, ride_id))
         conn = app_module.get_db_connection()
         try:
