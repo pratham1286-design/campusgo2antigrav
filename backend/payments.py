@@ -14,38 +14,23 @@ import qrcode.image.svg
 MIN_TOPUP = 1.0
 MAX_TOPUP = 5000.0
 MERCHANT_NAME = "CampusGo LPU"
-DEMO_SIGNATURE = "demo_signature_valid"
-# Values shipped in old example configs; never treat them as real credentials.
-KNOWN_PLACEHOLDER_SECRETS = {"", "demo_secret_campusgo_2026"}
 
 
 class PaymentError(Exception):
     """A payment problem that is safe to show to the user."""
 
 
-def _env(name, default=""):
-    return os.environ.get(name, default).strip()
+def _env(name):
+    return os.environ.get(name, "").strip()
 
 
 def upi_vpa():
-    return _env("CAMPUSGO_UPI_VPA", "pratham1286-1@okicici")
+    """The UPI ID that direct QR top-ups are paid into. Without it that method is off."""
+    return _env("CAMPUSGO_UPI_VPA")
 
 
-def razorpay_live_configured():
-    return bool(_env("RAZORPAY_KEY_ID")) and _env("RAZORPAY_KEY_SECRET") not in KNOWN_PLACEHOLDER_SECRETS
-
-
-def payments_demo_mode():
-    """Simulated payments must be switched on explicitly, and are always off
-    once real Razorpay credentials are configured."""
-    enabled = _env("PAYMENTS_DEMO_MODE").lower() in ("1", "true", "yes")
-    return enabled and not razorpay_live_configured()
-
-
-def validate_topup_amount(amount):
-    if amount < MIN_TOPUP or amount > MAX_TOPUP:
-        raise PaymentError(f"Top-up amount must be between ₹{MIN_TOPUP:.0f} and ₹{MAX_TOPUP:.0f}")
-    return round(amount, 2)
+def razorpay_configured():
+    return bool(_env("RAZORPAY_KEY_ID")) and bool(_env("RAZORPAY_KEY_SECRET"))
 
 
 def create_payment_order(conn, user_id, provider, amount, provider_order_id=None):
@@ -131,32 +116,32 @@ def fetch_captured_payment(provider_order_id, amount):
 
 
 def webhook_configured():
-    return razorpay_live_configured() and bool(_env("RAZORPAY_WEBHOOK_SECRET"))
+    return razorpay_configured() and bool(_env("RAZORPAY_WEBHOOK_SECRET"))
+
+
+def _same(expected_hex, supplied):
+    # As bytes: compare_digest raises TypeError for a str with non-ASCII characters.
+    return hmac.compare_digest(expected_hex.encode("ascii"), supplied.encode("utf-8"))
 
 
 def verify_webhook_signature(raw_body, signature):
     """Razorpay signs each webhook's raw body with the secret chosen when the webhook was created."""
     if not webhook_configured() or not signature:
         return False
-    expected = hmac.new(_env("RAZORPAY_WEBHOOK_SECRET").encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    return _same(hmac.new(_env("RAZORPAY_WEBHOOK_SECRET").encode("utf-8"), raw_body, hashlib.sha256).hexdigest(),
+                 signature)
 
 
 def verify_razorpay_signature(provider_order_id, payment_id, signature):
-    """HMAC-SHA256 check from Razorpay's docs. The demo signature is accepted
-    only in explicit demo mode, which is impossible with live keys set."""
-    if not provider_order_id or not payment_id or not signature:
-        return False
-    if payments_demo_mode():
-        return hmac.compare_digest(signature, DEMO_SIGNATURE)
-    if not razorpay_live_configured():
+    """HMAC-SHA256 check from Razorpay's docs."""
+    if not provider_order_id or not payment_id or not signature or not razorpay_configured():
         return False
     expected = hmac.new(
         _env("RAZORPAY_KEY_SECRET").encode("utf-8"),
         f"{provider_order_id}|{payment_id}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    return _same(expected, signature)
 
 
 def credit_order(conn, order_id, method, provider_payment_id=None):

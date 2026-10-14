@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest import mock
 
-from test_support import ClientMixin, departure_in
+from test_support import ADMIN_KEY, SMS_OUTBOX, ClientMixin, departure_in
 import app as app_module
 
 UNI_MALL = {"lat": 31.2535, "lng": 75.7038}
@@ -15,9 +15,6 @@ TRIP = {"pickup_key": "uni_mall", "drop_key": "block_34", "service_type": "bike"
 class TestRealGpsTrips(ClientMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.dict(os.environ, {"DEMO_SIMULATE_MOVEMENT": "0"})
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.db("UPDATE rides SET status = 'cancelled' WHERE status IN ('queued', 'matched', 'arriving', 'in_progress')")
         self.db("UPDATE driver_routes SET status = 'cancelled' WHERE status = 'in_progress'")
         self.db("UPDATE wallets SET balance = 500 WHERE user_id IN ('usr_student_aarav', 'usr_student_kavya')")
@@ -66,13 +63,6 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 409)
         self.assertEqual(res.get_json()["code"], "DRIVER_OFFLINE")
         self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.rider)  # refund the held fare
-
-    def test_simulation_is_refused_when_disabled(self):
-        ride_id = self.book()["ride_id"]
-        for headers in (self.rider, self.driver):
-            res = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=headers)
-            self.assertEqual(res.status_code, 403)
-            self.assertEqual(res.get_json()["code"], "SIMULATION_DISABLED")
 
     def test_driver_cannot_collect_fare_without_driving(self):
         ride = self.book()
@@ -182,7 +172,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_vikram'", (time.time() - 600,))
         self.assertEqual(self.book()["status"], "queued")
         nearby = self.client.get("/api/drivers/nearby", headers=self.rider).get_json()["drivers"]
-        self.assertFalse([d for d in nearby if d["first_name"] == "Vikram"])
+        self.assertNotIn(app_module.driver_public_key("usr_driver_vikram"), [d["key"] for d in nearby])
 
     def test_unmatched_request_expires_with_refund(self):
         self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_vikram'", (time.time() - 600,))
@@ -257,20 +247,13 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
 
 
 class TestIdentityAndSos(ClientMixin, unittest.TestCase):
-    def signup(self, phone, lpu_id, username, user_type="teacher"):
-        start = self.client.post("/api/auth/signup/start", json={
-            "name": "Test Person", "username": username, "user_type": user_type, "lpu_id": lpu_id, "phone": phone}).get_json()
-        return self.client.post("/api/auth/signup/verify",
-                                json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]}).get_json()
-
     def test_new_teacher_gets_no_priority_until_admin_approves(self):
-        created = self.signup("9000011111", "FAC-99001", "new.teacher")
+        created = self.signup("9000011111", "FAC-99001", "new.teacher", user_type="teacher")
         self.assertEqual(created["user"]["user_type"], "teacher")
         self.assertFalse(created["user"]["is_teacher_priority"])
 
-        key = "k" * 40
-        with mock.patch.dict(os.environ, {"ADMIN_API_KEY": key}):
-            admin = {"X-Admin-Key": key}
+        with mock.patch.dict(os.environ, {"ADMIN_API_KEY": ADMIN_KEY}):
+            admin = {"X-Admin-Key": ADMIN_KEY}
             pending = self.client.get("/api/admin/faculty/pending", headers=admin).get_json()["pending"]
             self.assertIn(created["user"]["id"], [p["id"] for p in pending])
             res = self.client.post(f"/api/admin/faculty/{created['user']['id']}/approve", headers=admin)
@@ -287,19 +270,17 @@ class TestIdentityAndSos(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.get("/api/auth/me", headers=two).status_code, 401)
 
     def test_login_for_unknown_account_looks_like_a_real_request(self):
-        with mock.patch.dict(os.environ, {"OTP_DEMO_MODE": "0"}):
-            res = self.client.post("/api/auth/login/start", json={"lpu_id": "99999999", "phone": "9111111111"})
-            self.assertEqual(res.status_code, 200)
-            body = res.get_json()
-            self.assertIn("challenge_id", body)
-            self.assertNotIn("demo_otp", body)
-            verify = self.client.post("/api/auth/login/verify", json={"challenge_id": body["challenge_id"], "otp": "123456"})
-            self.assertEqual(verify.status_code, 400)
+        res = self.client.post("/api/auth/login/start", json={"lpu_id": "99999999", "phone": "9111111111"})
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertEqual(set(body), {"challenge_id", "phone_hint", "expires_in", "resend_after"})
+        self.assertEqual(SMS_OUTBOX, [])
+        verify = self.client.post("/api/auth/login/verify", json={"challenge_id": body["challenge_id"], "otp": "123456"})
+        self.assertEqual(verify.status_code, 400)
 
     def test_unknown_account_gets_the_same_resend_cooldown(self):
-        with mock.patch.dict(os.environ, {"OTP_DEMO_MODE": "0"}):
-            first = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
-            again = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
+        first = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
+        again = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(again.status_code, 429)
         self.assertEqual(again.get_json()["code"], "OTP_COOLDOWN")
@@ -321,7 +302,7 @@ class TestIdentityAndSos(ClientMixin, unittest.TestCase):
         fake = mock.MagicMock(wraps=datetime)
         fake.now.side_effect = lambda tz=None: rush_utc.astimezone(tz) if tz else rush_utc.replace(tzinfo=None)
         with mock.patch.object(pricing_and_queue, "datetime", fake):
-            self.assertEqual(pricing_and_queue.get_current_surge_multiplier("Zone-Central"), 1.25)
+            self.assertEqual(pricing_and_queue.get_current_surge_multiplier(), 1.25)
 
     def test_strangers_cannot_exhaust_a_victims_login_attempts(self):
         for _ in range(12):

@@ -7,12 +7,11 @@ import os
 import unittest
 from unittest import mock
 
-from test_support import ClientMixin
+from test_support import RAZORPAY_ENV, ClientMixin
 import payments
 
 WEBHOOK_SECRET = "whsec_test_value"
-LIVE_ENV = {"RAZORPAY_KEY_ID": "rzp_test_x", "RAZORPAY_KEY_SECRET": "real_secret_value",
-            "RAZORPAY_WEBHOOK_SECRET": WEBHOOK_SECRET}
+LIVE_ENV = {**RAZORPAY_ENV, "RAZORPAY_WEBHOOK_SECRET": WEBHOOK_SECRET}
 
 
 class TestAutoTopup(ClientMixin, unittest.TestCase):

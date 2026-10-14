@@ -18,17 +18,7 @@ _PREFIX = "campusgo:"
 _redis = None
 _lock = threading.Lock()
 
-
-class _RateStore(dict):
-    """key -> [window_start, count, window]. clear() (used by tests) also resets Redis counters."""
-
-    def clear(self):
-        super().clear()
-        if _redis is not None:
-            _delete_prefix("rl:")
-
-
-RATE_LIMIT_STORE = _RateStore()
+_rates = {}           # key -> [window_start, count, window]
 _cache = {}           # key -> (expires_at, value)
 _flags = {}           # key -> expires_at
 _last_cleanup = [0.0]
@@ -51,16 +41,12 @@ def _client():
     return _redis
 
 
-def backend_name():
-    return "redis" if _client() is not None else "memory"
-
-
 def _cleanup(now):
     """Drops expired entries at most once a minute, so no single request pays for a scan."""
-    if now - _last_cleanup[0] < CLEANUP_EVERY and len(RATE_LIMIT_STORE) + len(_cache) < MAX_MEMORY_KEYS:
+    if now - _last_cleanup[0] < CLEANUP_EVERY and len(_rates) + len(_cache) < MAX_MEMORY_KEYS:
         return
     _last_cleanup[0] = now
-    for store, expired in ((RATE_LIMIT_STORE, lambda v: now - v[0] > v[2]),
+    for store, expired in ((_rates, lambda v: now - v[0] > v[2]),
                            (_cache, lambda v: v[0] < now),
                            (_flags, lambda v: v < now)):
         for k in [k for k, v in store.items() if expired(v)]:
@@ -81,10 +67,10 @@ def hit(key, limit, window_seconds):
     now = time.time()
     with _lock:
         _cleanup(now)
-        entry = RATE_LIMIT_STORE.get(key)
+        entry = _rates.get(key)
         if entry is None or now - entry[0] >= window_seconds:
             entry = [now, 0, window_seconds]
-            RATE_LIMIT_STORE[key] = entry
+            _rates[key] = entry
         if entry[1] >= limit:
             return False
         entry[1] += 1
@@ -134,10 +120,18 @@ def _delete_prefix(kind):
         r.delete(*keys)
 
 
+def clear_rate_limits():
+    """Resets every rate-limit counter (tests)."""
+    with _lock:
+        _rates.clear()
+    if _client() is not None:
+        _delete_prefix("rl:")
+
+
 def reset_memory():
     """Clears all limits, cache entries and flags (tests)."""
     with _lock:
-        RATE_LIMIT_STORE.clear()
+        _rates.clear()
         _cache.clear()
         _flags.clear()
     if _client() is not None:

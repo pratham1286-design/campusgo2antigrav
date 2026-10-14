@@ -2,7 +2,6 @@ import base64
 import json
 import os
 import re
-import time
 import urllib.parse
 import urllib.request
 
@@ -92,6 +91,19 @@ def send_twilio_sms(phone, message):
         return {"status": "failed", "gateway": "Twilio"}
 
 
+def send_sms(phone, message):
+    """Sends one text through whichever gateway is configured.
+    Returns {'status': 'sent' | 'failed' | 'not_sent' | 'invalid_number', ...}."""
+    number = normalize_phone(phone)
+    if not number:
+        return {"status": "invalid_number"}
+    if FAST2SMS_API_KEY:
+        return send_fast2sms(number, message)
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
+        return send_twilio_sms(number, message)
+    return {"status": "not_sent", "reason": "No SMS gateway configured"}
+
+
 def dispatch_emergency_alert(user_name, lpu_id, location_name, lat, lng, contacts, tracking_url=None,
                              approximate=False, blocked_phones=()):
     """Sends the SOS text to the user's own trusted contacts through a real SMS
@@ -101,19 +113,11 @@ def dispatch_emergency_alert(user_name, lpu_id, location_name, lat, lng, contact
     dispatched_results = []
 
     for c in contacts:
-        phone = normalize_phone(c.get("phone"))
-        if not phone:
-            delivery = {"status": "invalid_number"}
-        elif phone in blocked_phones:
+        if normalize_phone(c.get("phone")) in blocked_phones:
             # Per-number cap so nobody's phone can be flooded through many accounts.
             delivery = {"status": "rate_limited"}
-        elif FAST2SMS_API_KEY:
-            delivery = send_fast2sms(phone, message_body)
-        elif TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
-            delivery = send_twilio_sms(phone, message_body)
         else:
-            delivery = {"status": "not_sent", "reason": "No SMS gateway configured"}
-
+            delivery = send_sms(c.get("phone"), message_body)
         dispatched_results.append({
             "contact_name": c.get("name", "Contact"),
             "contact_phone": c.get("phone", ""),
@@ -127,26 +131,11 @@ def dispatch_emergency_alert(user_name, lpu_id, location_name, lat, lng, contact
         "status": "not_connected",
         "hotline": CAMPUS_SECURITY_PHONE,
         "message": "Campus security is not notified automatically. Call the hotline now.",
-        "timestamp": time.time(),
     }
 
     return {
-        "success": True,
         "sos_message": message_body,
         "contacts_dispatched": dispatched_results,
         "contacts_sent": sum(1 for r in dispatched_results if r["delivery"]["status"] == "sent"),
         "campus_security_dispatch": security,
     }
-
-
-def send_sms(phone, message):
-    """Sends one text through whichever gateway is configured.
-    Returns {'status': 'sent' | 'failed' | 'not_sent', ...}."""
-    number = normalize_phone(phone)
-    if not number:
-        return {"status": "invalid_number"}
-    if FAST2SMS_API_KEY:
-        return send_fast2sms(number, message)
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
-        return send_twilio_sms(number, message)
-    return {"status": "not_sent", "reason": "No SMS gateway configured"}

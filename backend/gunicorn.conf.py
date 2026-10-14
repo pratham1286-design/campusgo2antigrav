@@ -7,6 +7,12 @@ SQLite and in-memory limits only work inside a single process.
 import multiprocessing
 import os
 
+# Each worker would otherwise make up its own random key, and a login or SMS code issued by one
+# worker would be rejected by the next.
+if not os.environ.get("SECRET_KEY", "").strip():
+    raise SystemExit("SECRET_KEY is not set. Generate one with: "
+                     "python -c \"import secrets; print(secrets.token_hex(32))\"")
+
 chdir = os.path.dirname(os.path.abspath(__file__))
 wsgi_app = "app:app"
 bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"

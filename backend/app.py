@@ -50,6 +50,7 @@ from payments import PaymentError
 from pricing_and_queue import (
     CAMPUS_HOP_PLATFORM_FEE,
     CAMPUS_LANDMARKS,
+    LPU_CENTER,
     VALID_SERVICES,
     calculate_fare,
     find_nearest_campus_landmark,
@@ -90,16 +91,14 @@ SWEEP_INTERVAL_SECONDS = 30
 LOCAL_UTC_OFFSET_MINUTES = int(os.environ.get("LOCAL_UTC_OFFSET_MINUTES", "330") or 330)
 
 # --- Session tokens ---------------------------------------------------------
-WEAK_SECRET_KEYS = {"dev_only_change_me_in_production", "changeme", "change_me", "secret", "dev", "test"}
-
-
 def _load_secret_key():
+    """gunicorn.conf.py refuses to start without SECRET_KEY, so the random fallback only ever
+    applies to local `python app.py` runs (sessions then end when the server restarts)."""
     key = os.environ.get("SECRET_KEY", "").strip()
     if not key:
-        print("WARNING: SECRET_KEY env var not set. Using a random ephemeral key - "
-              "all sessions will be invalidated on restart. Set SECRET_KEY in production.")
+        print("WARNING: SECRET_KEY is not set; using a random key, so every session ends on restart.")
         return secrets.token_hex(32)
-    if key in WEAK_SECRET_KEYS or len(key) < 32:
+    if len(key) < 32 or key == "dev_only_change_me_in_production":
         raise RuntimeError(
             "SECRET_KEY is a known placeholder or shorter than 32 characters, so anyone could forge "
             "login tokens. Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
@@ -198,12 +197,10 @@ if "{s}" in TILE_URL:
 # --- Security headers ---------------------------------------------------------
 CONTENT_SECURITY_POLICY = "; ".join([
     "default-src 'self'",
-    # unpkg is limited to the one pinned Leaflet folder (and the pages carry SRI hashes), not the whole CDN.
-    "script-src 'self' https://unpkg.com/leaflet@1.9.4/dist/ https://checkout.razorpay.com https://*.razorpay.com",
-    "style-src 'self' 'unsafe-inline' https://unpkg.com/leaflet@1.9.4/dist/ https://fonts.googleapis.com",
+    "script-src 'self' https://checkout.razorpay.com https://*.razorpay.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
-    "img-src 'self' data: https://*.tile.openstreetmap.org https://tile.openstreetmap.org "
-    f"{TILE_ORIGIN} https://images.unsplash.com https://unpkg.com/leaflet@1.9.4/dist/ https://*.razorpay.com",
+    f"img-src 'self' data: {TILE_ORIGIN} https://*.razorpay.com",
     "connect-src 'self' https://*.razorpay.com",
     "frame-src https://api.razorpay.com https://checkout.razorpay.com",
     "object-src 'none'",
@@ -299,9 +296,6 @@ def as_bool(value):
 # --- Rate limiting --------------------------------------------------------------
 # Counters live in Redis when REDIS_URL is set (shared by every process and server), otherwise
 # in this process's memory (single-worker deployments). See shared.py.
-RATE_LIMIT_STORE = shared.RATE_LIMIT_STORE
-
-
 def check_rate(key, max_requests, window_seconds):
     if not shared.hit(key, max_requests, window_seconds):
         raise ApiError("Rate limit exceeded. Please wait a moment before trying again.", 429, "RATE_LIMITED")
@@ -366,6 +360,15 @@ def tracking_url(share_token):
     return f"{public_base_url()}/track/{share_token}"
 
 
+HONORIFICS = {"dr", "mr", "mrs", "ms", "prof"}
+
+
+def first_name(name, fallback="Rider"):
+    """What other users see of someone's name outside a trip they share ("Dr. Raman Sharma" -> "Raman")."""
+    parts = [p for p in (name or "").split() if p.lower().rstrip(".") not in HONORIFICS]
+    return parts[0] if parts else fallback
+
+
 def wallet_balance(conn, user_id):
     row = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
     return row["balance"] if row else 0.0
@@ -404,15 +407,6 @@ def credit_wallet(conn, user_id, amount, tx_type, reference_id, description):
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (str(uuid.uuid4()), user_id, amount, tx_type, reference_id, description, new_bal, now))
     return new_bal
-
-
-def fare_was_held(conn, ride):
-    """Rides booked before fares were held up front have no hold transaction;
-    they must not be refunded on cancel and must be charged on completion."""
-    return conn.execute(
-        "SELECT 1 FROM wallet_transactions WHERE user_id = ? AND reference_id = ? AND type = 'fare_deduction'",
-        (ride["rider_id"], ride["id"]),
-    ).fetchone() is not None
 
 
 def active_vehicle(conn, user_id):
@@ -474,21 +468,8 @@ def queue_position(conn, zone, is_priority, created_at):
     """, (zone, is_priority, is_priority, created_at)).fetchone()["pos"]
 
 
-def movement_simulation_enabled():
-    """Demo-only: lets the driver advance a fake position from the UI. Real deployments
-    leave this off and trust only the GPS the driver's phone reports."""
-    return os.environ.get("DEMO_SIMULATE_MOVEMENT", "") == "1"
-
-
-def fresh_cutoff():
-    """Drivers whose last position report is older than this are treated as offline."""
-    return 0.0 if movement_simulation_enabled() else time.time() - LOCATION_MAX_AGE_SECONDS
-
-
 def driver_near(conn, driver_id, lat, lng, radius_km):
     """True when the driver's own phone recently reported a position within radius_km of the point."""
-    if movement_simulation_enabled():
-        return True
     loc = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
     if not loc or time.time() - loc["updated_at"] > LOCATION_MAX_AGE_SECONDS:
         return False
@@ -496,19 +477,12 @@ def driver_near(conn, driver_id, lat, lng, radius_km):
 
 
 def parse_departure(text):
-    """Epoch seconds for a 'YYYY-MM-DDTHH:MM' campus-local time, or None for legacy free text."""
+    """Epoch seconds for a 'YYYY-MM-DDTHH:MM' campus-local time, or None if it isn't one."""
     try:
         naive = datetime.strptime((text or "").strip(), "%Y-%m-%dT%H:%M")
     except ValueError:
         return None
     return (naive - timedelta(minutes=LOCAL_UTC_OFFSET_MINUTES)).replace(tzinfo=timezone.utc).timestamp()
-
-
-def route_is_expired(route, now):
-    departs = parse_departure(route["departure_time"])
-    if departs is None:
-        return now - route["created_at"] > 24 * 3600
-    return now > departs + ROUTE_GRACE_SECONDS
 
 
 def cancel_ride_with_refund(conn, ride, reason):
@@ -521,11 +495,8 @@ def cancel_ride_with_refund(conn, ride, reason):
     )
     if cur.rowcount != 1:
         return None
-    refunded = 0.0
-    if fare_was_held(conn, ride):
-        refunded = ride["fare"]
-        credit_wallet(conn, ride["rider_id"], refunded, "refund", ride["id"], f"Refund for cancelled Ride #{ride['id'][5:13]}")
-    return refunded
+    credit_wallet(conn, ride["rider_id"], ride["fare"], "refund", ride["id"], f"Refund for cancelled Ride #{ride['id'][5:13]}")
+    return ride["fare"]
 
 
 def cancel_route_with_refunds(conn, route, why):
@@ -574,10 +545,7 @@ def settle_ride(conn, ride, now):
     )
     if cur.rowcount != 1:
         return None
-    # Normally the fare was held at booking, so only the driver is paid here.
-    # Rides booked before that rule existed are charged now instead.
-    if not fare_was_held(conn, ride):
-        debit_wallet(conn, ride["rider_id"], ride["fare"], ride["id"], f"CampusGo Ride #{ride['id'][5:13]}")
+    # The fare was held when the ride was booked, so only the driver is paid here.
     payout = driver_payout_for(ride["scope"], ride["fare"])
     credit_wallet(conn, ride["driver_id"], payout, "driver_payout", ride["id"], f"Payout for Ride #{ride['id'][5:13]}")
     record_platform_earning(conn, "ride", ride["id"], ride["scope"], ride["fare"], payout, now)
@@ -617,8 +585,8 @@ def sweep_stale(conn, force=False):
     ride_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM rides WHERE status = 'queued' AND created_at < ?", (now - QUEUE_TTL_SECONDS,)).fetchall()]
     route_ids = [r["id"] for r in conn.execute(
-        "SELECT id, departure_time, created_at FROM driver_routes WHERE status IN ('open', 'pinned')").fetchall()
-        if route_is_expired(r, now)]
+        "SELECT id, departure_time FROM driver_routes WHERE status IN ('open', 'pinned')").fetchall()
+        if now > parse_departure(r["departure_time"]) + ROUTE_GRACE_SECONDS]
     # Started trips nobody marked complete. A ride only starts once the rider gives the driver
     # their PIN, and a carpool once the host is at the pickup, so the trip happened: settle it.
     stale_ride_ids = [r["id"] for r in conn.execute(
@@ -652,7 +620,11 @@ def sweep_stale(conn, force=False):
 # JS/CSS with ?v=<content hash>, so browsers and CDNs cache those for a year and still pick
 # up a new release immediately; the pages themselves are revalidated with an ETag.
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+                ".webmanifest": "application/manifest+json"}
+VERSIONED_ASSETS = ("app.js", "styles.css", "track.js", "leaflet.js", "leaflet.css")
+PUBLIC_FILES = VERSIONED_ASSETS + ("sw.js", "manifest.webmanifest", "offline.html", "favicon.svg", "avatar-default.svg",
+                                   "icon-192.png", "icon-512.png", "apple-touch-icon.png")
 _static_files = {}
 _static_lock = threading.RLock()  # re-entered: a page loads its JS/CSS to version them
 
@@ -668,14 +640,15 @@ def _load_static(name):
             data = fh.read()
         if name.endswith(".html"):
             text = data.decode("utf-8")
-            for asset in ("app.js", "styles.css", "track.js"):
+            for asset in VERSIONED_ASSETS:
                 version = _load_static(asset)["etag"].strip('"')
                 text = (text.replace(f'"{asset}"', f'"/{asset}?v={version}"')
                             .replace(f'"/{asset}"', f'"/{asset}?v={version}"'))
             data = text.encode("utf-8")
-        entry = {"mtime": mtime, "data": data, "gzip": gzip.compress(data, 6),
-                 "etag": '"' + hashlib.sha256(data).hexdigest()[:16] + '"',
-                 "type": STATIC_TYPES[os.path.splitext(name)[1]]}
+        content_type = STATIC_TYPES[os.path.splitext(name)[1]]
+        entry = {"mtime": mtime, "data": data, "type": content_type,
+                 "gzip": gzip.compress(data, 6) if content_type != "image/png" else None,
+                 "etag": '"' + hashlib.sha256(data).hexdigest()[:16] + '"'}
         _static_files[name] = entry
         return entry
 
@@ -687,7 +660,7 @@ def _static_response(name, versioned=False):
     if request.headers.get("If-None-Match") == entry["etag"]:
         return Response(status=304, headers=headers)
     body = entry["data"]
-    if "gzip" in request.headers.get("Accept-Encoding", "") and len(body) > 1024:
+    if entry["gzip"] and "gzip" in request.headers.get("Accept-Encoding", "") and len(body) > 1024:
         body = entry["gzip"]
         headers["Content-Encoding"] = "gzip"
     return Response(body, headers=headers, content_type=entry["type"])
@@ -703,11 +676,35 @@ def track_page(share_token):
     return _static_response("track.html")
 
 
+@app.route("/privacy")
+def privacy_page():
+    return _static_response("privacy.html")
+
+
+@app.route("/terms")
+def terms_page():
+    return _static_response("terms.html")
+
+
 @app.route("/<name>")
 def serve_static(name):
-    if name not in ("app.js", "styles.css", "track.js", "avatar-default.svg"):
+    if name not in PUBLIC_FILES:
         raise ApiError("Not found", 404)
     return _static_response(name, versioned=bool(request.args.get("v")))
+
+
+@app.route("/.well-known/assetlinks.json")
+def android_asset_links():
+    """Proves to Android that the Play Store app (a Trusted Web Activity) and this site have the same
+    owner, so the app opens full-screen without a browser bar. Values come from the Play Console."""
+    package = os.environ.get("ANDROID_PACKAGE_NAME", "").strip()
+    fingerprints = [f.strip() for f in os.environ.get("ANDROID_CERT_SHA256", "").split(",") if f.strip()]
+    if not package or not fingerprints:
+        raise ApiError("Not found", 404)
+    return jsonify([{
+        "relation": ["delegate_permission/common.handle_all_urls"],
+        "target": {"namespace": "android_app", "package_name": package, "sha256_cert_fingerprints": fingerprints},
+    }])
 
 
 @app.route("/healthz")
@@ -720,29 +717,21 @@ def healthz():
 # --- Public config -------------------------------------------------------------------
 @app.route("/api/config", methods=["GET"])
 def public_config():
-    live = payments.razorpay_live_configured()
-    demo = payments.payments_demo_mode()
     return jsonify({
         "security_hotline": CAMPUS_SECURITY_PHONE,
-        "sms_gateway_configured": sms_gateway_configured(),
-        "payments_demo_mode": demo,
-        "razorpay_enabled": live or demo,
-        "upi_manual_verification": not demo,
-        "demo_simulation": movement_simulation_enabled(),
-        "min_topup": payments.MIN_TOPUP,
-        "max_topup": payments.MAX_TOPUP,
+        "razorpay_enabled": payments.razorpay_configured(),
+        "upi_enabled": bool(payments.upi_vpa()),
         "tile_url": TILE_URL,
         "tile_attribution": TILE_ATTRIBUTION,
     })
 
 
 # --- Auth -----------------------------------------------------------------------------
-USER_PUBLIC_FIELDS = ("id, lpu_id, username, name, email, phone, user_type, role, is_verified, "
-                      "is_teacher_priority, department, avatar_url, created_at")
-
-
 def _build_user_dict(conn, user_id):
-    user = conn.execute(f"SELECT {USER_PUBLIC_FIELDS} FROM users WHERE id = ?", (user_id,)).fetchone()
+    user = conn.execute("""
+    SELECT id, lpu_id, username, name, phone, user_type, role, is_teacher_priority, created_at
+    FROM users WHERE id = ? AND deleted_at IS NULL
+    """, (user_id,)).fetchone()
     if not user:
         return None
     user_dict = dict(user)
@@ -763,12 +752,6 @@ USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._]{2,19}$")
 STUDENT_ID_PATTERN = re.compile(r"^\d{8}$")
 TEACHER_ID_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\-]{3,19}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z .'\-]{1,59}$")
-
-
-def otp_demo_mode():
-    """Shows the code in the API reply instead of texting it. Only works while no
-    SMS gateway is configured, so it can never leak codes in a real deployment."""
-    return os.environ.get("OTP_DEMO_MODE", "") == "1" and not sms_gateway_configured()
 
 
 def phone_key(raw):
@@ -792,6 +775,16 @@ def _otp_hash(challenge_id, code):
     return hmac.new(OTP_HMAC_KEY, f"{challenge_id}:{code}".encode(), hashlib.sha256).hexdigest()
 
 
+def review_login_code(key):
+    """App Store and Play reviewers can't receive our SMS, so REVIEW_LOGIN_PHONE signs in with the
+    fixed REVIEW_LOGIN_CODE instead of a texted one. Only that one number; every other limit applies."""
+    review_key = phone_key(os.environ.get("REVIEW_LOGIN_PHONE", ""))
+    code = os.environ.get("REVIEW_LOGIN_CODE", "").strip()
+    if review_key and key == review_key and re.fullmatch(r"\d{6}", code):
+        return code
+    return None
+
+
 def require_phone(data):
     key = phone_key(data.get("phone"))
     if not key:
@@ -810,8 +803,8 @@ def normalize_lpu_id(value, user_type):
 
 def issue_otp(conn, purpose, key, payload):
     """Creates a challenge and texts the code. Returns the JSON reply for the client."""
-    demo = otp_demo_mode()
-    if not demo and not sms_gateway_configured():
+    review_code = review_login_code(key)
+    if not review_code and not sms_gateway_configured():
         raise ApiError("SMS sign-in is not available right now. Please try again later.", 503, "SMS_UNAVAILABLE")
 
     now = time.time()
@@ -824,9 +817,9 @@ def issue_otp(conn, purpose, key, payload):
     # Caps texts per number: SMS costs money, and this stops spamming someone else's phone.
     check_rate(f"otp-phone:{key}", 5, 3600)
 
-    code = "".join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
+    code = review_code or "".join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
     challenge_id = f"otp_{secrets.token_urlsafe(16)}"
-    if not demo:
+    if not review_code:
         delivery = send_sms(f"+91{key}", f"{code} is your CampusGo verification code. It expires in 5 minutes. Do not share it with anyone.")
         if delivery.get("status") != "sent":
             raise ApiError("We couldn't send the SMS. Check the number and try again.", 502, "SMS_FAILED")
@@ -837,15 +830,12 @@ def issue_otp(conn, purpose, key, payload):
         (challenge_id, purpose, key, _otp_hash(challenge_id, code), json.dumps(payload), now, now + OTP_TTL_SECONDS),
     )
     conn.commit()
-    reply = {
+    return {
         "challenge_id": challenge_id,
         "phone_hint": f"+91 {key[:2]}XXXXXX{key[-2:]}",
         "expires_in": OTP_TTL_SECONDS,
         "resend_after": OTP_RESEND_SECONDS,
     }
-    if demo:
-        reply["demo_otp"] = code
-    return reply
 
 
 def consume_otp(conn, purpose, data):
@@ -960,15 +950,14 @@ def signup_verify():
     begin_write(conn)
     try:
         conn.execute("""
-        INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified,
-                           is_teacher_priority, department, avatar_url, created_at, username, phone_key)
-        VALUES (?, ?, ?, '', ?, ?, 'rider', '', 1, 0, NULL, NULL, ?, ?, ?)
-        """, (user_id, payload["lpu_id"], payload["name"], f"+91{key}", payload["user_type"],
-              now, payload["username"], key))
+        INSERT INTO users (id, lpu_id, username, name, phone, phone_key, user_type, role, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'rider', ?)
+        """, (user_id, payload["lpu_id"], payload["username"], payload["name"], f"+91{key}", key,
+              payload["user_type"], now))
     except IntegrityError:
         conn.rollback()
         raise ApiError("Someone just took that username, ID or number. Please start again.", 409, "SIGNUP_CONFLICT")
-    conn.execute("INSERT INTO wallets (user_id, balance, currency, updated_at) VALUES (?, 0, 'INR', ?)", (user_id, now))
+    conn.execute("INSERT INTO wallets (user_id, balance, updated_at) VALUES (?, 0, ?)", (user_id, now))
     conn.commit()
     return jsonify({"user": _build_user_dict(conn, user_id), "token": generate_session_token(conn, user_id), "new_account": True})
 
@@ -984,8 +973,6 @@ def login_start():
     conn = get_db()
     user = conn.execute("SELECT id FROM users WHERE upper(lpu_id) = ? AND phone_key = ?", (lpu_id, key)).fetchone()
     if not user:
-        if otp_demo_mode():
-            raise ApiError("No account matches this LPU ID and mobile number. New here? Sign up instead.", 404, "NO_ACCOUNT")
         # Same reply (and the same resend cooldown) as a real code request, so this endpoint
         # can't be used to find out who has an account.
         try:
@@ -1154,6 +1141,44 @@ def delete_emergency_contact(contact_id):
     return jsonify({"success": True})
 
 
+# --- Account deletion (required in-app by Google Play and the App Store) ----------------------
+@app.route("/api/user/delete-account", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=5, window_seconds=60)
+def delete_account():
+    """Emergency contacts, vehicle, live location and pending sign-in codes are deleted. Rides,
+    payments and payouts are financial records that reference the user, so the user row stays,
+    with every field that identified the person replaced. Any wallet balance is forfeited (the
+    app says so first), and every session ends."""
+    user_id = request.auth_user_id
+    conn = get_db()
+    begin_write(conn)
+    busy = conn.execute("""
+    SELECT 1 FROM rides WHERE (rider_id = ? OR driver_id = ?) AND status IN ('queued', 'matched', 'arriving', 'in_progress')
+    UNION ALL SELECT 1 FROM driver_routes WHERE driver_id = ? AND status IN ('open', 'pinned', 'in_progress')
+    UNION ALL SELECT 1 FROM route_bookings WHERE rider_id = ? AND status IN ('confirmed', 'in_progress')
+    UNION ALL SELECT 1 FROM driver_payouts WHERE driver_id = ? AND status = 'requested'
+    """, (user_id,) * 5).fetchone()
+    if busy:
+        raise ApiError("Finish or cancel your rides, carpools and payout requests before deleting your account.",
+                       409, "ACCOUNT_BUSY")
+    phone = conn.execute("SELECT phone_key FROM users WHERE id = ?", (user_id,)).fetchone()["phone_key"]
+    conn.execute("DELETE FROM emergency_contacts WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM vehicles WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM driver_locations WHERE driver_id = ?", (user_id,))
+    conn.execute("DELETE FROM otp_challenges WHERE phone_key = ?", (phone,))
+    # ':' can't appear in a real LPU ID, username or phone, so these never collide with a new sign-up.
+    tombstone = f"deleted:{user_id}"
+    conn.execute("""
+    UPDATE users SET lpu_id = ?, username = ?, phone_key = ?, name = 'Deleted user', phone = '', role = 'rider',
+                     is_teacher_priority = 0, token_version = token_version + 1, deleted_at = ?
+    WHERE id = ?
+    """, (tombstone.upper(), tombstone, tombstone, time.time(), user_id))
+    conn.commit()
+    _token_versions.pop(user_id, None)
+    return jsonify({"success": True})
+
+
 # --- Landmarks & location --------------------------------------------------------------
 @app.route("/api/campus/landmarks", methods=["GET"])
 def list_landmarks():
@@ -1195,17 +1220,16 @@ def _drivers_in_cell(conn, lat, lng):
     dlat = reach / 111.0
     dlng = reach / (111.0 * max(0.2, math.cos(math.radians(cell[0]))))
     rows = conn.execute("""
-    SELECT dl.driver_id, dl.lat, dl.lng, v.category, u.name
+    SELECT dl.driver_id, dl.lat, dl.lng, v.category
     FROM driver_locations dl
-    JOIN users u ON u.id = dl.driver_id
     JOIN vehicles v ON v.user_id = dl.driver_id AND v.is_active = 1
     WHERE dl.is_online = 1 AND dl.lat BETWEEN ? AND ? AND dl.lng BETWEEN ? AND ? AND dl.updated_at >= ?
       AND NOT EXISTS (SELECT 1 FROM rides r WHERE r.driver_id = dl.driver_id
                       AND r.status IN ('matched', 'arriving', 'in_progress'))
       AND NOT EXISTS (SELECT 1 FROM driver_routes dr WHERE dr.driver_id = dl.driver_id AND dr.status = 'in_progress')
-    """, (cell[0] - dlat, cell[0] + dlat, cell[1] - dlng, cell[1] + dlng, fresh_cutoff())).fetchall()
-    drivers = [{"id": r["driver_id"], "lat": r["lat"], "lng": r["lng"], "category": r["category"],
-                "first_name": (r["name"] or "Driver").split()[0]} for r in rows]
+    """, (cell[0] - dlat, cell[0] + dlat, cell[1] - dlng, cell[1] + dlng,
+          time.time() - LOCATION_MAX_AGE_SECONDS)).fetchall()
+    drivers = [{"id": r["driver_id"], "lat": r["lat"], "lng": r["lng"], "category": r["category"]} for r in rows]
     with _nearby_lock:
         if len(_nearby_cache) > 5000:
             for k in [k for k, v in _nearby_cache.items() if v[0] <= now]:
@@ -1230,16 +1254,18 @@ def drivers_near(conn, lat, lng, exclude_id=None, limit=NEARBY_LIMIT):
 @app.route("/api/drivers/nearby", methods=["GET"])
 @require_auth
 def nearby_drivers():
-    """Online, free drivers near the rider for the home map (no contact details)."""
+    """Online, free drivers near the rider for the home map. Anyone with an account can call
+    this, so it carries no names and positions only to about 100 m: enough to show that cars
+    are around, not enough to follow a particular driver."""
     try:
-        lat = float(request.args.get("lat", geo.LPU[0]))
-        lng = float(request.args.get("lng", geo.LPU[1]))
+        lat = float(request.args.get("lat", LPU_CENTER[0]))
+        lng = float(request.args.get("lng", LPU_CENTER[1]))
     except ValueError:
         raise ApiError("Invalid position")
     if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
         raise ApiError("Invalid position")
-    drivers = [{"key": driver_public_key(d["id"]), "lat": d["lat"], "lng": d["lng"], "category": d["category"],
-                "first_name": d["first_name"]}
+    drivers = [{"key": driver_public_key(d["id"]), "lat": round(d["lat"], 3), "lng": round(d["lng"], 3),
+                "category": d["category"]}
                for d in drivers_near(get_db(), lat, lng, exclude_id=request.auth_user_id)]
     return jsonify({"drivers": drivers, "radius_km": NEARBY_RADIUS_KM})
 
@@ -1306,7 +1332,7 @@ def get_ride_quote():
     quotes = {}
     for service in VALID_SERVICES:
         drivers = sum(1 for d in nearby if d["category"] == service)
-        fare = calculate_fare(service, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"], pickup["zone"], demand)
+        fare = calculate_fare(service, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"], demand)
         fare["available_drivers"] = drivers
         fare["has_sufficient_balance"] = balance >= fare["total_fare"]
         fare["deficit"] = max(0.0, round(fare["total_fare"] - balance, 2))
@@ -1342,7 +1368,7 @@ def book_ride():
                        active_ride_id=existing["id"])
 
     fare_info = calculate_fare(service_type, scope, pickup["lat"], pickup["lng"], drop["lat"], drop["lng"],
-                               pickup["zone"], _demand(conn, pickup["zone"]))
+                               _demand(conn, pickup["zone"]))
     total_fare = fare_info["total_fare"]
     ride_id = f"ride_{uuid.uuid4().hex[:12]}"
 
@@ -1393,9 +1419,9 @@ def get_active_ride():
     sweep_stale(conn)
     ride = conn.execute("""
     SELECT r.*,
-           ru.name AS rider_name, ru.phone AS rider_phone, ru.avatar_url AS rider_avatar,
+           ru.name AS rider_name, ru.phone AS rider_phone,
            ru.is_teacher_priority AS rider_is_teacher, ru.user_type AS rider_type,
-           du.name AS driver_name, du.phone AS driver_phone, du.avatar_url AS driver_avatar,
+           du.name AS driver_name, du.phone AS driver_phone,
            v.model AS vehicle_model, v.plate_number AS vehicle_plate, v.color AS vehicle_color,
            v.category AS vehicle_category, v.has_helmet, v.has_ac,
            dl.lat AS driver_live_lat, dl.lng AS driver_live_lng
@@ -1448,8 +1474,7 @@ def report_driver_location():
         if jump_km > 1.0 and jump_km / hours > MAX_PLAUSIBLE_SPEED_KMH:
             raise ApiError("Your GPS position jumped too far. Waiting for a steady location fix.", 409, "GPS_JUMP")
     conn.execute("""
-    INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
-    VALUES (?, 0, ?, ?, 'Zone-Central', 0.0, ?)
+    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at) VALUES (?, 0, ?, ?, ?)
     ON CONFLICT(driver_id) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, updated_at = excluded.updated_at
     """, (driver_id, lat, lng, now))
     if state["hosting"]:
@@ -1460,53 +1485,6 @@ def report_driver_location():
     return jsonify({"success": True, "ride_status": state["ride_status"]})
 
 
-@app.route("/api/rides/<ride_id>/telemetry-step", methods=["POST"])
-@require_auth
-@rate_limit(max_requests=120, window_seconds=60)
-def telemetry_step(ride_id):
-    """Demo only (DEMO_SIMULATE_MOVEMENT=1): the driver advances a fake position. With
-    it off, positions come from /api/driver/location and this endpoint refuses."""
-    if not movement_simulation_enabled():
-        raise ApiError("Movement simulation is disabled. Positions come from the driver's phone.", 403, "SIMULATION_DISABLED")
-    conn = get_db()
-    ride = load_ride_for_participant(conn, ride_id)
-    if request.auth_user_id != ride["driver_id"]:
-        raise ApiError("Only the driver can move the simulated vehicle", 403)
-    status = ride["status"]
-    driver_id = ride["driver_id"]
-    if status not in ("matched", "arriving", "in_progress") or not driver_id:
-        return jsonify({"status": status})
-
-    begin_write(conn)
-    loc = conn.execute("SELECT lat, lng FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
-    current_lat = loc["lat"] if loc else ride["pickup_lat"]
-    current_lng = loc["lng"] if loc else ride["pickup_lng"]
-
-    if status in ("matched", "arriving"):
-        target_lat, target_lng, step = ride["pickup_lat"], ride["pickup_lng"], 0.35
-    else:
-        target_lat, target_lng, step = ride["drop_lat"], ride["drop_lng"], 0.25
-
-    dist_remaining = haversine_distance_km(current_lat, current_lng, target_lat, target_lng)
-    new_lat, new_lng = geo.step_toward(current_lat, current_lng, target_lat, target_lng, step)
-
-    if dist_remaining < 0.08:
-        # Arrived. At the pickup the ride waits for the rider's PIN; it never starts on its own.
-        new_lat, new_lng = target_lat, target_lng
-        dist_remaining = 0.0
-    next_status = status
-
-    conn.execute("UPDATE driver_locations SET lat = ?, lng = ?, updated_at = ? WHERE driver_id = ?",
-                 (new_lat, new_lng, time.time(), driver_id))
-    conn.commit()
-    return jsonify({
-        "status": next_status,
-        "current_lat": new_lat,
-        "current_lng": new_lng,
-        "distance_remaining_km": round(dist_remaining, 2),
-    })
-
-
 @app.route("/api/rides/<ride_id>/start", methods=["POST"])
 @require_auth
 @rate_limit(max_requests=10, window_seconds=60)
@@ -1514,6 +1492,8 @@ def start_ride(ride_id):
     """The driver starts the trip with the 4-digit PIN the rider tells them at pickup, so a
     ride (and its fare) can't begin without the rider actually being there."""
     pin = get_text(body(), "pin", required=True, max_len=8, label="ride PIN")
+    if not re.fullmatch(r"[0-9]{4}", pin):
+        raise ApiError("Enter the rider's 4-digit PIN", 400, "PIN_WRONG")
     conn = get_db()
     ride = load_ride_for_participant(conn, ride_id)
     if request.auth_user_id != ride["driver_id"]:
@@ -1524,12 +1504,12 @@ def start_ride(ride_id):
         raise ApiError("This ride can't be started now", 409, "NOT_STARTABLE")
     if not driver_near(conn, ride["driver_id"], ride["pickup_lat"], ride["pickup_lng"], PICKUP_RADIUS_KM):
         raise ApiError("Start the ride at the pickup point: your phone's live location must be there.", 409, "NOT_AT_PICKUP")
-    if (ride["pin_attempts"] or 0) >= START_PIN_MAX_ATTEMPTS:
+    if ride["pin_attempts"] >= START_PIN_MAX_ATTEMPTS:
         raise ApiError("Too many wrong PINs. Release the ride so the rider can be picked up again.", 429, "PIN_LOCKED")
-    if not ride["start_pin"] or not hmac.compare_digest(ride["start_pin"], pin):
-        conn.execute("UPDATE rides SET pin_attempts = COALESCE(pin_attempts, 0) + 1 WHERE id = ?", (ride_id,))
+    if not hmac.compare_digest(ride["start_pin"], pin):
+        conn.execute("UPDATE rides SET pin_attempts = pin_attempts + 1 WHERE id = ?", (ride_id,))
         conn.commit()
-        left = START_PIN_MAX_ATTEMPTS - (ride["pin_attempts"] or 0) - 1
+        left = START_PIN_MAX_ATTEMPTS - ride["pin_attempts"] - 1
         raise ApiError("That PIN is not correct" + (f" ({left} tries left)" if left > 0 else ""), 400, "PIN_WRONG")
     conn.execute("UPDATE rides SET status = 'in_progress', started_at = ? WHERE id = ?", (time.time(), ride_id))
     conn.commit()
@@ -1738,9 +1718,8 @@ def get_shared_ride(share_token):
     if not ride:
         raise ApiError("This tracking link has expired or is invalid", 404)
     ride_dict = dict(ride)
-    ride_dict["rider_name"] = (ride_dict["rider_name"] or "Rider").split()[0]
-    if ride_dict["driver_name"]:
-        ride_dict["driver_name"] = ride_dict["driver_name"].split()[0]
+    ride_dict["rider_name"] = first_name(ride_dict["rider_name"])
+    ride_dict["driver_name"] = first_name(ride_dict["driver_name"], None)
     try:  # the road path, so the shared page draws the real route instead of two dots
         ride_dict["route_points"] = geo.road_route(ride_dict["pickup_lat"], ride_dict["pickup_lng"],
                                                    ride_dict["drop_lat"], ride_dict["drop_lng"])["points"]
@@ -1760,21 +1739,19 @@ def toggle_driver_online():
     if is_online:
         require_vehicle(conn, driver_id)
 
-    zones = {l["zone"] for l in CAMPUS_LANDMARKS.values()}
-    zone = data.get("zone") if data.get("zone") in zones else "Zone-Central"
     has_fix = data.get("lat") is not None and data.get("lng") is not None
-    lat, lng = get_coordinates(data) if has_fix else (31.2536, 75.7038)
+    lat, lng = get_coordinates(data) if has_fix else LPU_CENTER
     # Only a real position report refreshes the location timestamp; going online alone doesn't,
     # so a driver whose phone stops reporting drops out of matching after a couple of minutes.
     conn.execute("""
-    INSERT INTO driver_locations (driver_id, is_online, lat, lng, zone, heading, updated_at)
-    VALUES (:driver, :online, :lat, :lng, :zone, 0.0, :now)
+    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at)
+    VALUES (:driver, :online, :lat, :lng, :now)
     ON CONFLICT(driver_id) DO UPDATE SET
-        is_online = excluded.is_online, zone = excluded.zone,
+        is_online = excluded.is_online,
         lat = CASE WHEN :fix = 1 THEN excluded.lat ELSE driver_locations.lat END,
         lng = CASE WHEN :fix = 1 THEN excluded.lng ELSE driver_locations.lng END,
         updated_at = CASE WHEN :fix = 1 THEN excluded.updated_at ELSE driver_locations.updated_at END
-    """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng, "zone": zone,
+    """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng,
           "now": time.time() if has_fix else 0.0, "fix": 1 if has_fix else 0})
     conn.commit()
     return jsonify({"success": True, "is_online": bool(is_online)})
@@ -1796,7 +1773,6 @@ def get_driver_requests():
         raise ApiError("Register a vehicle in your profile before driving.", 403, "VEHICLE_REQUIRED")
     if not me["is_online"]:
         return jsonify({"requests": [], "offline": True})
-    vehicle = me
     rows = conn.execute("""
     SELECT r.id, r.service_type, r.scope, r.pickup_name, r.pickup_zone, r.drop_name, r.fare,
            r.pickup_lat, r.pickup_lng, r.drop_lat, r.drop_lng,
@@ -1806,15 +1782,15 @@ def get_driver_requests():
     WHERE r.status = 'queued' AND r.service_type = ? AND r.rider_id != ?
     ORDER BY r.is_priority DESC, r.created_at ASC
     LIMIT 25
-    """, (vehicle["category"], request.auth_user_id)).fetchall()
-    has_fix = bool(me and time.time() - me["updated_at"] <= LOCATION_MAX_AGE_SECONDS)
+    """, (me["category"], request.auth_user_id)).fetchall()
+    has_fix = time.time() - me["updated_at"] <= LOCATION_MAX_AGE_SECONDS
     requests_out = []
     for r in rows:
         item = dict(r)
         item["trip_km"] = round(haversine_distance_km(item["pickup_lat"], item["pickup_lng"], item["drop_lat"], item["drop_lng"]), 1)
         item["distance_to_pickup_km"] = round(haversine_distance_km(me["lat"], me["lng"], item.pop("pickup_lat"), item.pop("pickup_lng")), 1) if has_fix else None
         item.pop("drop_lat"), item.pop("drop_lng")
-        item["rider_name"] = (item["rider_name"] or "Rider").split()[0]
+        item["rider_name"] = first_name(item["rider_name"])
         item["driver_payout"] = driver_payout_for(item["scope"], item["fare"])
         requests_out.append(item)
     return jsonify({"requests": requests_out})
@@ -1924,22 +1900,17 @@ def request_driver_payout():
 
 
 # --- CityLink scheduled carpools -------------------------------------------------------------
-ROUTE_LIST_FIELDS = """
-dr.id, dr.driver_id, dr.origin, dr.destination, dr.departure_time, dr.available_seats, dr.total_seats,
-dr.price_per_seat, dr.notes, dr.status, dr.created_at, dr.started_at,
-u.name AS driver_name, u.avatar_url AS driver_avatar,
-v.model AS vehicle_model, v.category AS vehicle_category, v.plate_number AS vehicle_plate
-"""
-
-
 @app.route("/api/routes/scheduled", methods=["GET"])
 @require_auth
 def get_scheduled_routes():
+    """Every open carpool, visible to every user: first names only, no phone numbers or IDs."""
     user_id = request.auth_user_id
     conn = get_db()
     sweep_stale(conn)
-    routes = [dict(r) for r in conn.execute(f"""
-    SELECT {ROUTE_LIST_FIELDS}
+    routes = [dict(r) for r in conn.execute("""
+    SELECT dr.id, dr.driver_id, dr.origin, dr.destination, dr.departure_time, dr.available_seats, dr.total_seats,
+           dr.price_per_seat, dr.notes, dr.status, dr.created_at, dr.started_at, u.name AS driver_name,
+           v.model AS vehicle_model, v.category AS vehicle_category, v.plate_number AS vehicle_plate
     FROM driver_routes dr
     JOIN users u ON dr.driver_id = u.id
     LEFT JOIN vehicles v ON dr.driver_id = v.user_id AND v.is_active = 1
@@ -1947,20 +1918,21 @@ def get_scheduled_routes():
     ORDER BY (CASE dr.status WHEN 'pinned' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END), dr.created_at DESC
     """).fetchall()]
 
+    passengers = {r["id"]: [] for r in routes}
+    for p in conn.execute("""
+    SELECT rb.route_id, rb.seats, rb.rider_id, u.name FROM route_bookings rb
+    JOIN users u ON rb.rider_id = u.id
+    JOIN driver_routes dr ON dr.id = rb.route_id AND dr.status IN ('open', 'pinned', 'in_progress')
+    WHERE rb.status IN ('confirmed', 'in_progress')
+    """).fetchall():
+        if p["route_id"] in passengers:
+            passengers[p["route_id"]].append(p)
     for r in routes:
-        # Campus-wide listing: names only, no phone numbers or LPU IDs.
-        passengers = [dict(p) for p in conn.execute("""
-        SELECT rb.seats, rb.status AS booking_status, u.id AS passenger_id,
-               u.name AS passenger_name, u.avatar_url AS passenger_avatar
-        FROM route_bookings rb JOIN users u ON rb.rider_id = u.id
-        WHERE rb.route_id = ? AND rb.status IN ('confirmed', 'in_progress')
-        """, (r["id"],)).fetchall()]
+        booked = passengers[r["id"]]
         r["is_host"] = r.pop("driver_id") == user_id
-        r["has_joined"] = any(p["passenger_id"] == user_id for p in passengers)
-        for p in passengers:
-            p.pop("passenger_id")
-        r["passengers"] = passengers
-
+        r["has_joined"] = any(p["rider_id"] == user_id for p in booked)
+        r["driver_name"] = first_name(r["driver_name"])
+        r["passengers"] = [{"passenger_name": first_name(p["name"]), "seats": p["seats"]} for p in booked]
     return jsonify({"routes": routes})
 
 
@@ -2000,13 +1972,13 @@ def plan_future_route():
     conn.execute("""
     INSERT INTO driver_routes (
         id, driver_id, origin, origin_lat, origin_lng, destination, destination_lat, destination_lng,
-        departure_time, available_seats, total_seats, price_per_seat, notes, status, share_token,
+        departure_time, available_seats, total_seats, price_per_seat, notes, status,
         current_lat, current_lng, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
     """, (
         route_id, driver_id, origin["name"], origin["lat"], origin["lng"], dest["name"], dest["lat"], dest["lng"],
         departure_time, total_seats, total_seats, round(price_per_seat, 2), notes,
-        f"share_route_{secrets.token_urlsafe(12)}", origin["lat"], origin["lng"], time.time(),
+        origin["lat"], origin["lng"], time.time(),
     ))
     conn.commit()
     return jsonify({"success": True, "route_id": route_id, "status": "open", "total_seats": total_seats})
@@ -2140,7 +2112,7 @@ def start_scheduled_route(route_id):
 def get_live_cockpit(route_id):
     conn = get_db()
     route = conn.execute("""
-    SELECT dr.*, u.name AS driver_name, u.phone AS driver_phone, u.avatar_url AS driver_avatar,
+    SELECT dr.*, u.name AS driver_name, u.phone AS driver_phone,
            v.model AS vehicle_model, v.plate_number AS vehicle_plate, v.category AS vehicle_category
     FROM driver_routes dr
     JOIN users u ON dr.driver_id = u.id
@@ -2152,12 +2124,11 @@ def get_live_cockpit(route_id):
     route_participant_check(conn, route, request.auth_user_id)
 
     route_dict = dict(route)
-    route_dict.pop("share_token", None)
-    route_dict["is_host"] = route["driver_id"] == request.auth_user_id
-    is_host = route["driver_id"] == request.auth_user_id
+    is_host = route_dict.pop("driver_id") == request.auth_user_id
+    route_dict["is_host"] = is_host
     route_dict["passengers"] = [dict(p) for p in conn.execute("""
     SELECT rb.id AS booking_id, rb.seats, rb.fare_paid, rb.status AS booking_status,
-           u.name AS passenger_name, u.phone AS passenger_phone, u.avatar_url AS passenger_avatar
+           u.name AS passenger_name, u.phone AS passenger_phone
     FROM route_bookings rb JOIN users u ON rb.rider_id = u.id
     WHERE rb.route_id = ? AND rb.status IN ('confirmed', 'in_progress', 'completed')
     """, (route_id,)).fetchall()]
@@ -2172,31 +2143,6 @@ def get_live_cockpit(route_id):
     route_dict["distance_remaining_km"] = round(dist, 2)
     route_dict["eta_minutes"] = max(3, int(dist * 2.5) + 2)
     return jsonify({"cockpit": route_dict})
-
-
-@app.route("/api/routes/<route_id>/telemetry-step", methods=["POST"])
-@require_auth
-@rate_limit(max_requests=120, window_seconds=60)
-def route_telemetry_step(route_id):
-    """Demo only (DEMO_SIMULATE_MOVEMENT=1). Real trips are moved by the host's phone GPS."""
-    if not movement_simulation_enabled():
-        raise ApiError("Movement simulation is disabled. Positions come from the host's phone.", 403, "SIMULATION_DISABLED")
-    conn = get_db()
-    route = conn.execute("SELECT * FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
-    if not route or route["status"] != "in_progress":
-        raise ApiError("Route is not active")
-    if route["driver_id"] != request.auth_user_id:
-        raise ApiError("Only the host can move the simulated vehicle", 403)
-
-    curr_lat = route["current_lat"] or route["origin_lat"]
-    curr_lng = route["current_lng"] or route["origin_lng"]
-    new_lat, new_lng = geo.step_toward(curr_lat, curr_lng, route["destination_lat"], route["destination_lng"], 0.30)
-    dist = haversine_distance_km(new_lat, new_lng, route["destination_lat"], route["destination_lng"])
-
-    conn.execute("UPDATE driver_routes SET current_lat = ?, current_lng = ? WHERE id = ?", (new_lat, new_lng, route_id))
-    conn.commit()
-    return jsonify({"status": "in_progress", "current_lat": new_lat, "current_lng": new_lng,
-                    "distance_remaining_km": round(dist, 2)})
 
 
 @app.route("/api/routes/<route_id>/complete", methods=["POST"])
@@ -2220,35 +2166,18 @@ def complete_scheduled_route(route_id):
     return jsonify({"success": True, "status": "completed", "total_revenue": total_revenue, "driver_payout": payout})
 
 
-@app.route("/api/user/active-session", methods=["GET"])
+@app.route("/api/routes/active", methods=["GET"])
 @require_auth
-def get_user_active_session():
+def get_active_route():
+    """The carpool this user is on right now, as host or passenger, so the app can reopen its live view."""
     user_id = request.auth_user_id
-    conn = get_db()
-    active_route = conn.execute("""
-    SELECT dr.id AS route_id, dr.origin, dr.destination, dr.departure_time, dr.status,
-           dr.price_per_seat, dr.available_seats, dr.total_seats,
-           (CASE WHEN dr.driver_id = ? THEN 1 ELSE 0 END) AS is_host
-    FROM driver_routes dr
-    WHERE (dr.driver_id = ? OR dr.id IN (
-        SELECT route_id FROM route_bookings WHERE rider_id = ? AND status IN ('confirmed', 'in_progress')
-    ))
-    AND dr.status IN ('pinned', 'in_progress')
-    ORDER BY dr.started_at DESC NULLS LAST LIMIT 1
-    """, (user_id, user_id, user_id)).fetchone()
-    if active_route:
-        return jsonify({"active_session": dict(active_route), "session_type": "scheduled_route"})
-
-    active_ride = conn.execute("""
-    SELECT id AS ride_id, pickup_name, drop_name, status, fare,
-           (CASE WHEN driver_id = ? THEN 1 ELSE 0 END) AS is_driver
-    FROM rides
-    WHERE (rider_id = ? OR driver_id = ?) AND status IN ('matched', 'arriving', 'in_progress')
-    ORDER BY created_at DESC LIMIT 1
-    """, (user_id, user_id, user_id)).fetchone()
-    if active_ride:
-        return jsonify({"active_session": dict(active_ride), "session_type": "on_demand_ride"})
-    return jsonify({"active_session": None, "session_type": None})
+    route = get_db().execute("""
+    SELECT id FROM driver_routes
+    WHERE status = 'in_progress' AND (driver_id = ? OR id IN (
+        SELECT route_id FROM route_bookings WHERE rider_id = ? AND status = 'in_progress'))
+    ORDER BY started_at DESC LIMIT 1
+    """, (user_id, user_id)).fetchone()
+    return jsonify({"route_id": route["id"] if route else None})
 
 
 # --- Wallet & payments -----------------------------------------------------------------------
@@ -2268,8 +2197,7 @@ def get_wallet():
 
 
 def _topup_amount(data):
-    amount = get_number(data, "amount", lo=payments.MIN_TOPUP, hi=payments.MAX_TOPUP, label="amount")
-    return payments.validate_topup_amount(amount)
+    return round(get_number(data, "amount", lo=payments.MIN_TOPUP, hi=payments.MAX_TOPUP, label="amount"), 2)
 
 
 @app.route("/api/payments/upi/create-qr", methods=["POST"])
@@ -2277,21 +2205,21 @@ def _topup_amount(data):
 @rate_limit(max_requests=20, window_seconds=60)
 def upi_create_qr():
     amount = _topup_amount(body())
+    if not payments.upi_vpa():
+        raise ApiError("UPI QR top-ups are not set up on this server", 503, "PAYMENTS_DISABLED")
     conn = get_db()
     order_id = payments.create_payment_order(conn, request.auth_user_id, "upi", amount)
     conn.commit()
-    result = payments.generate_upi_qr(order_id, amount)
-    result.update({"success": True, "demo_mode": payments.payments_demo_mode()})
-    return jsonify(result)
+    return jsonify({"success": True, **payments.generate_upi_qr(order_id, amount)})
 
 
 @app.route("/api/payments/upi/confirm", methods=["POST"])
 @require_auth
 @rate_limit(max_requests=10, window_seconds=60)
 def upi_confirm():
-    """The user says they paid. UPI gives no client-side proof of payment, so
-    the order is credited only after verification - except in explicit demo
-    mode. The amount always comes from the stored order, never the request."""
+    """The user says they paid. UPI gives no client-side proof of payment, so the order is
+    credited only after an admin checks the bank statement. The amount always comes from the
+    stored order, never the request."""
     reference_id = body().get("reference_id")
     if not isinstance(reference_id, str) or not reference_id:
         raise ApiError("reference_id is required")
@@ -2304,12 +2232,6 @@ def upi_confirm():
     ).fetchone()
     if not order:
         raise ApiError("Payment reference not found", 404)
-
-    if payments.payments_demo_mode():
-        result = payments.credit_order(conn, order["id"], "upi (demo)")
-        conn.commit()
-        return jsonify(result)
-
     if order["status"] not in ("created", "awaiting_verification"):
         raise ApiError("This payment has already been processed", 409)
     conn.execute("UPDATE payment_orders SET status = 'awaiting_verification' WHERE id = ?", (order["id"],))
@@ -2328,26 +2250,18 @@ def upi_confirm():
 @rate_limit(max_requests=15, window_seconds=60)
 def razorpay_create():
     amount = _topup_amount(body())
-    live = payments.razorpay_live_configured()
-    demo = payments.payments_demo_mode()
-    if not live and not demo:
+    if not payments.razorpay_configured():
         raise ApiError("Card payments are not configured on this server", 503, "PAYMENTS_DISABLED")
-
-    receipt = f"rcpt_{uuid.uuid4().hex[:12]}"
-    if live:
-        provider_order_id = payments.create_razorpay_remote_order(amount, receipt)
-    else:
-        provider_order_id = f"order_demo_{uuid.uuid4().hex[:14]}"
+    provider_order_id = payments.create_razorpay_remote_order(amount, f"rcpt_{uuid.uuid4().hex[:12]}")
     conn = get_db()
     payments.create_payment_order(conn, request.auth_user_id, "razorpay", amount, provider_order_id)
     conn.commit()
     return jsonify({
         "success": True,
         "order_id": provider_order_id,
-        "amount": int(round(amount * 100)),
+        "amount": payments.to_paise(amount),
         "currency": "INR",
-        "key_id": os.environ.get("RAZORPAY_KEY_ID", "") if live else None,
-        "demo_mode": demo,
+        "key_id": os.environ.get("RAZORPAY_KEY_ID", "").strip(),
         "merchant_name": payments.MERCHANT_NAME,
     })
 
@@ -2392,7 +2306,7 @@ def razorpay_sync():
     switch) on servers where no webhook is set up."""
     conn = get_db()
     credited = []
-    if payments.razorpay_live_configured():
+    if payments.razorpay_configured():
         pending = conn.execute("""
         SELECT id, provider_order_id, amount FROM payment_orders
         WHERE user_id = ? AND provider = 'razorpay' AND status = 'created' AND created_at > ?
@@ -2601,7 +2515,7 @@ def admin_pending_faculty():
     """Accounts that signed up as teachers and are waiting for priority-queue approval."""
     rows = get_db().execute("""
     SELECT id, lpu_id, name, phone, created_at FROM users
-    WHERE user_type = 'teacher' AND is_teacher_priority = 0 ORDER BY created_at ASC
+    WHERE user_type = 'teacher' AND is_teacher_priority = 0 AND deleted_at IS NULL ORDER BY created_at ASC
     """).fetchall()
     return jsonify({"pending": [dict(r) for r in rows]})
 
@@ -2611,7 +2525,8 @@ def admin_pending_faculty():
 def admin_approve_faculty(user_id):
     """Call only after checking the faculty ID against the staff records."""
     conn = get_db()
-    cur = conn.execute("UPDATE users SET is_teacher_priority = 1 WHERE id = ? AND user_type = 'teacher'", (user_id,))
+    cur = conn.execute("UPDATE users SET is_teacher_priority = 1 WHERE id = ? AND user_type = 'teacher' AND deleted_at IS NULL",
+                       (user_id,))
     if cur.rowcount != 1:
         raise ApiError("Teacher account not found", 404)
     conn.commit()

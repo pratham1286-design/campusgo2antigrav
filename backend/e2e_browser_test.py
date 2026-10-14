@@ -3,16 +3,15 @@
     pip install -r ../requirements-dev.txt        (installs playwright; uses your installed Chrome)
     python e2e_browser_test.py                    (add --headed to watch it)
 
-It starts the app on a throwaway database, fakes the GPS position, and replaces the outside
-map services (place search, road routes) with canned answers, so it needs no internet and
-touches no real data. Screenshots are saved to a temp folder printed at the end.
-Exit code is 0 when every check passes.
+It starts the app on the test suite's throwaway database and fake SMS gateway (test_support),
+fakes the GPS position, and replaces the outside map services (place search, road routes) with
+canned answers, so it needs no internet and touches no real data. Screenshots are saved to a
+temp folder printed at the end. Exit code is 0 when every check passes.
 """
 import json
 import logging
 import os
 import re
-import secrets
 import sys
 import tempfile
 import threading
@@ -20,18 +19,15 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-TMP = tempfile.mkdtemp(prefix="campusgo_e2e_")
-os.environ.update(DATABASE_PATH=os.path.join(TMP, "e2e.db"), SECRET_KEY=secrets.token_hex(32),
-                  OTP_DEMO_MODE="1", PAYMENTS_DEMO_MODE="1", DEMO_SIMULATE_MOVEMENT="1",
-                  CAMPUSGO_NO_DOTENV="1")
-for _var in ("FAST2SMS_API_KEY", "TWILIO_ACCOUNT_SID", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "ADMIN_API_KEY"):
-    os.environ.pop(_var, None)
-
+from test_support import ADMIN_KEY, LPU_IDS, PHONES, last_otp, load_fixtures
 import geo  # noqa: E402
 from app import app  # noqa: E402
 from pricing_and_queue import haversine_distance_km  # noqa: E402
-from seed_data import seed  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
+
+TMP = tempfile.mkdtemp(prefix="campusgo_e2e_")
+os.environ["ADMIN_API_KEY"] = ADMIN_KEY
+UNI_MALL = {"lat": 31.2535, "lng": 75.7038}
 
 PORT = 5059
 BASE = f"http://127.0.0.1:{PORT}"
@@ -70,9 +66,18 @@ def api(path, method="GET", body=None, token=None):
         return json.loads(err.read())
 
 
-def login(lpu_id, phone):
-    start = api("/api/auth/login/start", "POST", {"lpu_id": lpu_id, "phone": phone})
-    return api("/api/auth/login/verify", "POST", {"challenge_id": start["challenge_id"], "otp": start["demo_otp"]})["token"]
+def login(user_id):
+    start = api("/api/auth/login/start", "POST", {"lpu_id": LPU_IDS[user_id], "phone": PHONES[user_id]})
+    return api("/api/auth/login/verify", "POST",
+               {"challenge_id": start["challenge_id"], "otp": last_otp(PHONES[user_id])})["token"]
+
+
+def topup(token, amount):
+    """QR, "I've paid", then the admin approves it after checking the bank statement."""
+    ref = api("/api/payments/upi/create-qr", "POST", {"amount": amount}, token)["reference_id"]
+    api("/api/payments/upi/confirm", "POST", {"reference_id": ref}, token)
+    req = urllib.request.Request(f"{BASE}/api/admin/payments/{ref}/approve", method="POST", headers={"X-Admin-Key": ADMIN_KEY})
+    urllib.request.urlopen(req).close()
 
 
 results = []
@@ -88,9 +93,10 @@ def main():
         from playwright.sync_api import sync_playwright
     except ImportError:
         sys.exit("playwright is not installed. Run: pip install -r ../requirements-dev.txt")
+    sys.stdout.reconfigure(errors="replace")  # a Windows console can't print every character (e.g. ₹)
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)  # no request log lines
-    seed()
+    load_fixtures()
     geo.MIN_UPSTREAM_GAP = 0
     server = make_server("127.0.0.1", PORT, app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -118,10 +124,9 @@ def main():
         def on_view(page, view):
             return page.locator(f"#{view}").evaluate("e => e.classList.contains('active-view')")
 
-        rider_token = login("12204592", "9812345678")
-        driver_token = login("12019934", "9845678901")
-        ref = api("/api/payments/upi/create-qr", "POST", {"amount": 5000}, rider_token)["reference_id"]
-        api("/api/payments/upi/confirm", "POST", {"reference_id": ref}, rider_token)
+        rider_token = login("usr_student_aarav")
+        driver_token = login("usr_driver_vikram")
+        topup(rider_token, 5000)
 
         # ---- rider on campus ----
         page, errs = open_page(rider_token, 31.2535, 75.7038)
@@ -130,6 +135,15 @@ def main():
         page.wait_for_timeout(2500)
         check("location gate is gone once location is shared", page.locator("#location-gate").evaluate("e => e.classList.contains('hidden')"))
         check("on campus the badge says Auto-detected", page.locator("#auto-detected-badge").inner_text() == "Auto-detected")
+        check("the service worker installs (offline page, Play Store packaging)",
+              page.evaluate("navigator.serviceWorker.ready.then(() => true)"))
+        page.click("#header-wallet-btn")
+        page.wait_for_timeout(800)
+        check("top-up offers only the methods the server has set up (UPI here, no Razorpay keys)",
+              page.locator("#pay-panel-upi").is_visible()
+              and not page.locator('.pay-method-tab[data-method="razorpay"]').is_visible()
+              and page.locator("#upi-qr-container img").count() == 1)
+        page.click('#modal-topup .modal-close-btn')
 
         page.click('.scope-tab[data-scope="citylink"]')
         page.wait_for_timeout(1200)
@@ -186,6 +200,13 @@ def main():
               and not dpage.locator("#ride-pin-box").is_visible())
         dpage.fill("#start-pin-input", pin)
         dpage.click("#start-ride-btn")
+        dpage.wait_for_timeout(1500)
+        check("the PIN alone can't start the ride away from the pickup",
+              "pickup point" in dpage.locator(".app-dialog .dialog-message").inner_text())
+        dpage.click(".app-dialog .dialog-btn-primary")
+        api("/api/driver/location", "POST", UNI_MALL, driver_token)  # the driver's phone reaches the pickup
+        dpage.fill("#start-pin-input", pin)
+        dpage.click("#start-ride-btn")
         dpage.wait_for_timeout(2500)
         check("driver's PIN entry starts the ride", "PROGRESS" in dpage.locator("#cockpit-live-status-text").inner_text()
               and not dpage.locator("#start-ride-box").is_visible())
@@ -197,7 +218,8 @@ def main():
         check("no unexpected errors (driver)", not derrs, " | ".join(derrs[:4]))
 
         # ---- rider away from campus ----
-        off, offerrs = open_page(login("12301982", "9823456789"), 31.40, 75.60)
+        kavya_token = login("usr_student_kavya")
+        off, offerrs = open_page(kavya_token, 31.40, 75.60)
         off.goto(BASE)
         off.wait_for_timeout(3000)
         selected = "e => e.options[e.selectedIndex] ? e.options[e.selectedIndex].text : ''"
@@ -213,8 +235,23 @@ def main():
         check("off campus: CityLink pickup is the current location", "current location" in off.locator("#pickup-select").evaluate(selected).lower())
         check("no unexpected errors (off campus)", not offerrs, " | ".join(offerrs[:4]))
 
+        # ---- account screen and deleting the account (required by both app stores) ----
+        off.click('.nav-tab[data-view="view-profile"]')
+        off.wait_for_timeout(800)
+        account = off.locator("#profile-account-lpu").inner_text()
+        check("profile shows the username and the signed-in number", off.locator("#profile-card-username").inner_text() == "@kavya.patel"
+              and account == "Signed in as 12301982 · +919823456789", account)
+        off.click("#delete-account-btn")
+        off.wait_for_timeout(500)
+        warning = off.locator(".app-dialog .dialog-message").inner_text()
+        check("deleting asks first and warns about the wallet balance", "₹10.00" in warning, warning)
+        off.click(".app-dialog .dialog-btn-primary")
+        off.wait_for_timeout(1500)
+        check("a deleted account is signed out", off.locator("#login-screen").is_visible())
+        check("the deleted account's sessions stop working", api("/api/auth/me", token=kavya_token).get("code") == "AUTH_INVALID")
+
         # ---- small phone: nothing hides under the bottom bar ----
-        small, _ = open_page(login("FAC-10822", "9876543210"), 31.2535, 75.7038, 360, 640)
+        small, _ = open_page(login("usr_teacher_raman"), 31.2535, 75.7038, 360, 640)
         small.goto(BASE)
         small.wait_for_timeout(2500)
         small.locator(".bottom-sheet").evaluate("e => e.scrollTop = e.scrollHeight")

@@ -12,7 +12,6 @@ import os
 import re
 import sqlite3
 import threading
-import time
 
 DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "campusgo.db")
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
@@ -192,41 +191,28 @@ def begin_write(conn):
         conn.execute("BEGIN IMMEDIATE")
 
 
-def _columns(cursor, table):
-    if IS_POSTGRES:
-        rows = cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)).fetchall()
-        return {r["column_name"] for r in rows}
-    return {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _add_columns(cursor, table, columns):
-    existing = _columns(cursor, table)
-    for column, definition in columns.items():
-        if column not in existing:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {_ddl(definition)}")
-
-
 def _ddl(sql):
     # SQLite's REAL is 8 bytes; PostgreSQL's is 4, which can't hold a timestamp to the second.
     return re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql) if IS_POSTGRES else sql
 
 
 SCHEMA = [
+    # token_version is bumped on logout, so every earlier token stops working. A deleted account
+    # keeps its row (rides and payments reference it) with every personal field replaced.
     """
     CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         lpu_id TEXT UNIQUE NOT NULL,
+        username TEXT NOT NULL,
         name TEXT NOT NULL,
-        email TEXT NOT NULL,
         phone TEXT NOT NULL,
+        phone_key TEXT NOT NULL,
         user_type TEXT NOT NULL CHECK(user_type IN ('student', 'teacher')),
         role TEXT NOT NULL CHECK(role IN ('rider', 'driver', 'both')),
-        password_hash TEXT NOT NULL DEFAULT '',
-        is_verified INTEGER NOT NULL DEFAULT 1,
         is_teacher_priority INTEGER NOT NULL DEFAULT 0,
-        department TEXT,
-        avatar_url TEXT,
-        created_at REAL NOT NULL
+        token_version INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        deleted_at REAL
     )""",
     # One-time passwords sent by SMS. Only a keyed hash of the code is stored.
     """
@@ -260,7 +246,6 @@ SCHEMA = [
     CREATE TABLE IF NOT EXISTS wallets (
         user_id TEXT PRIMARY KEY,
         balance REAL NOT NULL DEFAULT 0.0,
-        currency TEXT NOT NULL DEFAULT 'INR',
         updated_at REAL NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     )""",
@@ -308,6 +293,8 @@ SCHEMA = [
         status TEXT NOT NULL CHECK(status IN ('queued', 'matched', 'arriving', 'in_progress', 'completed', 'cancelled')),
         is_priority INTEGER NOT NULL DEFAULT 0,
         share_token TEXT UNIQUE,
+        start_pin TEXT NOT NULL,
+        pin_attempts INTEGER NOT NULL DEFAULT 0,
         created_at REAL NOT NULL,
         matched_at REAL,
         started_at REAL,
@@ -336,9 +323,9 @@ SCHEMA = [
     CREATE TABLE IF NOT EXISTS driver_routes (
         id TEXT PRIMARY KEY,
         driver_id TEXT NOT NULL,
-        origin TEXT NOT NULL DEFAULT 'LPU Uni-Mall',
-        origin_lat REAL NOT NULL DEFAULT 31.2536,
-        origin_lng REAL NOT NULL DEFAULT 75.7038,
+        origin TEXT NOT NULL,
+        origin_lat REAL NOT NULL,
+        origin_lng REAL NOT NULL,
         destination TEXT NOT NULL,
         destination_lat REAL NOT NULL,
         destination_lng REAL NOT NULL,
@@ -348,7 +335,6 @@ SCHEMA = [
         price_per_seat REAL NOT NULL,
         notes TEXT,
         status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'pinned', 'in_progress', 'completed', 'cancelled')),
-        share_token TEXT,
         current_lat REAL,
         current_lng REAL,
         created_at REAL NOT NULL,
@@ -391,8 +377,6 @@ SCHEMA = [
         is_online INTEGER NOT NULL DEFAULT 1,
         lat REAL NOT NULL,
         lng REAL NOT NULL,
-        zone TEXT NOT NULL,
-        heading REAL NOT NULL DEFAULT 0.0,
         updated_at REAL NOT NULL,
         FOREIGN KEY(driver_id) REFERENCES users(id)
     )""",
@@ -460,13 +444,14 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_platform_earnings_time ON platform_earnings(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_driver_payouts_status ON driver_payouts(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_driver_payouts_driver ON driver_payouts(driver_id, created_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(lower(username))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_key ON users(phone_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_once ON ride_reviews(ride_id, reviewer_id)",
 ]
-# Indexes replaced by the ones above.
-OBSOLETE_INDEXES = ["idx_driver_locations_zone"]
 
 
 def init_db():
-    """Creates and upgrades the schema. Safe to run from many processes at once."""
+    """Creates the schema if it doesn't exist yet. Safe to run from many processes at once."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -475,7 +460,10 @@ def init_db():
             cursor.execute("SELECT pg_advisory_lock(?)", (MIGRATION_LOCK_ID,))
         else:
             cursor.execute("PRAGMA journal_mode=WAL;")  # readers proceed while a write is in progress
-        _migrate(cursor)
+        for statement in SCHEMA:
+            cursor.execute(_ddl(statement))
+        for statement in INDEXES:
+            cursor.execute(statement)
         conn.commit()
     finally:
         if IS_POSTGRES:
@@ -483,99 +471,3 @@ def init_db():
             cursor.execute("SELECT pg_advisory_unlock(?)", (MIGRATION_LOCK_ID,))
             conn.commit()
         conn.close()
-
-
-def _allow_withdrawal_transactions(cursor):
-    """Databases created before driver payouts reject the 'withdrawal' transaction type."""
-    types = "('topup', 'fare_deduction', 'driver_payout', 'refund', 'withdrawal')"
-    if IS_POSTGRES:
-        cursor.execute("ALTER TABLE wallet_transactions DROP CONSTRAINT IF EXISTS wallet_transactions_type_check")
-        cursor.execute(f"ALTER TABLE wallet_transactions ADD CONSTRAINT wallet_transactions_type_check CHECK (type IN {types})")
-        return
-    sql = cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wallet_transactions'").fetchone()[0]
-    if "'withdrawal'" in sql:
-        return
-    # SQLite can't alter a CHECK constraint, so the table is rebuilt; indexes are recreated by _migrate.
-    cursor.execute("ALTER TABLE wallet_transactions RENAME TO wallet_transactions_old")
-    cursor.execute(next(s for s in SCHEMA if "CREATE TABLE IF NOT EXISTS wallet_transactions" in s))
-    cursor.execute("""
-    INSERT INTO wallet_transactions (id, user_id, amount, type, reference_id, description, balance_after, created_at)
-    SELECT id, user_id, amount, type, reference_id, description, balance_after, created_at FROM wallet_transactions_old
-    """)
-    cursor.execute("DROP TABLE wallet_transactions_old")
-
-
-def _migrate(cursor):
-    for statement in SCHEMA:
-        cursor.execute(_ddl(statement))
-    _allow_withdrawal_transactions(cursor)
-
-    # Columns added after the first release.
-    _add_columns(cursor, "users", {
-        "password_hash": "TEXT NOT NULL DEFAULT ''",
-        "username": "TEXT",
-        "phone_key": "TEXT",
-        "token_version": "INTEGER NOT NULL DEFAULT 0",  # bumped on logout: every earlier token stops working
-    })
-    _add_columns(cursor, "driver_routes", {
-        "origin": "TEXT NOT NULL DEFAULT 'LPU Uni-Mall'",
-        "origin_lat": "REAL NOT NULL DEFAULT 31.2536",
-        "origin_lng": "REAL NOT NULL DEFAULT 75.7038",
-        "share_token": "TEXT",
-        "current_lat": "REAL",
-        "current_lng": "REAL",
-        "started_at": "REAL",
-        "completed_at": "REAL",
-    })
-    # Ride start PIN: the rider tells it to the driver at pickup; nothing else can start a ride.
-    _add_columns(cursor, "rides", {
-        "start_pin": "TEXT",
-        "pin_attempts": "INTEGER NOT NULL DEFAULT 0",
-    })
-
-    # Canonical phone (last 10 digits) and a username for accounts created before these columns existed.
-    legacy = cursor.execute(
-        "SELECT id, phone, lpu_id, username, phone_key FROM users WHERE username IS NULL OR phone_key IS NULL ORDER BY created_at"
-    ).fetchall()
-    if legacy:
-        seen_keys = {r[0] for r in cursor.execute("SELECT phone_key FROM users WHERE phone_key IS NOT NULL").fetchall()}
-        for row in legacy:
-            key = row[4] or "".join(ch for ch in (row[1] or "") if ch.isdigit())[-10:]
-            # Two legacy accounts sharing a number would break the unique index and stop the app
-            # booting; the later one gets a placeholder key and must be sorted out by an admin.
-            if not row[4] and key in seen_keys:
-                key = f"dup_{row[0]}"
-            seen_keys.add(key)
-            uname = row[3]
-            if not uname:
-                base = "".join(ch for ch in (row[2] or "").lower() if ch.isalnum()) or "user"
-                uname, n = base, 1
-                while cursor.execute("SELECT 1 FROM users WHERE lower(username) = ?", (uname,)).fetchone():
-                    n += 1
-                    uname = f"{base}{n}"
-            cursor.execute("UPDATE users SET username = ?, phone_key = ? WHERE id = ?", (uname, key, row[0]))
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(lower(username))")
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_key ON users(phone_key)")
-
-    for name in OBSOLETE_INDEXES:
-        cursor.execute(f"DROP INDEX IF EXISTS {name}")
-    for statement in INDEXES:
-        cursor.execute(statement)
-
-    # One review per person per ride (drop older duplicates from before this rule existed).
-    row_id = "ctid" if IS_POSTGRES else "rowid"
-    cursor.execute(f"""
-    DELETE FROM ride_reviews WHERE {row_id} NOT IN (
-        SELECT MIN({row_id}) FROM ride_reviews GROUP BY ride_id, reviewer_id
-    )""")
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_once ON ride_reviews(ride_id, reviewer_id)")
-
-
-def describe():
-    return f"PostgreSQL ({DATABASE_URL.split('@')[-1]})" if IS_POSTGRES else f"SQLite ({DB_PATH})"
-
-
-if __name__ == "__main__":
-    started = time.time()
-    init_db()
-    print(f"Database ready: {describe()} in {time.time() - started:.2f}s")

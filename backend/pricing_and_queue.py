@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 # Rush hours follow campus (India) time, not the server's clock, which is UTC on most hosts.
 CAMPUS_TZ = timezone(timedelta(minutes=int(os.environ.get("LOCAL_UTC_OFFSET_MINUTES", "330") or 330)))
 
-# LPU Campus Coordinates reference center: 31.2536° N, 75.7037° E
+LPU_CENTER = (31.2536, 75.7037)
 CAMPUS_LANDMARKS = {
     # Central Zone
     "uni_mall": {"name": "Uni-Mall & Student Plaza", "lat": 31.2535, "lng": 75.7038, "zone": "Zone-Central"},
@@ -79,7 +79,7 @@ def custom_point(lat, lng, name):
         return None, "Invalid location"
     if lat != lat or lng != lng or not (-90 <= lat <= 90 and -180 <= lng <= 180):
         return None, "Invalid location"
-    if haversine_distance_km(lat, lng, 31.2536, 75.7037) > MAX_SERVICE_RADIUS_KM:
+    if haversine_distance_km(lat, lng, *LPU_CENTER) > MAX_SERVICE_RADIUS_KM:
         return None, "That location is outside our service area."
     key, landmark = find_nearest_campus_landmark(lat, lng)
     if haversine_distance_km(lat, lng, landmark["lat"], landmark["lng"]) <= CAMPUS_RADIUS_KM and not is_city_landmark(landmark):
@@ -150,10 +150,10 @@ def haversine_distance_km(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def get_current_surge_multiplier(pickup_zone: str, demand_count: int = 0) -> float:
+def get_current_surge_multiplier(demand_count: int = 0) -> float:
     """
     Calculates dynamic surge multiplier based on class timetable peak rush
-    and real-time demand in the zone.
+    and real-time demand in the pickup zone.
     """
     now = datetime.now(CAMPUS_TZ)
     hour = now.hour
@@ -178,7 +178,7 @@ def get_current_surge_multiplier(pickup_zone: str, demand_count: int = 0) -> flo
 
     return min(1.50, round(base_surge, 2))
 
-def calculate_fare(service_type: str, scope: str, pickup_lat: float, pickup_lng: float, drop_lat: float, drop_lng: float, pickup_zone: str, demand_count: int = 0):
+def calculate_fare(service_type: str, scope: str, pickup_lat: float, pickup_lng: float, drop_lat: float, drop_lng: float, demand_count: int = 0):
     """
     100% Server-side validated fare calculation.
     - Campus Hop: strictly flat rate.
@@ -200,7 +200,7 @@ def calculate_fare(service_type: str, scope: str, pickup_lat: float, pickup_lng:
     else:
         # CityLink dynamic commute
         pricing = CITYLINK_PRICING[service_type]
-        surge = get_current_surge_multiplier(pickup_zone, demand_count)
+        surge = get_current_surge_multiplier(demand_count)
         base_fare = pricing["base"] + (pricing["per_km"] * dist_km)
         total_fare = round(base_fare * surge, 2)
         est_minutes = max(10, int(dist_km * 2.5) + 5)

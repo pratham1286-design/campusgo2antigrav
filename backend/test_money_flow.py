@@ -3,21 +3,19 @@ import os
 import unittest
 from unittest import mock
 
-from test_support import ClientMixin
+from test_support import ADMIN_KEY, ClientMixin
 
 UNI_MALL = {"lat": 31.2535, "lng": 75.7038}
 BLOCK_34 = {"lat": 31.2562, "lng": 75.7050}
-ADMIN_KEY = "a" * 40
 ADMIN = {"X-Admin-Key": ADMIN_KEY}
 
 
 class TestCampusHopMoneyFlow(ClientMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        for name, value in {"DEMO_SIMULATE_MOVEMENT": "0", "ADMIN_API_KEY": ADMIN_KEY}.items():
-            patcher = mock.patch.dict(os.environ, {name: value})
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"ADMIN_API_KEY": ADMIN_KEY})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.db("UPDATE rides SET status = 'cancelled' WHERE status IN ('queued', 'matched', 'arriving', 'in_progress')")
         self.db("UPDATE driver_routes SET status = 'cancelled' WHERE status = 'in_progress'")
         self.db("UPDATE driver_payouts SET status = 'rejected' WHERE status = 'requested'")
@@ -26,10 +24,7 @@ class TestCampusHopMoneyFlow(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 200, res.get_json())
 
     def new_rider(self, phone, lpu_id, username):
-        start = self.client.post("/api/auth/signup/start", json={
-            "name": "New Rider", "username": username, "user_type": "student", "lpu_id": lpu_id, "phone": phone}).get_json()
-        created = self.client.post("/api/auth/signup/verify",
-                                   json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]}).get_json()
+        created = self.signup(phone, lpu_id, username, name="New Rider")
         return {"Authorization": f"Bearer {created['token']}"}
 
     def ride_once(self, rider, service="bike"):
@@ -57,7 +52,7 @@ class TestCampusHopMoneyFlow(ClientMixin, unittest.TestCase):
         self.assertEqual(refused.status_code, 402)
         self.assertEqual(refused.get_json()["code"], "INSUFFICIENT_WALLET_BALANCE")
 
-        self.assertEqual(self.topup_demo(rider, 14).get_json()["new_balance"], 14.0)
+        self.assertEqual(self.topup(rider, 14).get_json()["new_balance"], 14.0)
         booked = self.client.post("/api/rides/book", headers=rider, json=trip).get_json()
         self.assertEqual(booked["wallet_balance"], 0.0)
 
@@ -113,7 +108,7 @@ class TestCampusHopMoneyFlow(ClientMixin, unittest.TestCase):
 
     def test_topped_up_money_cannot_be_withdrawn(self):
         rider = self.new_rider("9000033333", "12399002", "topup.only")
-        self.topup_demo(rider, 100)
+        self.topup(rider, 100)
         res = self.client.post("/api/driver/payouts", headers=rider, json={"upi_id": "me@okaxis", "amount": 50})
         self.assertEqual(res.status_code, 402)
         self.assertEqual(res.get_json()["code"], "INSUFFICIENT_EARNINGS")

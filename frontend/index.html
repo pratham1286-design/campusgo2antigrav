@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>CampusGo - LPU Community Transit</title>
-  
-  <!-- Leaflet Map CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-  <!-- Google Fonts: Inter for sharp modern typography -->
+  <meta name="description" content="Bike, scooty and car rides and carpools for the LPU community.">
+  <meta name="theme-color" content="#FF7C00">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+  <link rel="stylesheet" href="leaflet.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
-  
-  <!-- App Styles -->
-  <link rel="icon" type="image/svg+xml" href="avatar-default.svg">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -107,6 +107,7 @@
             <button type="button" class="btn-primary-cta" id="auth-go-login">Log In</button>
             <button type="button" class="btn-outline-cta" id="auth-go-signup">Sign Up</button>
           </div>
+          <p class="legal-links">By continuing you agree to our <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.</p>
         </section>
 
         <!-- Step: sign up - name & username -->
@@ -200,7 +201,6 @@
             <input type="text" inputmode="numeric" maxlength="1" aria-label="Digit 6">
           </div>
 
-          <p id="otp-demo-note" class="demo-otp hidden"></p>
           <p class="login-error hidden" data-error="otp"></p>
           <button type="button" class="btn-primary-cta" id="otp-verify-btn">Verify &amp; Continue</button>
           <p class="auth-switch"><span id="otp-resend-timer"></span> <button type="button" class="link-btn hidden" id="otp-resend-btn">Resend code</button></p>
@@ -239,9 +239,8 @@
           <span id="header-wallet-amount">0.00</span>
         </button>
 
-        <!-- Persona Switcher Menu -->
-        <button id="persona-switch-btn" class="persona-avatar-btn" title="Profile">
-          <img id="header-avatar" src="avatar-default.svg" alt="Avatar">
+        <button id="profile-btn" class="persona-avatar-btn" title="Profile">
+          <img src="avatar-default.svg" alt="Profile">
         </button>
       </div>
     </header>
@@ -486,12 +485,12 @@
             <div class="status-header">
               <div>
                 <div class="cockpit-tag">DURING-RIDE COCKPIT</div>
-                <h3 id="cockpit-route-title" class="status-title">Uni-Mall ➔ Jalandhar City</h3>
-                <p id="cockpit-telemetry-sub" class="status-sub">Distance remaining: Calculating...</p>
+                <h3 id="cockpit-route-title" class="status-title"></h3>
+                <p id="cockpit-telemetry-sub" class="status-sub"></p>
               </div>
               <div class="trip-fare-pill">
                 <span>Fare: ₹</span>
-                <span id="active-trip-fare">85.00</span>
+                <span id="active-trip-fare">0.00</span>
               </div>
             </div>
 
@@ -508,10 +507,10 @@
 
             <!-- Host / Driver Profile Card -->
             <div class="driver-profile-card">
-              <img id="active-driver-avatar" class="driver-avatar" src="avatar-default.svg" alt="Host">
+              <img class="driver-avatar" src="avatar-default.svg" alt="">
               <div class="driver-info">
                 <div class="driver-name-row">
-                  <span id="active-driver-name" class="driver-name">Harpreet Singh (Host)</span>
+                  <span id="active-driver-name" class="driver-name"></span>
                   <span class="verified-tag">
                     <svg viewBox="0 0 24 24" fill="currentColor">
                       <path d="M12 2l2.4 2.8 3.7-.4 1.3 3.4 3.4 1.3-.4 3.7 2.8 2.4-2.8 2.4.4 3.7-3.4 1.3-1.3 3.4-3.7-.4L12 22l-2.4-2.8-3.7.4-1.3-3.4-3.4-1.3.4-3.7L1 12l2.8-2.4-.4-3.7 3.4-1.3 1.3-3.4 3.7.4L12 2z"/>
@@ -520,9 +519,9 @@
                   </span>
                 </div>
                 <div class="vehicle-details">
-                  <span id="active-vehicle-model" class="vehicle-model">Maruti Dzire</span>
+                  <span id="active-vehicle-model" class="vehicle-model"></span>
                   <span class="vehicle-bullet">•</span>
-                  <span id="active-vehicle-plate" class="vehicle-plate">PB08-CR-9912</span>
+                  <span id="active-vehicle-plate" class="vehicle-plate"></span>
                 </div>
               </div>
             </div>
@@ -531,7 +530,7 @@
             <div class="cockpit-manifest-box">
               <div class="manifest-header">
                 <span class="manifest-title">PASSENGER MANIFEST</span>
-                <span id="manifest-count-badge" class="manifest-badge">3 Passengers Onboard</span>
+                <span id="manifest-count-badge" class="manifest-badge"></span>
               </div>
               <div id="cockpit-passenger-list" class="passenger-chips-row">
                 <!-- Dynamically populated passenger chips -->
@@ -544,7 +543,7 @@
                 <div class="waypoint-dot origin"></div>
                 <div class="waypoint-text">
                   <span class="waypoint-label">ORIGIN PICKUP</span>
-                  <span id="active-pickup-name" class="waypoint-name">Uni-Mall Plaza</span>
+                  <span id="active-pickup-name" class="waypoint-name"></span>
                 </div>
               </div>
               <div class="waypoint-line"></div>
@@ -552,19 +551,13 @@
                 <div class="waypoint-dot destination"></div>
                 <div class="waypoint-text">
                   <span class="waypoint-label">DESTINATION DROP</span>
-                  <span id="active-drop-name" class="waypoint-name">Jalandhar City Bus Stand</span>
+                  <span id="active-drop-name" class="waypoint-name"></span>
                 </div>
               </div>
             </div>
 
             <!-- During-Ride Live Actions -->
             <div class="active-actions-row">
-              <button id="sim-telemetry-btn" class="btn-secondary-action">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polygon points="5 3 19 12 5 21 5 3"/>
-                </svg>
-                <span>Advance Simulation</span>
-              </button>
               <button id="cancel-ride-btn" class="btn-secondary-action hidden">
                 <span>Cancel Ride</span>
               </button>
@@ -649,14 +642,14 @@
         <div class="profile-container">
           <!-- User Profile Card -->
           <div class="profile-header-card">
-            <img id="profile-card-avatar" class="profile-card-avatar" src="avatar-default.svg" alt="Avatar">
+            <img class="profile-card-avatar" src="avatar-default.svg" alt="">
             <div class="profile-card-info">
               <div class="profile-name-row">
-                <h3 id="profile-card-name" class="profile-user-name">Aarav Mehta</h3>
-                <span id="profile-verified-badge" class="verified-pill">Phone verified</span>
+                <h3 id="profile-card-name" class="profile-user-name"></h3>
+                <span class="verified-pill">Phone verified</span>
               </div>
-              <p id="profile-card-department" class="profile-department">B.Tech Computer Science & Engg</p>
-              <p id="profile-card-id" class="profile-lpu-id">Reg: 12204592</p>
+              <p id="profile-card-username" class="profile-username"></p>
+              <p id="profile-card-id" class="profile-lpu-id"></p>
             </div>
           </div>
 
@@ -748,7 +741,7 @@
             <div class="section-header-flex">
               <div>
                 <h4 class="setting-title">Emergency Contacts (Mandatory)</h4>
-                <p class="setting-sub">Texted when you press SOS (needs an SMS gateway on the server). Up to 5.</p>
+                <p class="setting-sub">We text them your location when you press SOS. Add up to 5 people who agree to this.</p>
               </div>
               <button id="add-emergency-btn" class="btn-sm-outline">+ Add</button>
             </div>
@@ -761,7 +754,11 @@
           <div class="setting-card">
             <h4 class="setting-title">Account</h4>
             <p class="setting-sub" id="profile-account-lpu">Signed in</p>
-            <button id="logout-btn" class="btn-sm-outline" style="width:100%; margin-top:10px;">Log Out</button>
+            <div class="account-actions">
+              <button id="logout-btn" class="btn-sm-outline">Log Out</button>
+              <button id="delete-account-btn" class="btn-sm-outline is-danger">Delete Account</button>
+            </div>
+            <p class="legal-links"><a href="/privacy">Privacy Policy</a> · <a href="/terms">Terms of Service</a></p>
           </div>
         </div>
       </section>
@@ -840,12 +837,11 @@
 
           <!-- Payment Method Selector -->
           <div class="payment-method-tabs">
-            <button class="pay-method-tab active" data-method="upi">
-              <span class="tab-badge">⚡ Instant</span>
-              <span class="tab-label">UPI QR Code</span>
+            <button class="pay-method-tab" data-method="upi">
+              <span class="tab-label">UPI QR (manual check)</span>
             </button>
-            <button class="pay-method-tab" data-method="razorpay">
-              <span class="tab-badge hidden">⚡ Instant</span>
+            <button class="pay-method-tab active" data-method="razorpay">
+              <span class="tab-badge">⚡ Instant</span>
               <span class="tab-label">Razorpay / Cards</span>
             </button>
           </div>
@@ -864,14 +860,14 @@
           </div>
 
           <!-- TAB 1: UPI QR Scanner Container -->
-          <div id="pay-panel-upi" class="pay-panel">
+          <div id="pay-panel-upi" class="pay-panel hidden">
             <div class="upi-qr-card">
               <div class="qr-wrapper" id="upi-qr-container">
                 <div class="qr-loading-spinner">Generating UPI QR...</div>
               </div>
               <div class="upi-info-col">
                 <span class="upi-vpa-label">Scan with Google Pay, PhonePe, Paytm or BHIM</span>
-                <span class="upi-vpa-val" id="upi-vpa-text">pratham1286-1@okicici</span>
+                <span class="upi-vpa-val" id="upi-vpa-text"></span>
               </div>
             </div>
 
@@ -880,16 +876,16 @@
                 📱 Open UPI App
               </a>
               <button id="confirm-upi-paid-btn" class="btn-primary-cta" style="flex:1;">
-                <span id="confirm-upi-label">I've Paid</span> (₹<span id="qr-pay-amount-label">100</span>)
+                I've Paid (₹<span id="qr-pay-amount-label">100</span>)
               </button>
             </div>
           </div>
 
           <!-- TAB 2: Razorpay Gateway Container -->
-          <div id="pay-panel-razorpay" class="pay-panel hidden">
+          <div id="pay-panel-razorpay" class="pay-panel">
             <div class="razorpay-preview-card">
               <div class="razorpay-logo-row">
-                <span class="rzp-badge" id="rzp-mode-badge">RAZORPAY</span>
+                <span class="rzp-badge">RAZORPAY SECURE CHECKOUT</span>
                 <span class="rzp-shield">🔒 256-bit SSL</span>
               </div>
               <p class="rzp-desc">Pay with any UPI app, Credit/Debit Card or NetBanking. The money is added to your wallet automatically as soon as the payment goes through.</p>
@@ -920,7 +916,7 @@
           <div class="sos-details-box">
             <div class="sos-row">
               <span class="label">Location:</span>
-              <strong id="sos-display-location">Near Uni-Mall, LPU Campus</strong>
+              <strong id="sos-display-location"></strong>
             </div>
             <div class="sos-row">
               <span class="label">Campus Control Room:</span>
@@ -928,7 +924,7 @@
             </div>
             <div class="sos-row">
               <span class="label">SMS Broadcast:</span>
-              <span id="sos-contacts-count">2 Emergency Contacts Dispatched</span>
+              <span id="sos-contacts-count"></span>
             </div>
           </div>
 
@@ -1140,9 +1136,7 @@
 
   </div>
 
-  <!-- Leaflet Map JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <!-- Application Script -->
+  <script src="leaflet.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

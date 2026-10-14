@@ -17,9 +17,8 @@ import urllib.parse
 import urllib.request
 
 import shared
-from pricing_and_queue import MAX_SERVICE_RADIUS_KM, haversine_distance_km
+from pricing_and_queue import LPU_CENTER as LPU, MAX_SERVICE_RADIUS_KM, haversine_distance_km
 
-LPU = (31.2536, 75.7037)
 # Bounding box that comfortably contains the service radius (about 2 degrees of latitude / 2.2 of longitude).
 _LAT_SPAN = MAX_SERVICE_RADIUS_KM / 111.0
 _LNG_SPAN = MAX_SERVICE_RADIUS_KM / (111.0 * 0.855)
@@ -52,6 +51,9 @@ def _cache_key(parts):
 
 
 def _fetch_json(url):
+    # NOMINATIM_URL / OSRM_URL come from the environment; never let one open a local file.
+    if not url.startswith(("https://", "http://")):
+        raise GeoError("The map service is not configured correctly.")
     if not _upstream_slots.acquire(timeout=0.5):
         raise GeoError("The map service is busy right now. Please try again in a moment.")
     req = urllib.request.Request(url, headers={"User-Agent": _user_agent(), "Accept": "application/json"})
@@ -164,31 +166,3 @@ def road_route(a_lat, a_lng, b_lat, b_lng):
         raise GeoError("No road route found between those points.") from exc
     shared.cache_put(key, result, ROUTE_CACHE_TTL)
     return result
-
-
-def point_along_route(points, fraction):
-    """The [lat, lng] lying `fraction` (0..1) of the way along the road path, measured by distance."""
-    if len(points) < 2 or fraction <= 0:
-        return list(points[0])
-    if fraction >= 1:
-        return list(points[-1])
-    legs = [haversine_distance_km(a[0], a[1], b[0], b[1]) for a, b in zip(points, points[1:])]
-    goal = sum(legs) * fraction
-    for (a, b), leg in zip(zip(points, points[1:]), legs):
-        if goal <= leg and leg > 0:
-            t = goal / leg
-            return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
-        goal -= leg
-    return list(points[-1])
-
-
-def step_toward(cur_lat, cur_lng, target_lat, target_lng, fraction):
-    """Demo vehicle movement: advance `fraction` of the remaining way along the real road path,
-    falling back to a straight line only if the routing service is unavailable."""
-    try:
-        points = road_route(cur_lat, cur_lng, target_lat, target_lng)["points"]
-    except GeoError:
-        points = []
-    if len(points) >= 2:
-        return point_along_route(points, fraction)
-    return [cur_lat + (target_lat - cur_lat) * fraction, cur_lng + (target_lng - cur_lng) * fraction]

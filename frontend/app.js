@@ -73,11 +73,8 @@ function showConfirm(message) {
   return showDialog({ message, confirmText: 'Yes', cancelText: 'No', danger: true });
 }
 
-const DEFAULT_AVATAR = 'data:image/svg+xml;utf8,' + encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><rect width="120" height="120" fill="#FFE9D6"/>'
-  + '<circle cx="60" cy="46" r="22" fill="#FF7C00"/><path d="M16 120c4-28 22-42 44-42s40 14 44 42z" fill="#FF7C00"/></svg>'
-);
 const LPU_COORDS = [31.2536, 75.7037];
+const AVATAR = '/avatar-default.svg';
 
 const AppState = {
   currentUser: null,
@@ -96,6 +93,14 @@ const AppState = {
   ratingRideId: null,
   ratingValue: 5,
   currentUpiRef: null,
+  sosAlertId: null,
+  userPosition: null,      // the phone's latest GPS fix: {lat, lng}
+  userMarker: null,
+  offCampus: undefined,
+  locating: false,
+  locationWatchId: null,
+  availableDrivers: null,
+  polling: false,
   homeMap: null,
   activeMap: null,
   homeMarkers: {},
@@ -107,6 +112,7 @@ const AppState = {
   placeSeq: 0,
   trackRouteAt: 0,
   tripRouteFor: '',
+  tripRouteBusy: false,
   activeLeg: null,
   activeFit: null,
   roadMinutes: null,
@@ -123,10 +129,6 @@ function esc(value) {
   }[c]));
 }
 
-function safeImageUrl(url) {
-  return typeof url === 'string' && /^https:\/\//i.test(url) ? url : DEFAULT_AVATAR;
-}
-
 function money(value) {
   return Number(value || 0).toFixed(2);
 }
@@ -137,6 +139,8 @@ function $(id) {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', async () => {
+  // Lets the app be installed (and packaged for the Play Store) and show a page when offline.
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   initNavigation();
   initModals();
   await loadConfig();
@@ -157,7 +161,7 @@ async function loadConfig() {
     const res = await fetch('/api/config');
     AppState.config = await res.json();
   } catch (err) {
-    AppState.config = { security_hotline: '+91 1824 517000', razorpay_enabled: false, payments_demo_mode: false };
+    AppState.config = { security_hotline: '+91 1824 517000', razorpay_enabled: false, upi_enabled: false };
   }
   const hotline = AppState.config.security_hotline;
   const link = $('sos-hotline-link');
@@ -228,7 +232,7 @@ async function apiGet(url) {
 
 function showLoginScreen() {
   $('login-screen').classList.remove('hidden');
-  if (typeof resetAuthForms === 'function') resetAuthForms();
+  resetAuthForms();
 }
 
 function hideLoginScreen() {
@@ -271,6 +275,28 @@ async function handleLogoutClick() {
     // Offline: still sign out locally.
   }
   handleLogout();
+}
+
+// Google Play and the App Store require that an account can be deleted from inside the app.
+async function handleDeleteAccount() {
+  const balance = Number(AppState.currentUser ? AppState.currentUser.wallet_balance : 0);
+  const lost = balance > 0
+    ? ` Your wallet balance of ₹${money(balance)} will be lost. To get it refunded, contact us first (see the Privacy Policy).`
+    : '';
+  const confirmed = await showDialog({
+    message: `Delete your CampusGo account? Your profile, emergency contacts and vehicle are removed and this can't be undone.${lost}`,
+    confirmText: 'Delete account',
+    cancelText: 'Keep account',
+    danger: true
+  });
+  if (!confirmed) return;
+  const { ok, data } = await apiPost('/api/user/delete-account');
+  if (!ok) {
+    showAlert(data.error || 'Could not delete your account. Please try again.');
+    return;
+  }
+  handleLogout();
+  showAlert('Your account has been deleted.');
 }
 
 function handleLogout() {
@@ -538,16 +564,6 @@ function showOtpStep(reply) {
   AuthFlow.challengeId = reply.challenge_id;
   $('otp-phone-hint').textContent = reply.phone_hint;
   document.querySelectorAll('#otp-boxes input').forEach((box) => { box.value = ''; });
-  const note = $('otp-demo-note');
-  if (reply.demo_otp) {
-    note.replaceChildren('Demo mode, no SMS sent. Your code is ');
-    const code = document.createElement('code');
-    code.textContent = reply.demo_otp;
-    note.appendChild(code);
-    note.classList.remove('hidden');
-  } else {
-    note.classList.add('hidden');
-  }
   authShow('otp');
   startResendCountdown(reply.resend_after || 30);
 }
@@ -704,19 +720,11 @@ function initAuthHandlers() {
   });
   initOtpBoxes();
   $('logout-btn').addEventListener('click', handleLogoutClick);
+  $('delete-account-btn').addEventListener('click', handleDeleteAccount);
 }
-
-window.initializeCustomLocationDropdowns = initializeCustomLocationDropdowns;
-window.syncCustomLocationDropdowns = syncCustomLocationDropdowns;
 
 // --- Map Initialization (OpenStreetMap, no API key needed) ---
 function initMaps() {
-  if (typeof L === 'undefined') {
-    renderMapFallback('campus-map', 'Campus map preview');
-    renderMapFallback('active-tracking-map', 'Live tracking map');
-    return;
-  }
-
   // The tile server comes from the server's config (TILE_URL), and its credit is always shown:
   // map data licences require it.
   const tiles = () => L.tileLayer((AppState.config && AppState.config.tile_url) || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -749,23 +757,6 @@ document.addEventListener('visibilitychange', () => {
   if (AppState.activeRide && AppState.timers.track) trackActiveRide();
   else if (AppState.timers.queue) checkActiveRide();
 });
-
-function renderMapFallback(elementId, label) {
-  const mapElement = $(elementId);
-  if (!mapElement || mapElement.querySelector('.map-fallback')) return;
-
-  mapElement.innerHTML = `
-    <div class="map-fallback" role="img" aria-label="${esc(label)}">
-      <div class="map-fallback-road road-horizontal"></div>
-      <div class="map-fallback-road road-vertical"></div>
-      <div class="map-fallback-area area-academic">Academic Blocks</div>
-      <div class="map-fallback-area area-mall">Uni-Mall</div>
-      <div class="map-fallback-area area-hostels">Hostels</div>
-      <div class="map-fallback-pin pin-campus">LPU</div>
-      <div class="map-fallback-caption">${esc(label)} • LPU Campus</div>
-    </div>
-  `;
-}
 
 // --- Load Landmarks from API ---
 async function loadLandmarks() {
@@ -866,7 +857,7 @@ async function detectUserLocation() {
     }
 
     setBadge('Locating…');
-    showLocationGate('Turn on location', 'CampusGo needs your live location to set your pickup and match nearby riders. Tap Allow when your browser asks.', false);
+    showLocationGate('Turn on location', 'CampusGo needs your live location to set your pickup and match nearby riders. Tap Allow when asked.', false);
 
     let result = await requestPosition(false, 15000);
     if (!result.pos && result.error && result.error.code !== 1) {
@@ -878,7 +869,7 @@ async function detectUserLocation() {
       showLocationGate(
         denied ? 'Location is blocked' : 'Could not find you',
         denied
-          ? 'Location access is blocked for this site. Click the lock icon in the address bar, set Location to Allow, then tap Try again.'
+          ? 'Location access is blocked. Allow location for CampusGo in your phone or browser settings, then tap Try again.'
           : 'We could not get your position. Check that GPS or Wi-Fi location is on, then tap Try again.'
       );
       return;
@@ -1175,7 +1166,7 @@ function populatePlannedRouteDropdowns() {
   originSelect.innerHTML = '';
   destinationSelect.innerHTML = '';
 
-  Object.entries(AppState.landmarks).forEach(([key, location]) => {
+  Object.values(AppState.landmarks).forEach((location) => {
     if (location.custom) return;
     const option = document.createElement('option');
     option.value = location.name;
@@ -1226,11 +1217,6 @@ function vehicleIcon(category, size = 28, border = '#FF7C00') {
 }
 
 function renderMapLandmarks() {
-  if (!AppState.homeMap) {
-    renderMapFallback('campus-map', 'Campus map preview');
-    return;
-  }
-
   Object.values(AppState.homeMarkers).forEach((m) => AppState.homeMap.removeLayer(m));
   AppState.homeMarkers = {};
 
@@ -1268,7 +1254,7 @@ async function refreshNearbyDrivers() {
       } else {
         AppState.driverMarkers[dr.key] = L.marker([dr.lat, dr.lng], { icon: vehicleIcon(dr.category) })
           .addTo(AppState.homeMap)
-          .bindPopup(`<b>${esc(dr.first_name)}</b> (${esc(dr.category)})<br>Available`);
+          .bindPopup(`Available ${esc(dr.category)}`);
       }
     });
     Object.keys(AppState.driverMarkers).forEach((key) => {
@@ -1621,7 +1607,6 @@ function updateUserUI() {
   if (!u) return;
 
   $('header-wallet-amount').textContent = money(u.wallet_balance);
-  $('header-avatar').src = safeImageUrl(u.avatar_url);
 
   const badgeEl = $('header-badge');
   if (u.is_teacher_priority) {
@@ -1632,10 +1617,9 @@ function updateUserUI() {
   }
 
   $('profile-card-name').textContent = u.name;
-  $('profile-card-avatar').src = safeImageUrl(u.avatar_url);
-  $('profile-card-department').textContent = u.department || 'Lovely Professional University';
+  $('profile-card-username').textContent = `@${u.username}`;
   $('profile-card-id').textContent = `LPU ID: ${u.lpu_id}`;
-  $('profile-account-lpu').textContent = `Signed in as ${u.lpu_id} (${u.email})`;
+  $('profile-account-lpu').textContent = `Signed in as ${u.lpu_id} · ${u.phone}`;
 
   document.querySelectorAll('.role-pill-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.role === u.role);
@@ -1726,10 +1710,9 @@ async function handleRemoveContact(contactId) {
 async function checkActiveRide() {
   if (!AppState.currentUser) return;
   try {
-    const sess = await apiGet('/api/user/active-session');
-    if (sess.ok && sess.data.active_session && sess.data.session_type === 'scheduled_route'
-        && sess.data.active_session.status === 'in_progress') {
-      await openDuringRideCockpit(sess.data.active_session.route_id);
+    const carpool = await apiGet('/api/routes/active');
+    if (carpool.ok && carpool.data.route_id) {
+      await openDuringRideCockpit(carpool.data.route_id);
       return;
     }
 
@@ -1892,11 +1875,11 @@ async function loadActivityHistory() {
 }
 
 // --- Live ride screen ---
-function passengerChip(name, avatar, suffix = '') {
+function passengerChip(name, suffix = '') {
   const chip = document.createElement('span');
   chip.className = 'passenger-chip';
   chip.innerHTML = `
-    <img src="${esc(safeImageUrl(avatar))}" alt="">
+    <img src="${AVATAR}" alt="">
     <span class="passenger-chip-name">${esc(name)}${suffix ? ` ${esc(suffix)}` : ''}</span>
   `;
   return chip;
@@ -1907,7 +1890,6 @@ function updateRideControls(status, isRider) {
   const completeBtn = $('complete-ride-btn');
   const cancellable = ['queued', 'matched', 'arriving'].includes(status);
   cancelBtn.classList.toggle('hidden', !cancellable);
-  $('sim-telemetry-btn').classList.toggle('hidden', !(AppState.config && AppState.config.demo_simulation) || isRider);
   cancelBtn.querySelector('span').textContent = isRider ? 'Cancel Ride (Refund)' : 'Release Ride';
   completeBtn.classList.remove('hidden');
   completeBtn.disabled = status !== 'in_progress';
@@ -1955,12 +1937,11 @@ function renderActiveRide(ride) {
   $('cockpit-telemetry-sub').textContent = isArriving ? 'Driver is heading to your pickup point' : 'En route to destination';
 
   $('active-driver-name').textContent = ride.driver_name || 'Assigned Driver';
-  $('active-driver-avatar').src = safeImageUrl(ride.driver_avatar);
   $('active-vehicle-model').textContent = ride.vehicle_model || 'Vehicle';
   $('active-vehicle-plate').textContent = ride.vehicle_plate || '—';
 
   const manifestBox = $('cockpit-passenger-list');
-  manifestBox.replaceChildren(passengerChip(ride.rider_name || 'Rider', ride.rider_avatar, '(Rider)'));
+  manifestBox.replaceChildren(passengerChip(ride.rider_name || 'Rider', '(Rider)'));
   $('manifest-count-badge').textContent = '1 Passenger';
 
   updateRideControls(ride.status, ride.is_rider !== false);
@@ -2111,39 +2092,6 @@ async function trackActiveRide() {
   }
 }
 
-// --- Demo-only simulation step (server refuses it unless DEMO_SIMULATE_MOVEMENT=1) ---
-async function advanceTelemetryStep() {
-  if (AppState.activeCockpitRouteId) {
-    const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/telemetry-step`);
-    if (!ok) {
-      showAlert(data.error || 'Could not update the trip');
-      return;
-    }
-    if (AppState.activeMarkers.car) AppState.activeMarkers.car.setLatLng([data.current_lat, data.current_lng]);
-    $('cockpit-telemetry-sub').textContent = `${data.distance_remaining_km} km remaining • Moving towards destination`;
-    return;
-  }
-
-  if (!AppState.activeRide) return;
-  const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(AppState.activeRide.id)}/telemetry-step`);
-  if (!ok) {
-    showAlert(data.error || 'Could not update the ride');
-    return;
-  }
-  AppState.activeRide.status = data.status;
-  if (AppState.activeMarkers.driver && data.current_lat) {
-    AppState.activeMarkers.driver.setLatLng([data.current_lat, data.current_lng]);
-  }
-  const isArriving = data.status === 'arriving' || data.status === 'matched';
-  $('cockpit-live-status-text').textContent = isArriving ? 'DRIVER ARRIVING' : 'RIDE IN PROGRESS';
-  if (data.distance_remaining_km !== undefined) {
-    $('cockpit-telemetry-sub').textContent = isArriving && data.distance_remaining_km === 0
-      ? "At the pickup. Ask the rider for their PIN to start."
-      : `${isArriving ? 'Driver is' : 'Destination is'} ${data.distance_remaining_km} km away`;
-  }
-  updateRideControls(data.status, AppState.activeRide.is_rider !== false);
-}
-
 // --- Completing trips ---
 async function handleCompleteRide() {
   if (AppState.activeCockpitRouteId) {
@@ -2291,8 +2239,8 @@ async function handleTriggerSOS() {
     const total = data.contacts_notified.length;
     $('sos-contacts-count').textContent = data.sms_gateway_configured
       ? `${data.contacts_sent} of ${total} contacts texted`
-      : `SMS is not set up on this server. Your ${total} contacts were NOT texted. Call them directly.`;
-    $('sos-gateway-tag').textContent = data.sms_gateway_configured ? 'SMS gateway active' : 'No SMS gateway';
+      : `Texting is unavailable right now. Your ${total} contacts were NOT texted. Call them directly.`;
+    $('sos-gateway-tag').textContent = data.sms_gateway_configured ? 'Sent by SMS' : 'SMS unavailable';
     $('sos-sms-text').textContent = data.sos_message;
     $('sos-advice-text').textContent = data.campus_security_dispatch.message;
 
@@ -2383,22 +2331,12 @@ async function fetchUpiQr(amount) {
   }
 }
 
+// A direct UPI payment has no automatic confirmation: an admin credits it after checking the bank statement.
 async function handleConfirmUpiPayment() {
   if (!AppState.currentUser || !AppState.currentUpiRef) return;
-  const { ok, status, data } = await apiPost('/api/payments/upi/confirm', { reference_id: AppState.currentUpiRef });
-  if (!ok) {
-    setTopupStatus(data.error || 'Payment confirmation failed');
-    return;
-  }
-  if (status === 202) {
-    setTopupStatus(data.message);
-    AppState.currentUpiRef = null;
-    return;
-  }
-  setWalletBalance(data.new_balance);
-  closeModal('modal-topup');
-  fetchFareQuotes();
-  showAlert(`₹${money(data.amount_credited)} added. New balance: ₹${money(data.new_balance)}`);
+  const { ok, data } = await apiPost('/api/payments/upi/confirm', { reference_id: AppState.currentUpiRef });
+  setTopupStatus(ok ? data.message : data.error || 'Payment confirmation failed');
+  if (ok) AppState.currentUpiRef = null;
 }
 
 function loadRazorpayScript() {
@@ -2435,8 +2373,7 @@ function showTopupCredited(data) {
 // Asks the server to check with Razorpay for payments this browser never heard back about
 // (tab closed, phone switched to the UPI app) and adds them to the wallet.
 async function syncRazorpayPayments() {
-  const cfg = AppState.config || {};
-  if (!AppState.currentUser || !cfg.razorpay_enabled || cfg.payments_demo_mode) return;
+  if (!AppState.currentUser || !(AppState.config && AppState.config.razorpay_enabled)) return;
   try {
     const { ok, data } = await apiPost('/api/payments/razorpay/sync');
     if (ok && data.amount_credited > 0) showTopupCredited(data);
@@ -2453,13 +2390,6 @@ async function handleRazorpayCheckout() {
     setTopupStatus(order.error || 'Failed to start the payment');
     return;
   }
-
-  if (order.demo_mode) {
-    // Demo servers accept a fixed test signature; live servers never do.
-    await verifyRazorpayPayment(order.order_id, `pay_demo_${Date.now()}`, 'demo_signature_valid');
-    return;
-  }
-
   try {
     await loadRazorpayScript();
   } catch (err) {
@@ -2473,7 +2403,7 @@ async function handleRazorpayCheckout() {
     order_id: order.order_id,
     name: order.merchant_name,
     description: 'CampusGo wallet top-up',
-    prefill: { email: AppState.currentUser.email, contact: AppState.currentUser.phone },
+    prefill: { name: AppState.currentUser.name, contact: AppState.currentUser.phone },
     handler: (resp) => verifyRazorpayPayment(resp.razorpay_order_id, resp.razorpay_payment_id, resp.razorpay_signature),
     modal: { ondismiss: syncRazorpayPayments }
   });
@@ -2481,22 +2411,22 @@ async function handleRazorpayCheckout() {
   checkout.open();
 }
 
+function selectPayMethod(method) {
+  document.querySelectorAll('.pay-method-tab').forEach((t) => t.classList.toggle('active', t.dataset.method === method));
+  $('pay-panel-upi').classList.toggle('hidden', method !== 'upi');
+  $('pay-panel-razorpay').classList.toggle('hidden', method !== 'razorpay');
+}
+
+// Razorpay credits the wallet the moment the payment goes through, so it is the default; the direct
+// UPI QR waits for a person to check the bank statement. Each tab appears only if the server has it set up.
 function configureTopupModal() {
   const cfg = AppState.config || {};
   $('modal-current-bal').textContent = money(AppState.currentUser.wallet_balance);
-  $('confirm-upi-label').textContent = cfg.payments_demo_mode ? 'Simulate Payment (Demo)' : "I've Paid";
-  $('rzp-mode-badge').textContent = cfg.payments_demo_mode ? 'RAZORPAY DEMO MODE' : 'RAZORPAY SECURE CHECKOUT';
-  const upiTab = document.querySelector('.pay-method-tab[data-method="upi"]');
-  const rzpTab = document.querySelector('.pay-method-tab[data-method="razorpay"]');
-  rzpTab.classList.toggle('hidden', !cfg.razorpay_enabled);
-  // The direct QR is always the first choice, but outside demo mode someone has to check the
-  // bank statement before it is credited; Razorpay is the instant one.
-  const upiInstant = Boolean(cfg.payments_demo_mode);
-  upiTab.querySelector('.tab-badge').classList.toggle('hidden', !upiInstant);
-  rzpTab.querySelector('.tab-badge').classList.toggle('hidden', upiInstant);
-  upiTab.querySelector('.tab-label').textContent = upiInstant ? 'UPI QR Code' : 'UPI QR (manual check)';
-  setTopupStatus('');
-  fetchUpiQr(currentTopupAmount());
+  document.querySelector('.pay-method-tab[data-method="upi"]').classList.toggle('hidden', !cfg.upi_enabled);
+  document.querySelector('.pay-method-tab[data-method="razorpay"]').classList.toggle('hidden', !cfg.razorpay_enabled);
+  selectPayMethod(cfg.razorpay_enabled || !cfg.upi_enabled ? 'razorpay' : 'upi');
+  setTopupStatus(cfg.razorpay_enabled || cfg.upi_enabled ? '' : 'Top-ups are not available right now. Please try again later.');
+  if (cfg.upi_enabled) fetchUpiQr(currentTopupAmount());
   syncRazorpayPayments();
 }
 
@@ -2565,7 +2495,7 @@ async function handleToggleOnline(event) {
   AppState.driverOnline = data.is_online;
   $('online-status-text').textContent = data.is_online ? 'Online' : 'Offline';
   if (data.is_online && !pos) {
-    showAlert('Allow location access in your browser. Without your live position riders cannot be matched to you.');
+    showAlert('Allow location access for CampusGo. Without your live position riders cannot be matched to you.');
   }
   refreshNearbyDrivers();
   fetchFareQuotes();
@@ -2655,7 +2585,7 @@ function routeCardHtml(r, pinned) {
   const chips = r.passengers.length
     ? r.passengers.map((p) => `
         <span class="passenger-chip">
-          <img src="${esc(safeImageUrl(p.passenger_avatar))}" alt="">
+          <img src="${AVATAR}" alt="">
           <span class="passenger-chip-name">${esc(p.passenger_name)}</span>
           <span class="passenger-chip-seats">(${Number(p.seats)} seat${p.seats > 1 ? 's' : ''})</span>
         </span>`).join('')
@@ -2695,7 +2625,7 @@ function routeCardHtml(r, pinned) {
       <div class="route-price-tag">₹${Number(r.price_per_seat).toFixed(0)} <span style="font-size:0.6rem; color:var(--text-muted);">/seat</span></div>
     </div>
     <div class="route-driver-row">
-      <img class="route-driver-avatar" src="${esc(safeImageUrl(r.driver_avatar))}" alt="">
+      <img class="route-driver-avatar" src="${AVATAR}" alt="">
       <span class="route-driver-text"><strong>${esc(r.driver_name)}</strong> • ${esc(r.vehicle_model || 'Vehicle')}${r.vehicle_plate ? ` (${esc(r.vehicle_plate)})` : ''}</span>
     </div>
     <div style="margin: 6px 0;">
@@ -2869,13 +2799,12 @@ async function openDuringRideCockpit(routeId) {
     $('active-pickup-name').textContent = cockpit.origin;
     $('active-drop-name').textContent = cockpit.destination;
     $('active-driver-name').textContent = `${cockpit.driver_name} (Host)`;
-    $('active-driver-avatar').src = safeImageUrl(cockpit.driver_avatar);
     $('active-vehicle-model').textContent = cockpit.vehicle_model || 'Vehicle';
     $('active-vehicle-plate').textContent = cockpit.vehicle_plate || '—';
 
     const manifestBox = $('cockpit-passenger-list');
     manifestBox.replaceChildren(...cockpit.passengers.map((p) =>
-      passengerChip(p.passenger_name, p.passenger_avatar, `(${p.seats} seat${p.seats > 1 ? 's' : ''})`)));
+      passengerChip(p.passenger_name, `(${p.seats} seat${p.seats > 1 ? 's' : ''})`)));
     $('manifest-count-badge').textContent = `${cockpit.passengers.length} Passenger${cockpit.passengers.length === 1 ? '' : 's'}`;
 
     $('cancel-ride-btn').classList.add('hidden');
@@ -2980,13 +2909,7 @@ function closeModal(id) {
 function initEventHandlers() {
   // Top-up payment method tabs
   document.querySelectorAll('.pay-method-tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.pay-method-tab').forEach((t) => t.classList.remove('active'));
-      tab.classList.add('active');
-      const isUpi = tab.dataset.method === 'upi';
-      $('pay-panel-upi').classList.toggle('hidden', !isUpi);
-      $('pay-panel-razorpay').classList.toggle('hidden', isUpi);
-    });
+    tab.addEventListener('click', () => selectPayMethod(tab.dataset.method));
   });
 
   $('topup-custom-input').addEventListener('input', () => {
@@ -3043,7 +2966,7 @@ function initEventHandlers() {
 
   $('quick-topup-btn').addEventListener('click', () => openModal('modal-topup'));
   $('header-wallet-btn').addEventListener('click', () => openModal('modal-topup'));
-  $('persona-switch-btn').addEventListener('click', () => switchView('view-profile'));
+  $('profile-btn').addEventListener('click', () => switchView('view-profile'));
   $('recenter-map-btn').addEventListener('click', () => {
     if (AppState.homeMap) {
       const c = AppState.userPosition ? [AppState.userPosition.lat, AppState.userPosition.lng] : LPU_COORDS;
@@ -3055,8 +2978,6 @@ function initEventHandlers() {
   $('find-ride-btn').addEventListener('click', handleBookRide);
   $('cancel-queued-ride-btn').addEventListener('click', handleCancelRide);
   $('cancel-ride-btn').addEventListener('click', handleCancelRide);
-  $('sim-telemetry-btn').addEventListener('click', advanceTelemetryStep);
-  if (!(AppState.config && AppState.config.demo_simulation)) $('sim-telemetry-btn').classList.add('hidden');
   $('route-time-input').value = defaultDeparture();
   $('complete-ride-btn').addEventListener('click', handleCompleteRide);
 

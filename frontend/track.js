@@ -19,7 +19,7 @@
   }
 
   function ensureMap(ride) {
-    if (map || typeof L === 'undefined') return;
+    if (map) return;
     map = L.map('track-map').setView([ride.pickup_lat, ride.pickup_lng], 14);
     map.attributionControl.setPrefix(false);
     L.tileLayer(tileConfig.tile_url || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', {

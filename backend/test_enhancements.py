@@ -1,6 +1,9 @@
+import os
 import unittest
+from unittest import mock
 
-from test_support import ClientMixin
+from test_support import RAZORPAY_ENV, ClientMixin, razorpay_signature
+import payments
 from emergency_dispatch import format_sos_message, normalize_phone
 from payments import generate_upi_qr
 
@@ -10,23 +13,26 @@ class TestEnhancements(ClientMixin, unittest.TestCase):
         res = generate_upi_qr("pay_test", 150.0)
         self.assertIn("upi://pay?", res["upi_uri"])
         self.assertIn("am=150.00", res["upi_uri"])
+        self.assertIn("pa=campusgo-test@okicici", res["upi_uri"])
         self.assertTrue(res["qr_data_url"].startswith("data:image/svg+xml"))
 
-    def test_02_demo_razorpay_flow_credits_order_amount_once(self):
+    def test_02_razorpay_payment_credits_order_amount_once(self):
         headers = self.auth_headers("usr_student_aarav")
         before = self.balance(headers)
-        order = self.client.post("/api/payments/razorpay/create-order", headers=headers, json={"amount": 250}).get_json()
-        self.assertEqual(order["amount"], 25000)
-        verify = {"order_id": order["order_id"], "payment_id": "pay_demo_1",
-                  "signature": "demo_signature_valid", "amount": 5000}
-        res = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(self.balance(headers), before + 250)  # client "amount" is ignored
-        replay = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
-        self.assertTrue(replay.get_json()["already_credited"])  # same payment reported twice: no second credit
-        self.assertEqual(self.balance(headers), before + 250)
-        other = self.client.post("/api/payments/razorpay/verify", headers=headers, json={**verify, "payment_id": "pay_demo_2"})
-        self.assertEqual(other.status_code, 400)
+        with mock.patch.dict(os.environ, RAZORPAY_ENV), \
+                mock.patch.object(payments, "_razorpay_api", return_value={"id": "order_enh_250"}):
+            order = self.client.post("/api/payments/razorpay/create-order", headers=headers, json={"amount": 250}).get_json()
+            self.assertEqual((order["amount"], order["key_id"]), (25000, "rzp_test_x"))
+            verify = {"order_id": order["order_id"], "payment_id": "pay_enh_1",
+                      "signature": razorpay_signature(order["order_id"], "pay_enh_1"), "amount": 5000}
+            res = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(self.balance(headers), before + 250)  # client "amount" is ignored
+            replay = self.client.post("/api/payments/razorpay/verify", headers=headers, json=verify)
+            self.assertTrue(replay.get_json()["already_credited"])  # same payment reported twice: no second credit
+            other = self.client.post("/api/payments/razorpay/verify", headers=headers, json={
+                **verify, "payment_id": "pay_enh_2", "signature": razorpay_signature(order["order_id"], "pay_enh_2")})
+            self.assertEqual(other.status_code, 400)
         self.assertEqual(self.balance(headers), before + 250)
 
     def test_03_sos_message_format(self):

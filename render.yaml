@@ -1,8 +1,9 @@
 # Render blueprint sized for real traffic: several app instances sharing a managed PostgreSQL
 # database and a Redis-compatible Key Value store. These are PAID plans (check Render's pricing
-# page before deploying). For a free throwaway demo, set the web plan to "free", delete the
-# `scaling` block, the Key Value service and the database, and remove DATABASE_URL / REDIS_URL:
-# the app then falls back to SQLite and a single worker (data is lost on every deploy).
+# page before deploying). For a single small instance instead, set the web plan to "starter",
+# delete the `scaling` block, the Key Value service and the database, and remove DATABASE_URL /
+# REDIS_URL: the app then uses SQLite and one worker. Add a persistent disk and point
+# DATABASE_PATH at a file on it, or every deploy starts with an empty database.
 databases:
   - name: campusgo-db
     plan: basic-1gb
@@ -28,13 +29,12 @@ services:
       maxInstances: 4
       targetCPUPercent: 60
     buildCommand: pip install -r requirements.txt
-    # Migrations run once per deploy, then gunicorn starts its workers (backend/gunicorn.conf.py).
-    startCommand: >-
-      python backend/database.py &&
-      if [ "$SEED_DEMO_DATA" = "1" ]; then python backend/seed_data.py --if-empty; fi &&
-      gunicorn --config backend/gunicorn.conf.py
+    # The schema is created when the app starts (safe with many workers at once).
+    startCommand: gunicorn --config backend/gunicorn.conf.py
     healthCheckPath: /healthz
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.13"
       - key: DATABASE_URL
         fromDatabase:
           name: campusgo-db
@@ -59,30 +59,38 @@ services:
       # Render sits behind one proxy; this makes rate limits use the real client IP.
       - key: TRUST_PROXY_HOPS
         value: "1"
+      # Your public address, e.g. https://campusgo.example.com (used in SOS trip links).
       - key: PUBLIC_BASE_URL
         sync: false
-      # Creates the demo personas on an empty database. Set "0" for a real launch.
-      - key: SEED_DEMO_DATA
-        value: "1"
-      # "1" shows a fake moving vehicle driven from the UI. Leave "0": real trips use the driver's phone GPS.
-      - key: DEMO_SIMULATE_MOVEMENT
-        value: "0"
-      # "1" lets reviewers top up with fake money. Leave "0" for anything real.
-      - key: PAYMENTS_DEMO_MODE
-        value: "0"
-      - key: CAMPUSGO_UPI_VPA
-        value: pratham1286-1@okicici
+      # Signing in needs real SMS: set FAST2SMS_API_KEY (or the three Twilio keys).
+      - key: FAST2SMS_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      # App Store / Play reviewers sign in with this number and fixed 6-digit code (see README).
+      - key: REVIEW_LOGIN_PHONE
+        sync: false
+      - key: REVIEW_LOGIN_CODE
+        sync: false
+      # Payments: Razorpay keys (live keys for real money) and the webhook secret.
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
       - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
-      # Logging in needs real SMS: set FAST2SMS_API_KEY (or the Twilio keys) below, otherwise
-      # sign-in answers 503. "1" shows the code on screen instead; only for a throwaway demo,
-      # because anyone who knows a demo ID + number could then log in as that person.
-      - key: OTP_DEMO_MODE
-        value: "0"
+      # Optional: your UPI ID for direct UPI QR top-ups (approved by hand; leave empty to turn off).
+      - key: CAMPUSGO_UPI_VPA
+        sync: false
+      # Play Store app (Trusted Web Activity): package name and signing-key SHA-256 from the Play Console.
+      - key: ANDROID_PACKAGE_NAME
+        sync: false
+      - key: ANDROID_CERT_SHA256
+        sync: false
       # Map services. The free public OpenStreetMap servers forbid heavy use: for real traffic
       # set a tile provider (TILE_URL + TILE_ATTRIBUTION) and hosted routing/search (OSRM_URL,
       # NOMINATIM_URL). See .env.example.
@@ -95,12 +103,4 @@ services:
       - key: NOMINATIM_URL
         sync: false
       - key: OSRM_URL
-        sync: false
-      - key: FAST2SMS_API_KEY
-        sync: false
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_PHONE_NUMBER
         sync: false

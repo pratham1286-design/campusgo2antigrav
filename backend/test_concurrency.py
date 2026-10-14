@@ -19,11 +19,10 @@ class TestConcurrentWrites(ClientMixin, unittest.TestCase):
         for _ in range(self.RIDERS):
             tag = secrets.token_hex(6)
             uid = f"usr_conc_{tag}"
-            self.db("""INSERT INTO users (id, lpu_id, name, email, phone, user_type, role, password_hash, is_verified,
-                       is_teacher_priority, created_at, username, phone_key)
-                       VALUES (?, ?, 'Conc Rider', '', '+916000000000', 'student', 'rider', '', 1, 0, ?, ?, ?)""",
-                    (uid, f"C{tag}", now, f"conc{tag}", f"c{tag}"))
-            self.db("INSERT INTO wallets (user_id, balance, currency, updated_at) VALUES (?, ?, 'INR', ?)", (uid, balance, now))
+            self.db("""INSERT INTO users (id, lpu_id, username, name, phone, phone_key, user_type, role, created_at)
+                       VALUES (?, ?, ?, 'Conc Rider', '+916000000000', ?, 'student', 'rider', ?)""",
+                    (uid, f"C{tag}", f"conc{tag}", f"c{tag}", now))
+            self.db("INSERT INTO wallets (user_id, balance, updated_at) VALUES (?, ?, ?)", (uid, balance, now))
             headers.append({"Authorization": f"Bearer {SESSION_SERIALIZER.dumps({'u': uid, 'v': 0})}"})
         return headers
 

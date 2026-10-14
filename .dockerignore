@@ -1,0 +1,6 @@
+.git
+.env
+**/__pycache__
+backend/campusgo.db*
+backend/test_*.py
+backend/e2e_browser_test.py

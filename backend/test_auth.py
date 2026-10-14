@@ -1,9 +1,13 @@
 """Sign up and log in with SMS one-time passwords."""
+import os
 import unittest
 from unittest import mock
 
-from test_support import ClientMixin, LPU_IDS, PHONES
-from app import RATE_LIMIT_STORE
+from test_support import SMS_OUTBOX, ClientMixin, LPU_IDS, PHONES, last_otp
+import emergency_dispatch
+import shared
+
+REVIEW_ENV = {"REVIEW_LOGIN_PHONE": "9123499999", "REVIEW_LOGIN_CODE": "246810"}
 
 
 def wrong_code(real):
@@ -12,18 +16,18 @@ def wrong_code(real):
 
 class TestSignupAndLogin(ClientMixin, unittest.TestCase):
     def start_signup(self, **overrides):
-        RATE_LIMIT_STORE.clear()
+        shared.clear_rate_limits()
         payload = {"name": "Nisha Verma", "username": "nisha.verma", "user_type": "student",
                    "lpu_id": "12400001", "phone": "+91 91234 56780"}
         payload.update(overrides)
         return self.client.post("/api/auth/signup/start", json=payload)
 
     def test_suggestions_skip_taken_usernames(self):
-        RATE_LIMIT_STORE.clear()
+        shared.clear_rate_limits()
         res = self.client.post("/api/auth/username-suggestions", json={"name": "Aarav Mehta"})
         names = res.get_json()["suggestions"]
         self.assertEqual(len(names), 5)
-        self.assertNotIn("aarav.mehta", names)  # the seeded user already owns it
+        self.assertNotIn("aarav.mehta", names)  # the fixture user already owns it
         self.assertEqual(len(set(names)), 5)
         for n in names:
             available = self.client.post("/api/auth/username-available", json={"username": n}).get_json()
@@ -33,13 +37,14 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
         res = self.start_signup()
         self.assertEqual(res.status_code, 200, res.get_json())
         start = res.get_json()
+        self.assertNotIn("demo_otp", start)
+        code = last_otp("9123456780")
 
         wrong = self.client.post("/api/auth/signup/verify",
-                                 json={"challenge_id": start["challenge_id"], "otp": wrong_code(start["demo_otp"])})
+                                 json={"challenge_id": start["challenge_id"], "otp": wrong_code(code)})
         self.assertEqual(wrong.status_code, 400)
 
-        done = self.client.post("/api/auth/signup/verify",
-                                json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]})
+        done = self.client.post("/api/auth/signup/verify", json={"challenge_id": start["challenge_id"], "otp": code})
         self.assertEqual(done.status_code, 200, done.get_json())
         body = done.get_json()
         self.assertEqual(body["user"]["username"], "nisha.verma")
@@ -47,17 +52,16 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
         headers = {"Authorization": f"Bearer {body['token']}"}
         self.assertEqual(self.client.get("/api/auth/me", headers=headers).status_code, 200)
 
-        replay = self.client.post("/api/auth/signup/verify",
-                                  json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]})
+        replay = self.client.post("/api/auth/signup/verify", json={"challenge_id": start["challenge_id"], "otp": code})
         self.assertEqual(replay.status_code, 400)
 
         # A fresh install logs in with LPU ID + mobile + OTP and gets the same account back.
-        RATE_LIMIT_STORE.clear()
+        shared.clear_rate_limits()
         self.db("DELETE FROM otp_challenges")
         self.client.post("/api/user/role", headers=headers, json={"role": "both"})
         login = self.client.post("/api/auth/login/start", json={"lpu_id": "12400001", "phone": "9123456780"}).get_json()
         again = self.client.post("/api/auth/login/verify",
-                                 json={"challenge_id": login["challenge_id"], "otp": login["demo_otp"]}).get_json()
+                                 json={"challenge_id": login["challenge_id"], "otp": last_otp("9123456780")}).get_json()
         self.assertEqual(again["user"]["id"], body["user"]["id"])
         self.assertEqual(again["user"]["role"], "both")
 
@@ -75,52 +79,81 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
         start = self.start_signup(name="Meera Iyer", username="meera.iyer", user_type="teacher",
                                   lpu_id="fac-20001", phone="9123400005").get_json()
         user = self.client.post("/api/auth/signup/verify",
-                                json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]}).get_json()["user"]
+                                json={"challenge_id": start["challenge_id"], "otp": last_otp("9123400005")}).get_json()["user"]
         self.assertEqual(user["lpu_id"], "FAC-20001")
         self.assertEqual(user["user_type"], "teacher")
 
-    def test_login_needs_matching_id_and_phone(self):
-        RATE_LIMIT_STORE.clear()
+    def test_login_with_the_wrong_number_texts_nobody(self):
+        shared.clear_rate_limits()
         res = self.client.post("/api/auth/login/start",
                                json={"lpu_id": LPU_IDS["usr_student_aarav"], "phone": PHONES["usr_student_kavya"]})
-        self.assertEqual(res.status_code, 404)
-        self.assertNotIn("demo_otp", res.get_json())
+        self.assertEqual(res.status_code, 200)  # looks like a real request, so accounts can't be discovered
+        self.assertEqual(SMS_OUTBOX, [])
+        verify = self.client.post("/api/auth/login/verify", json={"challenge_id": res.get_json()["challenge_id"], "otp": "123456"})
+        self.assertEqual(verify.status_code, 400)
 
     def test_wrong_code_locks_challenge_after_five_tries(self):
-        RATE_LIMIT_STORE.clear()
+        shared.clear_rate_limits()
         start = self.client.post("/api/auth/login/start",
                                  json={"lpu_id": LPU_IDS["usr_driver_vikram"], "phone": PHONES["usr_driver_vikram"]}).get_json()
+        code = last_otp(PHONES["usr_driver_vikram"])
         for _ in range(5):
-            RATE_LIMIT_STORE.clear()
+            shared.clear_rate_limits()
             res = self.client.post("/api/auth/login/verify",
-                                   json={"challenge_id": start["challenge_id"], "otp": wrong_code(start["demo_otp"])})
+                                   json={"challenge_id": start["challenge_id"], "otp": wrong_code(code)})
             self.assertEqual(res.status_code, 400)
-        RATE_LIMIT_STORE.clear()
-        right = self.client.post("/api/auth/login/verify",
-                                 json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]})
+        shared.clear_rate_limits()
+        right = self.client.post("/api/auth/login/verify", json={"challenge_id": start["challenge_id"], "otp": code})
         self.assertEqual(right.status_code, 429)
 
     def test_signup_code_cannot_be_used_to_log_in(self):
         start = self.start_signup(username="cross.check", lpu_id="12400006", phone="9123400006").get_json()
         res = self.client.post("/api/auth/login/verify",
-                               json={"challenge_id": start["challenge_id"], "otp": start["demo_otp"]})
+                               json={"challenge_id": start["challenge_id"], "otp": last_otp("9123400006")})
         self.assertEqual(res.status_code, 400)
 
     def test_resend_cooldown(self):
-        RATE_LIMIT_STORE.clear()
+        shared.clear_rate_limits()
         payload = {"lpu_id": LPU_IDS["usr_driver_simran"], "phone": PHONES["usr_driver_simran"]}
         self.assertEqual(self.client.post("/api/auth/login/start", json=payload).status_code, 200)
         self.assertEqual(self.client.post("/api/auth/login/start", json=payload).status_code, 429)
 
-    def test_without_gateway_or_demo_mode_no_code_is_issued(self):
-        RATE_LIMIT_STORE.clear()
-        with mock.patch.dict("os.environ", {"OTP_DEMO_MODE": "0"}):
+    def test_without_an_sms_gateway_no_code_is_issued(self):
+        shared.clear_rate_limits()
+        with mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
             res = self.client.post("/api/auth/login/start",
                                    json={"lpu_id": LPU_IDS["usr_student_kavya"], "phone": PHONES["usr_student_kavya"]})
         self.assertEqual(res.status_code, 503)
 
     def test_old_password_login_is_gone(self):
         self.assertIn(self.client.post("/api/auth/login", json={"lpu_id": "12204592", "password": "x"}).status_code, (404, 405))
+
+
+class TestReviewLogin(ClientMixin, unittest.TestCase):
+    """App Store / Play reviewers sign in with a fixed code on one configured number."""
+
+    def test_review_number_signs_up_and_logs_in_with_the_fixed_code_and_no_sms(self):
+        with mock.patch.dict(os.environ, REVIEW_ENV), mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
+            start = self.client.post("/api/auth/signup/start", json={
+                "name": "App Review", "username": "app.review", "user_type": "student",
+                "lpu_id": "12499999", "phone": "9123499999"})
+            self.assertEqual(start.status_code, 200, start.get_json())
+            done = self.client.post("/api/auth/signup/verify",
+                                    json={"challenge_id": start.get_json()["challenge_id"], "otp": "246810"})
+            self.assertEqual(done.status_code, 200, done.get_json())
+            self.assertEqual(SMS_OUTBOX, [])
+
+            # Every other number still needs a real SMS, which isn't configured here.
+            other = self.client.post("/api/auth/login/start",
+                                     json={"lpu_id": LPU_IDS["usr_student_kavya"], "phone": PHONES["usr_student_kavya"]})
+            self.assertEqual(other.status_code, 503)
+
+    def test_review_code_is_ignored_unless_it_is_six_digits(self):
+        with mock.patch.dict(os.environ, {**REVIEW_ENV, "REVIEW_LOGIN_CODE": "12ab"}):
+            self.client.post("/api/auth/signup/start", json={
+                "name": "App Review", "username": "app.review2", "user_type": "student",
+                "lpu_id": "12499998", "phone": "9123499999"})
+        self.assertRegex(last_otp("9123499999"), r"^\d{6}$")  # a normal random code was texted
 
 
 if __name__ == "__main__":

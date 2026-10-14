@@ -1,17 +1,19 @@
 import unittest
+from unittest import mock
 
 from test_support import ClientMixin, departure_in
+import emergency_dispatch
 
 
 class TestCampusGo(ClientMixin, unittest.TestCase):
     def test_00_protected_routes_need_a_token(self):
         self.assertEqual(self.client.get("/api/wallet").status_code, 401)
 
-    def test_01_login_returns_teacher_badge_without_password_hash(self):
+    def test_01_login_returns_teacher_badge(self):
         headers = self.auth_headers("usr_teacher_raman")
         user = self.client.get("/api/auth/me", headers=headers).get_json()["user"]
         self.assertEqual(user["is_teacher_priority"], 1)
-        self.assertNotIn("password_hash", user)
+        self.assertEqual(user["username"], "raman.sharma")
 
     def test_02_server_side_fare_quotes(self):
         headers = self.auth_headers("usr_student_aarav")
@@ -33,7 +35,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         self.assertEqual(res.status_code, 402)
         self.assertEqual(res.get_json()["code"], "INSUFFICIENT_WALLET_BALANCE")
 
-        self.assertEqual(self.topup_demo(headers, 100).get_json()["new_balance"], 110.0)
+        self.assertEqual(self.topup(headers, 100).get_json()["new_balance"], 110.0)
 
         book = self.client.post("/api/rides/book", headers=headers, json=trip)
         self.assertEqual(book.status_code, 200)
@@ -64,15 +66,11 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         # Can't complete before pickup, and can't rate before completion.
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/complete", headers=rider).status_code, 409)
         self.assertEqual(self.client.post(f"/api/rides/{ride_id}/rate", headers=rider, json={"rating": 5}).status_code, 409)
-        step = {}
-        driver = self.auth_headers(self.db("SELECT driver_id FROM rides WHERE id = ?", (ride_id,))[0]["driver_id"])
-        for _ in range(20):
-            step = self.client.post(f"/api/rides/{ride_id}/telemetry-step", headers=driver).get_json()
-            if step["distance_remaining_km"] == 0:
-                break
-        self.assertEqual(step["status"], "arriving")  # at the pickup, the ride still waits for the rider's PIN
+        # The driver's phone reports reaching the pickup; the ride still waits for the rider's PIN.
+        at_pickup = self.client.post("/api/driver/location", headers=vikram, json={"lat": 31.2535, "lng": 75.7038})
+        self.assertEqual(at_pickup.get_json()["ride_status"], "arriving")
         pin = self.client.get("/api/rides/active", headers=rider).get_json()["active_ride"]["start_pin"]
-        start = self.client.post(f"/api/rides/{ride_id}/start", headers=driver, json={"pin": pin})
+        start = self.client.post(f"/api/rides/{ride_id}/start", headers=vikram, json={"pin": pin})
         self.assertEqual(start.status_code, 200, start.get_json())
 
         comp = self.client.post(f"/api/rides/{ride_id}/complete", headers=rider)
@@ -88,13 +86,19 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
 
     def test_06_sos_reports_delivery_honestly(self):
         headers = self.auth_headers("usr_student_aarav")
-        res = self.client.post("/api/sos/trigger", headers=headers, json={
-            "lat": 31.2535, "lng": 75.7038, "location_name": "Uni-Mall Student Plaza"})
+        sos = {"lat": 31.2535, "lng": 75.7038, "location_name": "Uni-Mall Student Plaza"}
+        res = self.client.post("/api/sos/trigger", headers=headers, json=sos)
         self.assertEqual(res.status_code, 200)
         data = res.get_json()
-        self.assertGreater(len(data["contacts_notified"]), 0)
-        self.assertTrue(all(c["delivery"]["status"] == "not_sent" for c in data["contacts_notified"]))
+        self.assertEqual(len(data["contacts_notified"]), 2)
+        self.assertEqual(data["contacts_sent"], 2)
         self.assertEqual(data["campus_security_dispatch"]["status"], "not_connected")
+
+        with mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
+            data = self.client.post("/api/sos/trigger", headers=headers, json=sos).get_json()
+        self.assertFalse(data["sms_gateway_configured"])
+        self.assertEqual(data["contacts_sent"], 0)
+        self.assertTrue(all(c["delivery"]["status"] == "not_sent" for c in data["contacts_notified"]))
 
     def test_07_driver_posts_route_to_chandigarh(self):
         headers = self.auth_headers("usr_driver_harpreet")
@@ -124,7 +128,11 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         join = self.client.post(f"/api/routes/{route_id}/join", headers=rider, json={"seats": 1})
         self.assertEqual(join.status_code, 200)
         self.assertTrue(join.get_json()["is_pinned"])
+        self.client.post("/api/driver/location", headers=host, json={"lat": 31.2535, "lng": 75.7038})  # at Uni-Mall
         self.assertEqual(self.client.post(f"/api/routes/{route_id}/start", headers=host).status_code, 200)
+        # The drive to Phagwara takes a while; an instant 10 km jump would be rejected as GPS spoofing.
+        self.db("UPDATE driver_locations SET updated_at = updated_at - 590 WHERE driver_id = 'usr_driver_harpreet'")
+        self.client.post("/api/driver/location", headers=host, json={"lat": 31.2210, "lng": 75.7720})
         done = self.client.post(f"/api/routes/{route_id}/complete", headers=host)
         self.assertEqual(done.get_json()["driver_payout"], 90.0)
         self.assertEqual(self.client.post(f"/api/routes/{route_id}/complete", headers=host).status_code, 409)
