@@ -1,7 +1,9 @@
 import base64
 import json
+import logging
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -11,6 +13,8 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")
 # Single source of truth for the helpline shown in the app and in SMS alerts.
 CAMPUS_SECURITY_PHONE = os.environ.get("CAMPUS_SECURITY_PHONE", "+91 1824 517000")
+
+log = logging.getLogger("campusgo")
 
 PHONE_PATTERN = re.compile(r"^\+?\d{10,15}$")
 
@@ -58,6 +62,16 @@ def _fast2sms_ok(body):
     return isinstance(body, dict) and body.get("return") is True
 
 
+def _http_error_text(exc):
+    """The gateway's own error message (bad key, no balance, unverified number...) for the logs."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            return f"HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:500]}"
+        except Exception:
+            return f"HTTP {exc.code}"
+    return repr(exc)
+
+
 def send_fast2sms(phone, message):
     clean_phone = re.sub(r"\D", "", phone)[-10:]
     payload = {"route": "q", "message": message, "language": "english", "numbers": clean_phone}
@@ -69,8 +83,12 @@ def send_fast2sms(phone, message):
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        return {"status": "sent" if _fast2sms_ok(body) else "failed", "gateway": "Fast2SMS"}
-    except Exception:
+        if not _fast2sms_ok(body):
+            log.warning("Fast2SMS rejected the SMS: %s", str(body)[:500])
+            return {"status": "failed", "gateway": "Fast2SMS"}
+        return {"status": "sent", "gateway": "Fast2SMS"}
+    except Exception as exc:
+        log.warning("Fast2SMS request failed: %s", _http_error_text(exc))
         return {"status": "failed", "gateway": "Fast2SMS"}
 
 
@@ -87,7 +105,8 @@ def send_twilio_sms(phone, message):
         with urllib.request.urlopen(req, timeout=5) as resp:
             json.loads(resp.read().decode("utf-8"))
             return {"status": "sent", "gateway": "Twilio"}
-    except Exception:
+    except Exception as exc:
+        log.warning("Twilio request failed: %s", _http_error_text(exc))
         return {"status": "failed", "gateway": "Twilio"}
 
 

@@ -16,6 +16,7 @@ import threading
 DB_PATH = os.environ.get("DATABASE_PATH") or os.path.join(os.path.dirname(__file__), "campusgo.db")
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 IS_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+print("DATABASE BACKEND:", "PostgreSQL" if IS_POSTGRES else "SQLite")
 
 # Write transactions are serialised with this advisory lock on PostgreSQL, matching SQLite's
 # single-writer behaviour that the money and seat logic relies on.
