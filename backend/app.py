@@ -976,19 +976,8 @@ def login_start():
     conn = get_db()
     user = conn.execute("SELECT id FROM users WHERE upper(lpu_id) = ? AND phone_key = ?", (lpu_id, key)).fetchone()
     if not user:
-        # Same reply (and the same resend cooldown) as a real code request, so this endpoint
-        # can't be used to find out who has an account.
-        try:
-            check_rate(f"otp-decoy:{key}", 1, OTP_RESEND_SECONDS)
-        except ApiError:
-            raise ApiError(f"Please wait {OTP_RESEND_SECONDS}s before asking for another code", 429, "OTP_COOLDOWN",
-                           retry_after=OTP_RESEND_SECONDS)
-        return jsonify({
-            "challenge_id": f"otp_{secrets.token_urlsafe(16)}",
-            "phone_hint": f"+91 {key[:2]}XXXXXX{key[-2:]}",
-            "expires_in": OTP_TTL_SECONDS,
-            "resend_after": OTP_RESEND_SECONDS,
-        })
+        raise ApiError("No registered account matches that LPU ID and mobile number. Check your details or sign up.",
+                       404, "ACCOUNT_NOT_FOUND")
     return jsonify(issue_otp(conn, "login", key, {"user_id": user["id"]}))
 
 
