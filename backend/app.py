@@ -619,7 +619,8 @@ STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; ch
                 ".webmanifest": "application/manifest+json"}
 VERSIONED_ASSETS = ("app.js", "styles.css", "track.js", "leaflet.js", "leaflet.css", "protomaps-leaflet.js", "campus-map.js")
 PUBLIC_FILES = VERSIONED_ASSETS + ("sw.js", "manifest.webmanifest", "offline.html", "favicon.svg", "avatar-default.svg",
-                                   "icon-192.png", "icon-512.png", "apple-touch-icon.png")
+                                   "icon-192.png", "icon-512.png", "icon-maskable-192.png", "icon-maskable-512.png",
+                                   "apple-touch-icon.png")
 _static_files = {}
 _static_lock = threading.RLock()  # re-entered: a page loads its JS/CSS to version them
 

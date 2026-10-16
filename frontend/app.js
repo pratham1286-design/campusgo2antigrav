@@ -321,6 +321,7 @@ function showLoginScreen() {
 
 function hideLoginScreen() {
   $('login-screen').classList.add('hidden');
+  window.scrollTo(0, 0);  // the OTP keyboard can leave the page scrolled, pushing the bottom bar off screen
 }
 
 async function tryResumeSession() {
@@ -1324,26 +1325,25 @@ function renderMapLandmarks() {
 
   const p = pickupPlace();
   if (p) {
-    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#059669', 'P', 32), draggable: true, autoPan: true })
+    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#059669', 'P', 32), draggable: true, autoPan: true, zIndexOffset: 1000 })
       .addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${esc(p.name)}`);
     AppState.homeMarkers.pickup.on('dragend', (e) => movePickupTo(e.target.getLatLng()));
   }
   const d = dropPlace();
   if (d) {
-    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#F97316', 'D', 32), draggable: true, autoPan: true })
+    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#F97316', 'D', 32), draggable: true, autoPan: true, zIndexOffset: 1000 })
       .addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${esc(d.name)}`);
     AppState.homeMarkers.drop.on('dragend', (e) => moveDropTo(e.target.getLatLng()));
   }
   const hint = $('drop-pin-hint');
-  hint.textContent = p && d
-    ? 'Drag P for pickup and D for destination\nWarning: These locations may be approximate. Move both pins to your intended spots before booking.'
-    : 'Choose pickup and destination to move the map pins';
+  hint.textContent = p && (p.moved || (d && d.moved)) ? 'Pins moved. Drag again to adjust.' : 'Drag P and D to your exact spots';
   hint.classList.toggle('hidden', !p || !d);
   drawHomeRoute();
 }
 
-// The rider dragged the destination pin: the trip now ends exactly there. The place keeps its
-// name, as "Near …" when moved more than a short walk away, so the driver still knows the area.
+// The rider dragged a pin: the trip now starts or ends exactly there (pins are only approximate).
+// The place keeps its name, as "Near …" when moved more than a short walk away, so the driver
+// still knows the area.
 function movePickupTo(latlng) {
   const p = pickupPlace();
   if (!p) return;
@@ -1351,7 +1351,7 @@ function movePickupTo(latlng) {
   const origin = p.origin || { lat: p.lat, lng: p.lng };
   const far = distanceKm(origin.lat, origin.lng, latlng.lat, latlng.lng) > 0.3;
   AppState.customPickup = {
-    key: AppState.pickupKey, name: far ? `Near ${base}` : base, baseName: base, origin,
+    key: AppState.pickupKey, name: far ? `Near ${base}` : base, baseName: base, origin, moved: true,
     lat: Number(latlng.lat.toFixed(6)), lng: Number(latlng.lng.toFixed(6))
   };
   AppState.keepMapView = true;
@@ -1529,6 +1529,7 @@ function chooseDrop(choice) {
   }
   $('drop-suggestions').classList.add('hidden');
   $('drop-search-input').blur();
+  setRideSheetExpanded(false);  // show the route, so the rider can drag the pins into place
   syncDropSearchInput();
   fetchFareQuotes();
 }
@@ -1553,8 +1554,9 @@ function initDropSearch() {
   const input = $('drop-search-input');
   input.addEventListener('focus', () => {
     input.select();
-    // On small phones the suggestions open below the fold, so bring the box to the top of the panel.
-    setTimeout(() => input.scrollIntoView({ block: 'start', behavior: 'smooth' }), 150);
+    // On small phones the suggestions open below the fold: raise the sheet and bring the box to its top.
+    setRideSheetExpanded(true);
+    setTimeout(() => input.scrollIntoView({ block: 'start', behavior: 'smooth' }), 260);
     const current = dropPlace();
     searchDropPlaces(current && input.value === current.name ? '' : input.value.trim());
   });
@@ -2999,41 +3001,60 @@ function initNavigation() {
   initRideSheet();
 }
 
+// The booking sheet slides over the map: drag the handle (the sheet follows the finger) or tap it.
+// When the sheet is up and scrolled to the top, swiping down on it brings the map back too.
 function initRideSheet() {
-  const handle = $('sheet-handle-toggle');
-  if (!handle) return;
   const view = $('view-ride');
-  let startY = null;
-  let dragged = false;
+  const sheet = $('ride-bottom-sheet');
+  const handle = $('sheet-handle-toggle');
+  let drag = null;
+
   handle.addEventListener('pointerdown', (event) => {
-    startY = event.clientY;
-    dragged = false;
+    drag = { y: event.clientY, top: sheet.offsetTop, moved: false };
     handle.setPointerCapture(event.pointerId);
+    view.classList.add('sheet-dragging');
   });
-  handle.addEventListener('pointerup', (event) => {
-    if (startY === null) return;
-    const delta = event.clientY - startY;
-    startY = null;
-    if (Math.abs(delta) >= 36) {
-      dragged = true;
-      setRideSheetExpanded(delta < 0);
+  handle.addEventListener('pointermove', (event) => {
+    if (!drag) return;
+    const dy = event.clientY - drag.y;
+    if (Math.abs(dy) > 6) drag.moved = true;
+    const lowest = view.querySelector('.map-wrapper').offsetHeight;
+    sheet.style.top = `${Math.min(lowest, Math.max(0, drag.top + dy))}px`;
+  });
+  const endDrag = (event, cancelled) => {
+    if (!drag) return;
+    const { y, moved } = drag;
+    drag = null;
+    view.classList.remove('sheet-dragging');
+    sheet.style.top = '';
+    if (cancelled) return;
+    setRideSheetExpanded(moved ? event.clientY < y : !view.classList.contains('sheet-expanded'));
+  };
+  handle.addEventListener('pointerup', (event) => endDrag(event, false));
+  handle.addEventListener('pointercancel', (event) => endDrag(event, true));
+  // Keyboard users: Enter/Space fire a click with no pointer events around it.
+  handle.addEventListener('click', (event) => {
+    if (event.detail === 0) setRideSheetExpanded(!view.classList.contains('sheet-expanded'));
+  });
+
+  let swipeFrom = null;
+  sheet.addEventListener('touchstart', (event) => {
+    swipeFrom = view.classList.contains('sheet-expanded') && sheet.scrollTop <= 0 ? event.touches[0].clientY : null;
+  }, { passive: true });
+  sheet.addEventListener('touchend', (event) => {
+    if (swipeFrom !== null && sheet.scrollTop <= 0 && event.changedTouches[0].clientY - swipeFrom > 70) {
+      setRideSheetExpanded(false);
     }
-  });
-  handle.addEventListener('pointercancel', () => { startY = null; });
-  handle.addEventListener('click', () => {
-    if (dragged) { dragged = false; return; }
-    setRideSheetExpanded(!view.classList.contains('sheet-expanded'));
-  });
+    swipeFrom = null;
+  }, { passive: true });
 }
 
 function setRideSheetExpanded(expanded) {
   const view = $('view-ride');
   const handle = $('sheet-handle-toggle');
-  if (!view || !handle) return;
   view.classList.toggle('sheet-expanded', expanded);
   handle.setAttribute('aria-expanded', String(expanded));
-  handle.setAttribute('aria-label', expanded ? 'Collapse ride options to show map' : 'Expand ride options over map');
-  if (AppState.homeMap) setTimeout(() => AppState.homeMap.invalidateSize({ pan: false }), 230);
+  handle.setAttribute('aria-label', expanded ? 'Lower ride options to show the map' : 'Raise ride options over the map');
 }
 
 function switchView(viewId) {
@@ -3121,6 +3142,7 @@ function initEventHandlers() {
       document.querySelectorAll('.scope-tab').forEach((t) => t.classList.remove('active'));
       tab.classList.add('active');
       AppState.selectedScope = tab.dataset.scope;
+      AppState.customDrop = null;  // each mode has its own destinations; a moved pin doesn't carry over
       populateLocationDropdowns();
     });
   });
@@ -3151,12 +3173,19 @@ function initEventHandlers() {
   $('swap-locations-btn').addEventListener('click', () => {
     const p = $('pickup-select');
     const d = $('drop-select');
-    if (p.value === CURRENT_LOCATION_KEY || AppState.customDrop) return;
-    if (!Array.from(p.options).some((o) => o.value === d.value) || !Array.from(d.options).some((o) => o.value === p.value)) return;
-    const temp = p.value;
-    p.value = d.value;
-    d.value = temp;
+    const pickupKey = p.value;
+    const dropKey = AppState.customDrop ? AppState.customDrop.key : d.value;
+    if (!Array.from(p.options).some((o) => o.value === dropKey) || !Array.from(d.options).some((o) => o.value === pickupKey)) return;
+    // Moved pins swap along with their places.
+    const movedPickup = AppState.customPickup;
+    const movedDrop = AppState.customDrop;
+    AppState.customPickup = movedDrop ? { ...movedDrop, key: dropKey } : null;
+    AppState.customDrop = movedPickup ? { ...movedPickup, key: pickupKey } : null;
+    p.value = dropKey;
+    d.value = pickupKey;
+    AppState.dropKey = pickupKey;
     syncCustomLocationDropdowns();
+    syncDropSearchInput();
     fetchFareQuotes();
   });
 

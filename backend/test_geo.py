@@ -182,6 +182,29 @@ class TestCustomDestination(ClientMixin, unittest.TestCase):
         # Both ends on campus is not a CityLink trip.
         self.assertEqual(post(drop_lat=31.2562, drop_lng=75.7050).status_code, 400)
 
+    def test_moved_pins_on_campus_keep_the_flat_fare(self):
+        headers = self.auth_headers("usr_student_aarav")
+        trip = {"pickup_key": "main_gate", "drop_key": "block_34", "scope": "campus_hop",
+                "pickup_lat": 31.2514, "pickup_lng": 75.7071, "drop_lat": 31.2566, "drop_lng": 75.7046}
+        res = self.client.post("/api/rides/quote", headers=headers, json=trip)
+        self.assertEqual(res.status_code, 200, res.get_json())
+        self.assertEqual(res.get_json()["quotes"]["bike"]["total_fare"], 14.0)
+        # A Campus Hop pin dragged off campus would be a long trip at the flat fare.
+        off_campus = self.client.post("/api/rides/quote", headers=headers, json={**trip, "drop_lat": 31.3190, "drop_lng": 75.5860})
+        self.assertEqual(off_campus.status_code, 400)
+
+    def test_moved_citylink_pin_is_priced_by_its_new_distance(self):
+        headers = self.auth_headers("usr_student_aarav")
+        trip = {"pickup_key": "uni_mall", "drop_key": "jalandhar_bus_stand", "scope": "citylink"}
+        fare = lambda **kw: self.client.post("/api/rides/quote", headers=headers, json={**trip, **kw}).get_json()["quotes"]["car"]
+        listed = fare()
+        moved = fare(drop_lat=31.3400, drop_lng=75.5600, drop_name="Near Jalandhar City Bus Stand")
+        self.assertGreater(moved["distance_km"], listed["distance_km"])
+        self.assertGreater(moved["base_fare"], listed["base_fare"])
+        # Only known places can be moved: a made-up key is rejected.
+        self.assertEqual(self.client.post("/api/rides/quote", headers=headers,
+                                          json={**trip, "pickup_key": "nowhere", "pickup_lat": 31.25, "pickup_lng": 75.70}).status_code, 400)
+
     def test_destination_name_is_sanitised(self):
         points, error = __import__("pricing_and_queue").custom_point(30.7333, 76.7794, "<b>Hi</b>\x00\n there" + "x" * 300)
         self.assertIsNone(error)

@@ -1,6 +1,33 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" fill="#111827"/>
-  <circle cx="256" cy="256" r="194" fill="#1E293B"/>
-  <path d="M256 83c-79 0-143 64-143 143 0 90 84 164 143 203 59-39 143-113 143-203 0-79-64-143-143-143Z" fill="#FF7C00"/>
-  <path d="M181 233 256 190l75 43v104h-55v-65h-40v65h-55Z" fill="#FFFDF9"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="CampusGo">
+  <!-- Source of icon-maskable-*.png. Android crops app icons to its own shape (circle, squircle…),
+       so the background fills the whole square and the logo stays inside the central safe circle. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#131313"/>
+      <stop offset="0.48" stop-color="#090909"/>
+      <stop offset="1" stop-color="#050505"/>
+    </linearGradient>
+    <radialGradient id="badge" cx="35%" cy="20%" r="85%">
+      <stop offset="0" stop-color="#171717"/>
+      <stop offset="1" stop-color="#0C0C0C"/>
+    </radialGradient>
+    <linearGradient id="pin" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF884D"/>
+      <stop offset="0.52" stop-color="#F4511E"/>
+      <stop offset="1" stop-color="#D93810"/>
+    </linearGradient>
+    <filter id="pin-shadow" x="-30%" y="-25%" width="160%" height="165%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="7" result="blur"/>
+      <feOffset dy="8" result="offset"/>
+      <feColorMatrix in="offset" type="matrix" values="0 0 0 0 0.01  0 0 0 0 0.04  0 0 0 0 0.09  0 0 0 .42 0" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="512" height="512" fill="url(#tile)"/>
+  <g transform="translate(256 262) scale(0.86) translate(-256 -250)">
+    <circle cx="256" cy="196" r="122" fill="url(#badge)" stroke="#555555" stroke-opacity="0.25" stroke-width="2"/>
+    <path d="M256 102C206.3 102 166 142.3 166 192c0 56.6 50.7 100.6 90 121 39.3-20.4 90-64.4 90-121 0-49.7-40.3-90-90-90Z" fill="url(#pin)" filter="url(#pin-shadow)"/>
+    <path d="M211 191v-21l45-25 45 25v75h-30v-46h-30v46h-30z" fill="#FFFDF9"/>
+    <text x="256" y="390" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="56" font-weight="700" letter-spacing="-2.5"><tspan fill="#FFFDF9">Campus</tspan><tspan fill="#FF6A36">Go</tspan></text>
+  </g>
 </svg>

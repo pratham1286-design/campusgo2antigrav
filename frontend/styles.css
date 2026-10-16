@@ -45,6 +45,8 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
+  /* A dark orange tint: the light #fff4ec made light text (ride PIN, selected vehicle) unreadable. */
+  --primary-orange-light: #3A2414;
   --text-main: #F1F5F9;
   --text-secondary: #CBD5E1;
   --text-muted: #94A3B8;
@@ -150,13 +152,17 @@ body {
   display: flex;
   justify-content: center;
   align-items: center;
+  min-height: 100vh;
   min-height: 100dvh;
 }
 
-/* Mobile Frame Container */
+/* Mobile Frame Container. 100dvh is the screen height that is actually visible (100vh is the
+   fallback for old browsers): with plain 100vh the bottom bar hid under the phone browser's toolbar.
+   overflow: clip stops focus and the keyboard from scrolling the frame and leaving it shifted. */
 .app-container {
   width: 100%;
   max-width: 440px;
+  height: 100vh;
   height: 100dvh;
   min-height: 0;
   max-height: 920px;
@@ -165,11 +171,13 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  overflow: clip;
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
 }
 
 @media (min-width: 480px) {
   .app-container {
+    height: min(880px, 100vh);
     height: min(880px, 100dvh);
     border-radius: 28px;
     border: 6px solid #1E293B;
@@ -308,6 +316,7 @@ body {
   min-height: 0;
   position: relative;
   overflow: hidden;
+  overflow: clip;
 }
 
 .app-view {
@@ -331,25 +340,19 @@ body {
    VIEW 1: RIDE (Half-Screen Live Map + Bottom Sheet)
    ========================================================================== */
 
+/* The map keeps its size and place; the booking sheet slides up over it (and back down). */
 #view-ride {
+  --map-height: 44%;
   overflow: hidden;
-  display: none;
-  grid-template-rows: minmax(0, 44fr) minmax(0, 56fr);
-  transition: grid-template-rows 220ms ease;
-}
-
-#view-ride.active-view {
-  display: grid;
-}
-
-#view-ride.sheet-expanded {
-  grid-template-rows: minmax(0, 0fr) minmax(0, 1fr);
+  overflow: clip;
 }
 
 .map-wrapper {
   position: absolute;
-  inset: 0;
-  width: 100%;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--map-height);
   z-index: 0;
   background: #E2E8F0;
 }
@@ -448,11 +451,12 @@ body {
 
 /* Bottom Sheet */
 .bottom-sheet {
-  position: relative;
-  grid-row: 2;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
+  position: absolute;
+  top: var(--map-height);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   background-color: var(--bg-card);
@@ -461,12 +465,24 @@ body {
   box-shadow: var(--shadow-sheet);
   display: flex;
   flex-direction: column;
-  padding: 0 16px calc(28px + env(safe-area-inset-bottom));
+  padding: 0 16px 28px;
   z-index: 200;
-  touch-action: pan-y;
+  transition: top 240ms ease;
+}
+
+#view-ride.sheet-expanded .bottom-sheet {
+  top: 0;
+}
+
+/* While a finger drags the handle, the sheet follows it exactly. */
+#view-ride.sheet-dragging .bottom-sheet {
+  transition: none;
 }
 
 .sheet-handle-bar {
+  position: sticky;
+  top: 0;
+  z-index: 90;
   flex: 0 0 auto;
   width: calc(100% + 32px);
   margin: 0 -16px 10px;
@@ -475,13 +491,13 @@ body {
   cursor: grab;
   display: flex;
   justify-content: center;
-  padding: 10px 0 8px;
+  padding: 12px 0 10px;
   touch-action: none;
 }
 
 .sheet-handle {
-  width: 36px;
-  height: 4px;
+  width: 44px;
+  height: 5px;
   background-color: var(--border-light);
   border-radius: 2px;
 }
@@ -1049,7 +1065,7 @@ body {
 
 .share-live-float-btn {
   position: absolute;
-  top: 14px;
+  top: 56px;  /* under the centred status pill: side by side they overlap on small phones */
   left: 14px;
   background-color: var(--bg-card);
   border: 1px solid var(--border-light);
@@ -1284,6 +1300,8 @@ body {
 .start-pin-input {
   flex: 1;
   min-width: 0;
+  background-color: var(--bg-card);
+  color: var(--text-main);
   padding: 10px 12px;
   border: 1px solid var(--border-light);
   border-radius: var(--radius-md);
@@ -2658,7 +2676,7 @@ body {
   position: absolute;
   inset: 0;
   z-index: 2000;
-  background: linear-gradient(180deg, #fff4ec 0%, var(--bg-canvas) 38%);
+  background: linear-gradient(180deg, var(--primary-orange-light) 0%, var(--bg-canvas) 38%);
   display: flex;
   justify-content: center;
   padding: 20px 20px 28px;
@@ -3177,7 +3195,6 @@ button.star-btn {
   font-size: 0.7rem;
   font-weight: 700;
   line-height: 1.3;
-  white-space: pre-line;
   pointer-events: none;
 }
 

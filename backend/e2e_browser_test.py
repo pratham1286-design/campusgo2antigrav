@@ -27,7 +27,6 @@ from werkzeug.serving import make_server  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="campusgo_e2e_")
 os.environ["ADMIN_API_KEY"] = ADMIN_KEY
-UNI_MALL = {"lat": 31.2535, "lng": 75.7038}
 
 PORT = 5059
 BASE = f"http://127.0.0.1:{PORT}"
@@ -139,6 +138,45 @@ def main():
               and page.locator("#upi-qr-container img").count() == 1)
         page.click('#modal-topup .modal-close-btn')
 
+        # ---- Campus Hop: both pins can be dragged, and the fare stays flat ----
+        def drag_pin(label, dx, dy):
+            box = page.get_by_role("button", name=label, exact=True).bounding_box()
+            x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+            page.mouse.move(x, y)
+            page.mouse.down()
+            page.mouse.move(x + dx, y + dy, steps=8)
+            page.mouse.up()
+            page.wait_for_timeout(1500)
+
+        drag_pin("P", 25, 20)
+        drag_pin("D", -25, 15)
+        moved = page.evaluate("[AppState.customPickup && AppState.customPickup.moved, AppState.customDrop && AppState.customDrop.moved]")
+        check("Campus Hop: pickup and drop pins can both be dragged", moved == [True, True], str(moved))
+        summary = page.locator("#selected-service-summary").inner_text()
+        check("Campus Hop: moved pins keep the flat ₹14 fare", "Flat ₹14" in summary, summary)
+        before_swap = page.evaluate("[AppState.customPickup.lat, AppState.customDrop.lat]")
+        page.click("#swap-locations-btn")
+        page.wait_for_timeout(1500)
+        after_swap = page.evaluate("[AppState.customPickup.lat, AppState.customDrop.lat]")
+        check("swap also swaps moved pins", after_swap == before_swap[::-1], f"{before_swap} -> {after_swap}")
+
+        # ---- the booking sheet slides over the map and back ----
+        handle = page.locator("#sheet-handle-toggle").bounding_box()
+        hx, hy = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2
+        map_box = page.locator(".map-wrapper").bounding_box()
+        page.mouse.move(hx, hy)
+        page.mouse.down()
+        page.mouse.move(hx, hy - 250, steps=10)
+        page.mouse.up()
+        page.wait_for_timeout(500)
+        sheet_top = page.locator("#ride-bottom-sheet").bounding_box()["y"]
+        check("dragging the handle up covers the map", sheet_top <= map_box["y"] + 1, f"sheet top {sheet_top}")
+        check("the map keeps its size under the sheet", page.locator(".map-wrapper").bounding_box() == map_box)
+        page.click("#sheet-handle-toggle")
+        page.wait_for_timeout(500)
+        sheet_top = page.locator("#ride-bottom-sheet").bounding_box()["y"]
+        check("tapping the handle brings the map back", abs(sheet_top - (map_box["y"] + map_box["height"])) <= 1, f"sheet top {sheet_top}")
+
         page.click('.scope-tab[data-scope="citylink"]')
         page.wait_for_timeout(1200)
         page.click("#drop-search-input")
@@ -152,19 +190,17 @@ def main():
         page.wait_for_timeout(2500)
         check("fare quote works for the searched place", "₹" in page.locator("#selected-service-summary").inner_text())
         check("road route chip appears", page.locator("#route-info-chip").is_visible(), page.locator("#route-info-chip").inner_text())
-        check("rider is told the drop pin can be dragged", page.locator("#drop-pin-hint").is_visible())
+        check("rider is told the pins can be dragged", page.locator("#drop-pin-hint").is_visible())
         before = page.evaluate("[AppState.customDrop.lat, AppState.customDrop.lng]")
-        box = page.locator(".leaflet-marker-draggable").bounding_box()
-        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-        page.mouse.move(x, y)
-        page.mouse.down()
-        page.mouse.move(x - 40, y + 30, steps=8)
-        page.mouse.up()
-        page.wait_for_timeout(2500)
+        fare_before = page.locator("#selected-service-summary").inner_text()
+        drag_pin("D", -40, 30)
+        page.wait_for_timeout(1000)
         after = page.evaluate("[AppState.customDrop.lat, AppState.customDrop.lng, AppState.customDrop.name]")
         check("dragging the drop pin moves the destination", after[:2] != before, f"{before} -> {after}")
         check("the moved destination keeps a readable name", "Sector 17" in after[2], after[2])
-        check("fare is re-quoted for the moved pin", "₹" in page.locator("#selected-service-summary").inner_text())
+        fare_after = page.locator("#selected-service-summary").inner_text()
+        check("CityLink fare is re-quoted from the new distance", "₹" in fare_after and fare_after != fare_before,
+              f"{fare_before} -> {fare_after}")
         shot(page, "rider_route")
 
         page.click("#find-ride-btn")
@@ -211,7 +247,8 @@ def main():
         check("the PIN alone can't start the ride away from the pickup",
               "pickup point" in dpage.locator(".app-dialog .dialog-message").inner_text())
         dpage.click(".app-dialog .dialog-btn-primary")
-        api("/api/driver/location", "POST", UNI_MALL, driver_token)  # the driver's phone reaches the pickup
+        ride = api("/api/rides/active", token=rider_token)["active_ride"]  # the pickup is where the rider dragged P
+        api("/api/driver/location", "POST", {"lat": ride["pickup_lat"], "lng": ride["pickup_lng"]}, driver_token)  # the driver's phone reaches it
         dpage.fill("#start-pin-input", pin)
         dpage.click("#start-ride-btn")
         dpage.wait_for_timeout(2500)
