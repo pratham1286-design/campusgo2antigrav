@@ -316,6 +316,7 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
+  isolation: isolate;
   display: none;
   flex-direction: column;
   overflow-y: auto;
