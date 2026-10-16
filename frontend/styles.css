@@ -333,9 +333,13 @@ body {
 
 #view-ride {
   overflow: hidden;
-  display: grid;
+  display: none;
   grid-template-rows: minmax(0, 44fr) minmax(0, 56fr);
   transition: grid-template-rows 220ms ease;
+}
+
+#view-ride.active-view {
+  display: grid;
 }
 
 #view-ride.sheet-expanded {
