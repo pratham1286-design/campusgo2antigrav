@@ -91,14 +91,18 @@ def custom_point(lat, lng, name):
 
 
 def validate_trip(scope: str, pickup_key: str, drop_key: str, pickup_lat=None, pickup_lng=None,
-                  drop_lat=None, drop_lng=None, drop_name=None):
+                  drop_lat=None, drop_lng=None, drop_name=None, pickup_name=None):
     """Returns (pickup, drop, error). Campus Hop must stay on campus; CityLink
     must have at least one off-campus end, so flat campus pricing can't be
     used for inter-city trips."""
     if scope not in VALID_SCOPES:
         return None, None, "Invalid ride type"
-    if pickup_key == CURRENT_LOCATION_KEY:
-        pickup, error = custom_point(pickup_lat, pickup_lng, "My current location")
+    pickup_has_coords = pickup_lat is not None or pickup_lng is not None
+    if pickup_key == CURRENT_LOCATION_KEY or pickup_has_coords:
+        if pickup_key != CURRENT_LOCATION_KEY and pickup_key not in CAMPUS_LANDMARKS:
+            return None, None, "Invalid pickup location selected"
+        label = pickup_name or CAMPUS_LANDMARKS.get(pickup_key, {}).get("name", "My current location")
+        pickup, error = custom_point(pickup_lat, pickup_lng, label)
         if error:
             return None, None, error
     else:
@@ -106,6 +110,13 @@ def validate_trip(scope: str, pickup_key: str, drop_key: str, pickup_lat=None, p
     if drop_key == CUSTOM_PLACE_KEY:
         if scope != "citylink":
             return None, None, "Searching for any address is available on CityLink only."
+        drop, error = custom_point(drop_lat, drop_lng, drop_name)
+        if error:
+            return None, None, error
+    elif drop_lat is not None or drop_lng is not None:
+        if drop_key not in CAMPUS_LANDMARKS:
+            return None, None, "Invalid destination selected"
+        drop_name = drop_name or CAMPUS_LANDMARKS[drop_key]["name"]
         drop, error = custom_point(drop_lat, drop_lng, drop_name)
         if error:
             return None, None, error

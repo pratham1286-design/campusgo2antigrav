@@ -85,7 +85,9 @@ const AppState = {
   selectedService: 'bike',     // 'bike' | 'scooty' | 'car'
   pickupKey: 'uni_mall',
   dropKey: 'block_34',
+  customPickup: null,
   quotes: null,
+  quoteSeq: 0,
   activeRide: null,
   activeCockpitRouteId: null,
   activeCockpitIsHost: false,
@@ -869,8 +871,15 @@ const CURRENT_LOCATION_KEY = 'current_location';
 const NOT_IN_CAMPUS_KEY = 'not_in_campus';
 const CUSTOM_PLACE_KEY = 'custom_place';
 
-// Real GPS coordinates are sent only when the pickup is "My current location".
+// Send adjusted map coordinates when a rider moves the pickup, or the GPS fix for current location.
 function pickupCoords(key) {
+  if (AppState.customPickup) {
+    return {
+      pickup_lat: AppState.customPickup.lat,
+      pickup_lng: AppState.customPickup.lng,
+      pickup_name: AppState.customPickup.name
+    };
+  }
   if (key !== CURRENT_LOCATION_KEY || !AppState.userPosition) return {};
   return { pickup_lat: AppState.userPosition.lat, pickup_lng: AppState.userPosition.lng };
 }
@@ -1293,7 +1302,7 @@ function populatePlannedRouteDropdowns() {
 function pinIcon(color, label, size = 24) {
   return L.divIcon({
     className: 'custom-map-pin',
-    html: `<div style="background:${color}; width:${size}px; height:${size}px; border-radius:50%; border:2px solid white; box-shadow:0 2px 6px rgba(0,0,0,0.3); display:flex; align-items:center; justify-content:center; color:white; font-size:10px; font-weight:bold;">${esc(label)}</div>`,
+    html: `<div style="background:${color}; width:${size}px; height:${size}px; border-radius:50%; border:2px solid white; box-shadow:0 0 0 2px #111827, 0 0 0 4px rgba(255,255,255,.92), 0 3px 9px rgba(0,0,0,.7); display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:800; text-shadow:0 1px 2px rgba(0,0,0,.65);">${esc(label)}</div>`,
     iconSize: [size, size],
     iconAnchor: [size / 2, size / 2]
   });
@@ -1315,26 +1324,40 @@ function renderMapLandmarks() {
 
   const p = pickupPlace();
   if (p) {
-    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#10B981', 'P') })
+    AppState.homeMarkers.pickup = L.marker([p.lat, p.lng], { icon: pinIcon('#059669', 'P', 32), draggable: true, autoPan: true })
       .addTo(AppState.homeMap).bindPopup(`<b>Pickup:</b> ${esc(p.name)}`);
+    AppState.homeMarkers.pickup.on('dragend', (e) => movePickupTo(e.target.getLatLng()));
   }
   const d = dropPlace();
-  // A CityLink destination can be dragged to the exact gate or door: searched places are often
-  // a few hundred metres off. Campus Hop stops are fixed (flat fares), so they stay put.
-  const movable = Boolean(d) && AppState.selectedScope === 'citylink';
   if (d) {
-    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#FF7C00', 'D', movable ? 34 : 24), draggable: movable, autoPan: true })
+    AppState.homeMarkers.drop = L.marker([d.lat, d.lng], { icon: pinIcon('#F97316', 'D', 32), draggable: true, autoPan: true })
       .addTo(AppState.homeMap).bindPopup(`<b>Destination:</b> ${esc(d.name)}`);
-    if (movable) AppState.homeMarkers.drop.on('dragend', (e) => moveDropTo(e.target.getLatLng()));
+    AppState.homeMarkers.drop.on('dragend', (e) => moveDropTo(e.target.getLatLng()));
   }
   const hint = $('drop-pin-hint');
-  hint.textContent = d && d.moved ? 'Pin moved. Drag D again to adjust.' : 'Drag the D pin to your exact drop point';
-  hint.classList.toggle('hidden', !movable);
+  hint.textContent = p && d
+    ? 'Drag P for pickup and D for destination\nWarning: These locations may be approximate. Move both pins to your intended spots before booking.'
+    : 'Choose pickup and destination to move the map pins';
+  hint.classList.toggle('hidden', !p || !d);
   drawHomeRoute();
 }
 
 // The rider dragged the destination pin: the trip now ends exactly there. The place keeps its
 // name, as "Near …" when moved more than a short walk away, so the driver still knows the area.
+function movePickupTo(latlng) {
+  const p = pickupPlace();
+  if (!p) return;
+  const base = p.baseName || p.name;
+  const origin = p.origin || { lat: p.lat, lng: p.lng };
+  const far = distanceKm(origin.lat, origin.lng, latlng.lat, latlng.lng) > 0.3;
+  AppState.customPickup = {
+    key: AppState.pickupKey, name: far ? `Near ${base}` : base, baseName: base, origin,
+    lat: Number(latlng.lat.toFixed(6)), lng: Number(latlng.lng.toFixed(6))
+  };
+  AppState.keepMapView = true;
+  fetchFareQuotes();
+}
+
 function moveDropTo(latlng) {
   const d = dropPlace();
   if (!d) return;
@@ -1342,11 +1365,12 @@ function moveDropTo(latlng) {
   const origin = d.origin || { lat: d.lat, lng: d.lng };
   const far = distanceKm(origin.lat, origin.lng, latlng.lat, latlng.lng) > 0.3;
   AppState.customDrop = {
+    key: d.key || AppState.dropKey,
     name: far ? `Near ${base}` : base, baseName: base, origin, moved: true,
     lat: Number(latlng.lat.toFixed(6)), lng: Number(latlng.lng.toFixed(6))
   };
-  AppState.dropKey = CUSTOM_PLACE_KEY;
-  $('drop-select').value = '';
+  AppState.dropKey = AppState.customDrop.key;
+  if (AppState.dropKey === CUSTOM_PLACE_KEY) $('drop-select').value = '';
   AppState.keepMapView = true;  // the rider is looking at this spot: don't zoom out to the whole trip
   syncDropSearchInput();
   fetchFareQuotes();
@@ -1390,18 +1414,19 @@ async function refreshNearbyDrivers() {
 // --- Destination (CityLink: any place, or a popular one) and route drawing ---
 function pickupPlace() {
   if (AppState.pickupKey === NOT_IN_CAMPUS_KEY) return null;
+  if (AppState.customPickup) return AppState.customPickup;
   return AppState.landmarks[AppState.pickupKey] || null;
 }
 
 function dropPlace() {
-  if (AppState.selectedScope === 'citylink' && AppState.customDrop) return AppState.customDrop;
+  if (AppState.customDrop) return AppState.customDrop;
   return AppState.landmarks[AppState.dropKey] || null;
 }
 
 function dropPayload() {
-  if (AppState.selectedScope === 'citylink' && AppState.customDrop) {
+  if (AppState.customDrop) {
     const d = AppState.customDrop;
-    return { drop_key: CUSTOM_PLACE_KEY, drop_lat: d.lat, drop_lng: d.lng, drop_name: d.name };
+    return { drop_key: d.key || AppState.dropKey, drop_lat: d.lat, drop_lng: d.lng, drop_name: d.name };
   }
   return { drop_key: $('drop-select').value };
 }
@@ -1493,7 +1518,7 @@ function renderDropSuggestions(query, places, status) {
 
 function chooseDrop(choice) {
   if (choice.custom) {
-    AppState.customDrop = choice.custom;
+    AppState.customDrop = { ...choice.custom, key: CUSTOM_PLACE_KEY };
     AppState.dropKey = CUSTOM_PLACE_KEY;
     $('drop-select').value = '';
   } else {
@@ -1641,8 +1666,10 @@ function renderAvailableRiders() {
 // --- Server-side fare quotes ---
 async function fetchFareQuotes() {
   if (!AppState.currentUser) return;
+  const quoteSeq = ++AppState.quoteSeq;
 
   const pickupKey = $('pickup-select').value;
+  if (AppState.customPickup && AppState.customPickup.key !== pickupKey) AppState.customPickup = null;
   const extra = dropPayload();
   AppState.pickupKey = pickupKey;
   AppState.dropKey = extra.drop_key;
@@ -1665,6 +1692,7 @@ async function fetchFareQuotes() {
       scope: AppState.selectedScope,
       ...pickupCoords(pickupKey)
     });
+    if (quoteSeq !== AppState.quoteSeq) return;
     if (!ok) {
       AppState.quotes = null;
       renderServiceTiles();
@@ -2076,8 +2104,8 @@ function renderActiveRide(ride) {
     const dCoords = [ride.drop_lat, ride.drop_lng];
     const drCoords = [ride.driver_live_lat || ride.pickup_lat, ride.driver_live_lng || ride.pickup_lng];
 
-    AppState.activeMarkers.pickup = L.marker(pCoords, { icon: pinIcon('#10B981', 'P', 22) }).addTo(AppState.activeMap);
-    AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#FF7C00', 'D', 22) }).addTo(AppState.activeMap);
+    AppState.activeMarkers.pickup = L.marker(pCoords, { icon: pinIcon('#059669', 'P', 30) }).addTo(AppState.activeMap);
+    AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#F97316', 'D', 30) }).addTo(AppState.activeMap);
     AppState.activeMarkers.driver = L.marker(drCoords, { icon: vehicleIcon(ride.service_type, 32) }).addTo(AppState.activeMap);
     AppState.activePolyline = L.polyline([pCoords, dCoords], { color: '#FF7C00', weight: 5, opacity: 0.8, dashArray: '8, 8' })
       .addTo(AppState.activeMap);
@@ -2942,8 +2970,8 @@ async function openDuringRideCockpit(routeId) {
       const oCoords = [cockpit.origin_lat, cockpit.origin_lng];
       const dCoords = [cockpit.destination_lat, cockpit.destination_lng];
       const vCoords = [cockpit.current_lat || cockpit.origin_lat, cockpit.current_lng || cockpit.origin_lng];
-      AppState.activeMarkers.origin = L.marker(oCoords, { icon: pinIcon('#10B981', 'P', 22) }).addTo(AppState.activeMap);
-      AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#FF7C00', 'D', 22) }).addTo(AppState.activeMap);
+      AppState.activeMarkers.origin = L.marker(oCoords, { icon: pinIcon('#059669', 'P', 30) }).addTo(AppState.activeMap);
+      AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#F97316', 'D', 30) }).addTo(AppState.activeMap);
       AppState.activeMarkers.car = L.marker(vCoords, { icon: vehicleIcon(cockpit.vehicle_category || 'car', 34, '#F59E0B') }).addTo(AppState.activeMap);
       AppState.activePolyline = L.polyline([oCoords, dCoords], { color: '#F59E0B', weight: 5, opacity: 0.85, dashArray: '8, 8' })
         .addTo(AppState.activeMap);
@@ -2968,6 +2996,44 @@ function initNavigation() {
   document.querySelectorAll('.nav-tab').forEach((tab) => {
     tab.addEventListener('click', () => switchView(tab.dataset.view));
   });
+  initRideSheet();
+}
+
+function initRideSheet() {
+  const handle = $('sheet-handle-toggle');
+  if (!handle) return;
+  const view = $('view-ride');
+  let startY = null;
+  let dragged = false;
+  handle.addEventListener('pointerdown', (event) => {
+    startY = event.clientY;
+    dragged = false;
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener('pointerup', (event) => {
+    if (startY === null) return;
+    const delta = event.clientY - startY;
+    startY = null;
+    if (Math.abs(delta) >= 36) {
+      dragged = true;
+      setRideSheetExpanded(delta < 0);
+    }
+  });
+  handle.addEventListener('pointercancel', () => { startY = null; });
+  handle.addEventListener('click', () => {
+    if (dragged) { dragged = false; return; }
+    setRideSheetExpanded(!view.classList.contains('sheet-expanded'));
+  });
+}
+
+function setRideSheetExpanded(expanded) {
+  const view = $('view-ride');
+  const handle = $('sheet-handle-toggle');
+  if (!view || !handle) return;
+  view.classList.toggle('sheet-expanded', expanded);
+  handle.setAttribute('aria-expanded', String(expanded));
+  handle.setAttribute('aria-label', expanded ? 'Collapse ride options to show map' : 'Expand ride options over map');
+  if (AppState.homeMap) setTimeout(() => AppState.homeMap.invalidateSize({ pan: false }), 230);
 }
 
 function switchView(viewId) {
@@ -3073,8 +3139,15 @@ function initEventHandlers() {
   });
 
   initDropSearch();
-  $('pickup-select').addEventListener('change', fetchFareQuotes);
-  $('drop-select').addEventListener('change', fetchFareQuotes);
+  $('pickup-select').addEventListener('change', () => {
+    AppState.customPickup = null;
+    fetchFareQuotes();
+  });
+  $('drop-select').addEventListener('change', () => {
+    AppState.customDrop = null;
+    AppState.dropKey = $('drop-select').value;
+    fetchFareQuotes();
+  });
   $('swap-locations-btn').addEventListener('click', () => {
     const p = $('pickup-select');
     const d = $('drop-select');

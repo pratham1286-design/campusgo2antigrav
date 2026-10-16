@@ -279,8 +279,8 @@
         </div>
 
         <!-- Bottom Sheet Booking Container -->
-        <div class="bottom-sheet">
-          <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
+        <div class="bottom-sheet" id="ride-bottom-sheet">
+          <button class="sheet-handle-bar" id="sheet-handle-toggle" type="button" aria-label="Expand ride options" aria-expanded="false"><span class="sheet-handle"></span></button>
 
           <!-- Scope Switcher: Campus Hop vs CityLink -->
           <div class="scope-toggle-group">
@@ -1133,14 +1133,14 @@
               <input type="text" id="veh-color-input" maxlength="20" placeholder="e.g. White">
             </div>
           </div>
-          <div class="input-row">
+          <div class="input-row vehicle-capacity-row">
             <div class="input-group">
               <label>Passenger Seats</label>
               <input type="number" id="veh-capacity-input" min="1" max="6" value="1">
             </div>
-            <div class="input-group">
-              <label><input type="checkbox" id="veh-helmet-input" checked> Spare helmet</label>
-              <label><input type="checkbox" id="veh-ac-input"> AC (cars)</label>
+            <div class="input-group vehicle-options">
+              <label class="vehicle-checkbox"><input type="checkbox" id="veh-helmet-input" checked> <span>Spare helmet</span></label>
+              <label class="vehicle-checkbox"><input type="checkbox" id="veh-ac-input"> <span>AC (cars)</span></label>
             </div>
           </div>
           <p id="veh-error-text" class="login-error hidden"></p>

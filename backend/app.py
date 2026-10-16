@@ -1298,7 +1298,7 @@ def _trip_from_request(data):
     scope = data.get("scope", "campus_hop")
     pickup, drop, error = validate_trip(
         scope, data.get("pickup_key"), data.get("drop_key"), data.get("pickup_lat"), data.get("pickup_lng"),
-        data.get("drop_lat"), data.get("drop_lng"), data.get("drop_name"),
+        data.get("drop_lat"), data.get("drop_lng"), data.get("drop_name"), data.get("pickup_name"),
     )
     if error:
         raise ApiError(error)
