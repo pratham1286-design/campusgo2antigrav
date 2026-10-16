@@ -176,20 +176,17 @@ window.addEventListener('beforeinstallprompt', (event) => {
 window.addEventListener('appinstalled', () => {
   deferredInstallPrompt = null;
   hideInstallSheet();
-  updateProfileInstallOption();
 });
 
 function isInstalledApp() {
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
 
-function updateProfileInstallOption() {
-  const card = $('profile-install-card');
-  if (card) card.classList.toggle('hidden', isInstalledApp());
-}
-
 function offerInstall() {
-  if (isInstalledApp()) return;
+  if (isInstalledApp()) {
+    showAlert('CampusGo is already on your home screen.');
+    return;
+  }
   const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent)
     || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const steps = $('install-sheet-steps');
@@ -237,7 +234,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('install-sheet-btn').addEventListener('click', installApp);
   $('install-sheet-later').addEventListener('click', hideInstallSheet);
   $('profile-install-btn').addEventListener('click', offerInstall);
-  updateProfileInstallOption();
   initAuthHandlers();
   await tryResumeSession();
 });
