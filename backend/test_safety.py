@@ -103,8 +103,10 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         pin = self.rider_pin()
         self.assertRegex(pin, r"^\d{4}$")
 
-        self.report({"lat": 31.2510, "lng": 75.7080})  # main gate, ~0.5 km from the pickup
-        self.assertEqual(self.start(ride_id, pin).get_json()["code"], "NOT_AT_PICKUP")
+        self.report({"lat": 31.2585, "lng": 75.7110})  # law gate, ~0.9 km from the pickup
+        refused = self.start(ride_id, pin).get_json()
+        self.assertEqual(refused["code"], "NOT_AT_PICKUP")
+        self.assertIn("0.9 km from the pickup point", refused["error"])  # says how far off the phone is
         self.report(UNI_MALL)
         wrong = "0000" if pin != "0000" else "1111"
         self.assertEqual(self.start(ride_id, wrong).get_json()["code"], "PIN_WRONG")
@@ -113,6 +115,39 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.assertEqual(self.start(ride_id, pin).status_code, 200)
         self.assertEqual(self.db("SELECT status FROM rides WHERE id = ?", (ride_id,))[0]["status"], "in_progress")
         self.client.post(f"/api/rides/{ride_id}/complete", headers=self.rider)
+
+    def test_approximate_location_is_enough_to_start_and_finish(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        # ~1.2 km from the pickup, but the phone says it is only accurate to ~1.8 km ("approximate location").
+        self.report({"lat": 31.2430, "lng": 75.7037, "accuracy": 1800})
+        self.assertEqual(self.start(ride_id, self.rider_pin()).status_code, 200)
+        # Approximate fixes hop around by about their accuracy: that is not a GPS jump.
+        self.report({"lat": 31.2650, "lng": 75.7050, "accuracy": 1800})
+        done = self.client.post(f"/api/rides/{ride_id}/complete", headers=self.driver)
+        self.assertEqual(done.status_code, 200, done.get_json())
+
+    def test_approximate_location_still_has_a_limit(self):
+        ride_id = self.book()["ride_id"]
+        self.accept(ride_id)
+        # A wildly inaccurate fix doesn't let a driver start from anywhere: the allowance is capped.
+        self.report({"lat": 31.2310, "lng": 75.7037, "accuracy": 50000})  # 2.5 km away
+        self.assertEqual(self.start(ride_id, self.rider_pin()).get_json()["code"], "NOT_AT_PICKUP")
+        self.client.post(f"/api/rides/{ride_id}/cancel", headers=self.rider)
+
+    def test_online_driver_stays_listed_while_the_phone_sleeps(self):
+        nearby = lambda: self.client.get("/api/drivers/nearby?lat=31.2535&lng=75.7038", headers=self.rider).get_json()["drivers"]
+        self.report(UNI_MALL)
+        # Phone locked for 20 minutes: no reports, but the driver never went offline.
+        self.db("UPDATE driver_locations SET updated_at = updated_at - 1200 WHERE driver_id = 'usr_driver_vikram'")
+        app_module._nearby_cache.clear()
+        self.assertTrue(any(d["category"] == "bike" for d in nearby()))
+        status = self.client.get("/api/driver/earnings", headers=self.driver).get_json()["is_online"]
+        self.assertTrue(status)
+        # Going offline is the driver's choice, and takes effect.
+        self.client.post("/api/driver/toggle-online", headers=self.driver, json={"is_online": False})
+        app_module._nearby_cache.clear()
+        self.assertFalse(any(d["category"] == "bike" for d in nearby()))
 
     def test_pin_guessing_is_capped(self):
         ride_id = self.book()["ride_id"]
@@ -168,8 +203,10 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         res = self.client.post("/api/driver/location", headers=self.driver, json={"lat": 31.25})
         self.assertEqual(res.status_code, 400)
 
-    def test_silent_driver_is_not_matched(self):
-        self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_vikram'", (time.time() - 600,))
+    def test_driver_silent_for_hours_is_not_listed(self):
+        # Online but not a single position for over 12 hours: they forgot to go offline.
+        self.db("UPDATE driver_locations SET updated_at = ? WHERE driver_id = 'usr_driver_vikram'", (time.time() - 13 * 3600,))
+        app_module._nearby_cache.clear()
         self.assertEqual(self.book()["status"], "queued")
         nearby = self.client.get("/api/drivers/nearby", headers=self.rider).get_json()["drivers"]
         self.assertNotIn(app_module.driver_public_key("usr_driver_vikram"), [d["key"] for d in nearby])
@@ -233,7 +270,7 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.post("/api/routes/plan", headers=host, json={**base, "departure_time": "soon"}).status_code, 400)
         self.assertEqual(self.client.post("/api/routes/plan", headers=host, json={**base, "departure_time": departure_in(-48)}).status_code, 400)
 
-    def test_passengers_do_not_see_each_others_phone(self):
+    def test_nobody_sees_a_phone_number(self):
         host = self.auth_headers("usr_driver_harpreet")
         route_id = self.client.post("/api/routes/plan", headers=host, json={
             "origin": "uni_mall", "destination": "phagwara_station", "departure_time": departure_in(),
@@ -241,8 +278,9 @@ class TestRealGpsTrips(ClientMixin, unittest.TestCase):
         self.client.post(f"/api/routes/{route_id}/join", headers=self.rider, json={"seats": 1})
         mine = self.client.get(f"/api/routes/{route_id}/live", headers=self.rider).get_json()["cockpit"]
         theirs = self.client.get(f"/api/routes/{route_id}/live", headers=host).get_json()["cockpit"]
-        self.assertTrue(all("passenger_phone" not in p for p in mine["passengers"]))
-        self.assertTrue(all("passenger_phone" in p for p in theirs["passengers"]))
+        # Host and passengers reach each other with in-app calls; numbers are never sent.
+        self.assertNotIn("driver_phone", mine)
+        self.assertTrue(all("passenger_phone" not in p for p in mine["passengers"] + theirs["passengers"]))
         self.client.post(f"/api/routes/{route_id}/cancel", headers=host)
 
 
@@ -269,21 +307,18 @@ class TestIdentityAndSos(ClientMixin, unittest.TestCase):
         self.assertEqual(self.client.get("/api/auth/me", headers=one).status_code, 401)
         self.assertEqual(self.client.get("/api/auth/me", headers=two).status_code, 401)
 
-    def test_login_for_unknown_account_looks_like_a_real_request(self):
+    def test_login_for_unknown_account_says_so_and_texts_nobody(self):
         res = self.client.post("/api/auth/login/start", json={"lpu_id": "99999999", "phone": "9111111111"})
-        self.assertEqual(res.status_code, 200)
-        body = res.get_json()
-        self.assertEqual(set(body), {"challenge_id", "phone_hint", "expires_in", "resend_after"})
+        self.assertEqual((res.status_code, res.get_json()["code"]), (404, "ACCOUNT_NOT_FOUND"))
+        self.assertIn("sign up", res.get_json()["error"])
         self.assertEqual(SMS_OUTBOX, [])
-        verify = self.client.post("/api/auth/login/verify", json={"challenge_id": body["challenge_id"], "otp": "123456"})
-        self.assertEqual(verify.status_code, 400)
 
-    def test_unknown_account_gets_the_same_resend_cooldown(self):
-        first = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
-        again = self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": "9111111112"})
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(again.status_code, 429)
-        self.assertEqual(again.get_json()["code"], "OTP_COOLDOWN")
+    def test_guessing_accounts_is_slowed_down(self):
+        # Trying ID + number pairs one after another is cut off, like any login attempt.
+        codes = [self.client.post("/api/auth/login/start", json={"lpu_id": "99999998", "phone": f"91111111{n:02d}"}).status_code
+                 for n in range(12)]
+        self.assertEqual(codes[:10], [404] * 10)
+        self.assertIn(429, codes[10:])
 
     def test_removing_primary_contact_promotes_another(self):
         headers = self.auth_headers("usr_driver_simran")

@@ -209,7 +209,9 @@ def main():
         page.click(".app-dialog .dialog-btn-primary")
 
         # ---- driver chooses the ride ----
-        dpage, derrs = open_page(driver_token, 31.2562, 75.7050)
+        # The driver starts ~0.7 km north of the pickup: too far to start the ride (limit 0.5 km).
+        booked = api("/api/rides/active", token=rider_token)["active_ride"]
+        dpage, derrs = open_page(driver_token, booked["pickup_lat"] + 0.0063, booked["pickup_lng"])
         dpage.goto(BASE)
         dpage.wait_for_timeout(2500)
         dpage.click('.nav-tab[data-view="view-profile"]')
@@ -248,7 +250,8 @@ def main():
               "pickup point" in dpage.locator(".app-dialog .dialog-message").inner_text())
         dpage.click(".app-dialog .dialog-btn-primary")
         ride = api("/api/rides/active", token=rider_token)["active_ride"]  # the pickup is where the rider dragged P
-        api("/api/driver/location", "POST", {"lat": ride["pickup_lat"], "lng": ride["pickup_lng"]}, driver_token)  # the driver's phone reaches it
+        dpage.context.set_geolocation({"latitude": ride["pickup_lat"], "longitude": ride["pickup_lng"]})  # the driver's phone reaches it
+        dpage.wait_for_timeout(1500)
         dpage.fill("#start-pin-input", pin)
         dpage.click("#start-ride-btn")
         dpage.wait_for_timeout(2500)

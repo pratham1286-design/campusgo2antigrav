@@ -55,6 +55,13 @@ def _fake_fast2sms(phone, message):
 emergency_dispatch.FAST2SMS_API_KEY = "test-gateway"
 mock.patch.object(emergency_dispatch, "send_fast2sms", _fake_fast2sms).start()
 
+# Push notifications are encrypted and signed for real, then land in this outbox instead of
+# Google's push service: (endpoint, encrypted body, headers).
+import push  # noqa: E402
+PUSH_OUTBOX = []
+push.INLINE = True
+mock.patch.object(push, "_post", lambda endpoint, body, headers: PUSH_OUTBOX.append((endpoint, body, headers)) or 201).start()
+
 ADMIN_KEY = "test-admin-key-" + "x" * 32
 # Razorpay test-mode credentials; tests that use them mock payments._razorpay_api.
 RAZORPAY_ENV = {"RAZORPAY_KEY_ID": "rzp_test_x", "RAZORPAY_KEY_SECRET": "real_secret_value"}
@@ -99,7 +106,7 @@ VEHICLES = {
 }
 TABLES = ("driver_payouts", "platform_earnings", "sos_alerts", "route_bookings", "driver_routes", "ride_reviews",
           "rides", "driver_locations", "emergency_contacts", "wallet_transactions", "wallets", "vehicles",
-          "payment_orders", "otp_challenges", "users")
+          "payment_orders", "otp_challenges", "calls", "push_subscriptions", "users")
 
 
 def load_fixtures():

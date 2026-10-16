@@ -1,5 +1,5 @@
 -r requirements.txt
-cryptography==50.0.2  # only for HTTPS_DEV=1 local testing (self-signed cert)
+http-ece==1.2.1  # tests decrypt push notifications with an independent implementation
 playwright==1.64.0  # only for backend/e2e_browser_test.py (drives your installed Chrome or Edge)
 fakeredis==2.39.0  # TEST_REDIS=fake runs the tests through a Redis client
 osmium==4.3.1  # only for maintenance/build_places.py (reads the OpenStreetMap extract)

@@ -422,6 +422,40 @@ SCHEMA = [
         settled_at REAL,
         FOREIGN KEY(driver_id) REFERENCES users(id)
     )""",
+    # Phones that turned notifications on (Web Push). One row per browser install.
+    """
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )""",
+    # Server-wide values made once and kept (e.g. the push signing key).
+    """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
+    # In-app voice calls between the two sides of a ride or carpool. The server only passes the
+    # call setup (WebRTC offer/answer) between the phones: no numbers are shared, no audio stored.
+    """
+    CREATE TABLE IF NOT EXISTS calls (
+        id TEXT PRIMARY KEY,
+        caller_id TEXT NOT NULL,
+        callee_id TEXT NOT NULL,
+        context_type TEXT NOT NULL CHECK(context_type IN ('ride', 'route')),
+        context_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('ringing', 'connected', 'ended', 'declined', 'missed')),
+        offer TEXT NOT NULL,
+        answer TEXT,
+        created_at REAL NOT NULL,
+        answered_at REAL,
+        ended_at REAL,
+        FOREIGN KEY(caller_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(callee_id) REFERENCES users(id) ON DELETE CASCADE
+    )""",
 ]
 
 # Every hot query has an index: these are the lookups the app runs on each poll.
@@ -448,7 +482,25 @@ INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(lower(username))",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_key ON users(phone_key)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_once ON ride_reviews(ride_id, reviewer_id)",
+    "CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_id, status)",
 ]
+
+
+# Columns added after launch. CREATE TABLE IF NOT EXISTS leaves an existing table as it was,
+# so these are added to it here (a fresh database gets them the same way).
+ADDED_COLUMNS = [
+    # How far off the driver's reported position may be (phones on "approximate location" are ~2 km).
+    ("driver_locations", "accuracy_km", "REAL NOT NULL DEFAULT 0"),
+]
+
+
+def _add_columns(cursor):
+    for table, column, kind in ADDED_COLUMNS:
+        if IS_POSTGRES:
+            cursor.execute(_ddl(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}"))
+        elif column not in [row["name"] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()]:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def init_db():
@@ -463,6 +515,7 @@ def init_db():
             cursor.execute("PRAGMA journal_mode=WAL;")  # readers proceed while a write is in progress
         for statement in SCHEMA:
             cursor.execute(_ddl(statement))
+        _add_columns(cursor)
         for statement in INDEXES:
             cursor.execute(statement)
         conn.commit()

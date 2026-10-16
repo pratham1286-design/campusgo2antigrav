@@ -36,6 +36,7 @@ _load_dotenv()
 
 import geo  # noqa: E402
 import payments  # noqa: E402
+import push  # noqa: E402
 import shared
 from database import IntegrityError, begin_write, get_db_connection, init_db
 from emergency_dispatch import (
@@ -75,12 +76,19 @@ if _trust_hops > 0:
 PLATFORM_SHARE = 0.10
 DRIVER_SHARE = 1 - PLATFORM_SHARE
 MAX_EMERGENCY_CONTACTS = 5
-LOCATION_MAX_AGE_SECONDS = 120     # a driver who hasn't reported a position this recently can't be matched
-PICKUP_RADIUS_KM = 0.15            # driver must be this close to the pickup for the ride to start
+LOCATION_MAX_AGE_SECONDS = 600     # pickup/drop checks need a position reported at least this recently
+# An online driver stays listed for riders until they go offline, even while their phone sleeps
+# and stops reporting; only a driver silent for this long (forgot to go offline) is hidden.
+ONLINE_LISTED_MAX_AGE_SECONDS = 12 * 3600
+# A phone on "approximate location" is only accurate to ~2 km, so the pickup/drop distance checks
+# allow the phone's own reported accuracy, up to this much. Precise phones keep the tight limits.
+MAX_LOCATION_SLACK_KM = 2.0
+ARRIVED_NOTICE_KM = 0.2            # the rider is told "your driver is here" within this of the pickup
+PICKUP_RADIUS_KM = 0.5             # driver must be this close to the pickup to start (two phones' GPS errors add up)
 START_PIN_MAX_ATTEMPTS = 5         # wrong ride PINs before the driver must release the ride
 MAX_PLAUSIBLE_SPEED_KMH = 150      # a GPS report implying a faster jump than this is rejected
 STALE_TRIP_SECONDS = 12 * 3600     # a started trip nobody finished is settled after this
-DROP_RADIUS_KM = 0.30              # ...and this close to the drop for the driver to complete it
+DROP_RADIUS_KM = 0.30              # ...and this close to the drop to complete it (the rider can always confirm)
 ROUTE_ORIGIN_RADIUS_KM = 0.5
 ROUTE_DEST_RADIUS_KM = 1.0
 QUEUE_TTL_SECONDS = 30 * 60        # an unmatched ride request is cancelled and refunded after this
@@ -211,7 +219,7 @@ def _security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    resp.headers["Permissions-Policy"] = "geolocation=(self), camera=(), microphone=()"
+    resp.headers["Permissions-Policy"] = "geolocation=(self), camera=(), microphone=(self)"
     if request.is_secure:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/api/"):
@@ -444,6 +452,55 @@ def load_ride_for_participant(conn, ride_id):
     return ride
 
 
+# --- Push notifications ---------------------------------------------------------------
+# Sent only after the change is committed, so a phone is never told about something that was
+# rolled back. `screen` is what the app opens when the notification is tapped.
+def notify(user_ids, title, text, screen="ride", tag=None):
+    push.notify(user_ids, title, text, url=f"/?open={screen}", tag=tag)
+
+
+def user_first_name(conn, user_id, fallback):
+    row = conn.execute("SELECT name FROM users WHERE id = ?", (user_id,)).fetchone()
+    return first_name(row["name"] if row else "", fallback)
+
+
+def route_passenger_ids(conn, route_id, statuses):
+    marks = ",".join("?" * len(statuses))
+    return [r["rider_id"] for r in conn.execute(
+        f"SELECT rider_id FROM route_bookings WHERE route_id = ? AND status IN ({marks})", (route_id, *statuses)).fetchall()]
+
+
+@app.route("/api/push/subscribe", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=20, window_seconds=60)
+def push_subscribe():
+    """Saves this phone's push subscription. A phone that changed account moves to the new one."""
+    data = body()
+    endpoint = data.get("endpoint")
+    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+    if not isinstance(endpoint, str) or not push.valid_endpoint(endpoint):
+        raise ApiError("Unsupported push subscription")
+    if not push.valid_keys(keys.get("p256dh"), keys.get("auth")):
+        raise ApiError("Invalid push subscription keys")
+    conn = get_db()
+    conn.execute("""
+    INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth
+    """, (endpoint, request.auth_user_id, keys["p256dh"], keys["auth"], time.time()))
+    conn.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/push/unsubscribe", methods=["POST"])
+@require_auth
+def push_unsubscribe():
+    conn = get_db()
+    conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?",
+                 (str(body().get("endpoint") or ""), request.auth_user_id))
+    conn.commit()
+    return jsonify({"success": True})
+
+
 def route_participant_check(conn, route, user_id):
     if route["driver_id"] == user_id:
         return
@@ -463,12 +520,33 @@ def queue_position(conn, zone, is_priority, created_at):
     """, (zone, is_priority, is_priority, created_at)).fetchone()["pos"]
 
 
-def driver_near(conn, driver_id, lat, lng, radius_km):
-    """True when the driver's own phone recently reported a position within radius_km of the point."""
-    loc = conn.execute("SELECT lat, lng, updated_at FROM driver_locations WHERE driver_id = ?", (driver_id,)).fetchone()
+def driver_distance_km(conn, driver_id, lat, lng):
+    """(distance from the driver's recently reported position to the point, how far off that
+    position may be), or None when the driver's phone hasn't reported one recently."""
+    loc = conn.execute("SELECT lat, lng, updated_at, accuracy_km FROM driver_locations WHERE driver_id = ?",
+                       (driver_id,)).fetchone()
     if not loc or time.time() - loc["updated_at"] > LOCATION_MAX_AGE_SECONDS:
-        return False
-    return haversine_distance_km(loc["lat"], loc["lng"], lat, lng) <= radius_km
+        return None
+    return haversine_distance_km(loc["lat"], loc["lng"], lat, lng), min(loc["accuracy_km"] or 0.0, MAX_LOCATION_SLACK_KM)
+
+
+def require_driver_near(conn, driver_id, lat, lng, radius_km, place, code):
+    """The driver's own phone must have recently reported a position within radius_km of the point
+    (widened by how far off the phone says it may be). Otherwise raises, saying what is wrong."""
+    found = driver_distance_km(conn, driver_id, lat, lng)
+    if found is None:
+        raise ApiError("CampusGo can't see your phone's location. Turn location on for CampusGo, wait a few "
+                       "seconds and try again.", 409, code)
+    if found[0] > max(radius_km, found[1]):
+        raise ApiError(f"Your phone shows you {found[0]:.1f} km from the {place}. Go to the {place} "
+                       f"(the {'P' if place == 'pickup point' else 'D'} pin) and try again.", 409, code)
+
+
+def get_accuracy_km(data):
+    """The phone's own estimate of how far off its position may be, sent in metres. Optional."""
+    if data.get("accuracy") is None:
+        return 0.0
+    return get_number(data, "accuracy", lo=0, hi=1_000_000, label="location accuracy") / 1000
 
 
 def parse_departure(text):
@@ -591,14 +669,17 @@ def sweep_stale(conn, force=False):
     if not (ride_ids or route_ids or stale_ride_ids or stale_route_ids):
         return
     begin_write(conn)
+    expired_rides, expired_routes = [], []
     for ride_id in ride_ids:
         ride = conn.execute("SELECT * FROM rides WHERE id = ? AND status = 'queued'", (ride_id,)).fetchone()
-        if ride:
-            cancel_ride_with_refund(conn, ride, "No driver accepted in time")
+        if ride and cancel_ride_with_refund(conn, ride, "No driver accepted in time") is not None:
+            expired_rides.append(ride)
     for route_id in route_ids:
         route = conn.execute("SELECT * FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
         if route:
-            cancel_route_with_refunds(conn, route, "trip expired")
+            passengers = route_passenger_ids(conn, route_id, ("confirmed",))
+            if cancel_route_with_refunds(conn, route, "trip expired") is not None:
+                expired_routes.append((route, passengers))
     for ride_id in stale_ride_ids:
         ride = conn.execute("SELECT * FROM rides WHERE id = ? AND status = 'in_progress'", (ride_id,)).fetchone()
         if ride:
@@ -608,6 +689,14 @@ def sweep_stale(conn, force=False):
         if route:
             settle_route(conn, route, now)
     conn.commit()
+    for ride in expired_rides:
+        notify(ride["rider_id"], "No driver found",
+               f"Your ride request from {ride['pickup_name']} expired. ₹{ride['fare']:.0f} was refunded to your wallet.",
+               "ride", tag=f"ride-{ride['id']}")
+    for route, passengers in expired_routes:
+        notify(passengers, "Carpool didn't happen",
+               f"The {route['origin']} → {route['destination']} carpool never started. Your fare was refunded to your wallet.",
+               "citylink")
 
 
 # --- Static pages -------------------------------------------------------------------
@@ -617,7 +706,7 @@ def sweep_stale(conn, force=False):
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                 ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
                 ".webmanifest": "application/manifest+json"}
-VERSIONED_ASSETS = ("app.js", "styles.css", "track.js", "leaflet.js", "leaflet.css", "protomaps-leaflet.js", "campus-map.js")
+VERSIONED_ASSETS = ("app.js", "calls.js", "styles.css", "track.js", "leaflet.js", "leaflet.css", "protomaps-leaflet.js", "campus-map.js")
 PUBLIC_FILES = VERSIONED_ASSETS + ("sw.js", "manifest.webmanifest", "offline.html", "favicon.svg", "avatar-default.svg",
                                    "icon-192.png", "icon-512.png", "icon-maskable-192.png", "icon-maskable-512.png",
                                    "apple-touch-icon.png")
@@ -727,6 +816,7 @@ def public_config():
         "security_hotline": CAMPUS_SECURITY_PHONE,
         "razorpay_enabled": payments.razorpay_configured(),
         "upi_enabled": bool(payments.upi_vpa()),
+        "push_public_key": push.vapid(get_db()).public_key,
     })
 
 
@@ -996,6 +1086,7 @@ def logout():
     """Signs the user out everywhere: every token issued so far stops working."""
     conn = get_db()
     conn.execute("UPDATE users SET token_version = token_version + 1 WHERE id = ?", (request.auth_user_id,))
+    conn.execute("DELETE FROM push_subscriptions WHERE user_id = ?", (request.auth_user_id,))  # signed out: no more alerts
     conn.commit()
     _token_versions.pop(request.auth_user_id, None)
     return jsonify({"success": True})
@@ -1159,6 +1250,7 @@ def delete_account():
     conn.execute("DELETE FROM emergency_contacts WHERE user_id = ?", (user_id,))
     conn.execute("DELETE FROM vehicles WHERE user_id = ?", (user_id,))
     conn.execute("DELETE FROM driver_locations WHERE driver_id = ?", (user_id,))
+    conn.execute("DELETE FROM push_subscriptions WHERE user_id = ?", (user_id,))
     conn.execute("DELETE FROM otp_challenges WHERE phone_key = ?", (phone,))
     # ':' can't appear in a real LPU ID, username or phone, so these never collide with a new sign-up.
     tombstone = f"deleted:{user_id}"
@@ -1221,7 +1313,7 @@ def _drivers_in_cell(conn, lat, lng):
                       AND r.status IN ('matched', 'arriving', 'in_progress'))
       AND NOT EXISTS (SELECT 1 FROM driver_routes dr WHERE dr.driver_id = dl.driver_id AND dr.status = 'in_progress')
     """, (cell[0] - dlat, cell[0] + dlat, cell[1] - dlng, cell[1] + dlng,
-          time.time() - LOCATION_MAX_AGE_SECONDS)).fetchall()
+          time.time() - ONLINE_LISTED_MAX_AGE_SECONDS)).fetchall()
     drivers = [{"id": r["driver_id"], "lat": r["lat"], "lng": r["lng"], "category": r["category"]} for r in rows]
     with _nearby_lock:
         if len(_nearby_cache) > 5000:
@@ -1390,8 +1482,12 @@ def book_ride():
     ))
     position = queue_position(conn, pickup["zone"], is_priority, now)
     conn.commit()
-    waiting_drivers = sum(1 for d in drivers_near(conn, pickup["lat"], pickup["lng"], exclude_id=rider_id, limit=None)
-                          if d["category"] == service_type)
+    waiting = [d["id"] for d in drivers_near(conn, pickup["lat"], pickup["lng"], exclude_id=rider_id, limit=None)
+               if d["category"] == service_type]
+    waiting_drivers = len(waiting)
+    notify(waiting, f"New {service_type} ride request",
+           f"{pickup['name']} → {drop['name']}. You earn ₹{driver_payout_for(scope, total_fare):.0f}. Open CampusGo to accept.",
+           "requests", tag="ride-requests")
     return jsonify({
         "success": True,
         "ride_id": ride_id,
@@ -1412,9 +1508,9 @@ def get_active_ride():
     sweep_stale(conn)
     ride = conn.execute("""
     SELECT r.*,
-           ru.name AS rider_name, ru.phone AS rider_phone,
+           ru.name AS rider_name,
            ru.is_teacher_priority AS rider_is_teacher, ru.user_type AS rider_type,
-           du.name AS driver_name, du.phone AS driver_phone,
+           du.name AS driver_name,
            v.model AS vehicle_model, v.plate_number AS vehicle_plate, v.color AS vehicle_color,
            v.category AS vehicle_category, v.has_helmet, v.has_ac,
            dl.lat AS driver_live_lat, dl.lng AS driver_live_lng
@@ -1447,12 +1543,14 @@ def report_driver_location():
     """The driver's phone reports its real GPS position. This is the only thing that moves a
     driver on the map, and what the pickup and drop-off checks rely on. Two database round
     trips in the usual case: drivers send this every 15 seconds."""
-    lat, lng = get_coordinates(body())
+    data = body()
+    lat, lng = get_coordinates(data)
+    accuracy_km = get_accuracy_km(data)
     driver_id = request.auth_user_id
     conn = get_db()
     now = time.time()
     state = conn.execute("""
-    SELECT dl.lat, dl.lng, dl.updated_at,
+    SELECT dl.lat, dl.lng, dl.updated_at, dl.accuracy_km,
            (SELECT status FROM rides WHERE driver_id = ? AND status IN ('matched', 'arriving', 'in_progress') LIMIT 1)
                AS ride_status,
            (SELECT 1 FROM driver_routes WHERE driver_id = ? AND status = 'in_progress' LIMIT 1) AS hosting
@@ -1461,20 +1559,33 @@ def report_driver_location():
     busy = bool(state["ride_status"] or state["hosting"])
     # While driving someone, a position that jumps further than any vehicle could travel is a
     # spoofed or broken fix: it must not be able to reach a pickup or drop-off point.
+    # Approximate positions hop by up to their accuracy between reports, which is not a jump.
     if busy and state["updated_at"] and now - state["updated_at"] < 600:
         jump_km = haversine_distance_km(state["lat"], state["lng"], lat, lng)
         hours = max(now - state["updated_at"], 1.0) / 3600
-        if jump_km > 1.0 and jump_km / hours > MAX_PLAUSIBLE_SPEED_KMH:
+        wobble_km = min(max(accuracy_km, state["accuracy_km"] or 0.0), MAX_LOCATION_SLACK_KM)
+        if jump_km > 1.0 + wobble_km and jump_km / hours > MAX_PLAUSIBLE_SPEED_KMH:
             raise ApiError("Your GPS position jumped too far. Waiting for a steady location fix.", 409, "GPS_JUMP")
     conn.execute("""
-    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at) VALUES (?, 0, ?, ?, ?)
-    ON CONFLICT(driver_id) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, updated_at = excluded.updated_at
-    """, (driver_id, lat, lng, now))
+    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at, accuracy_km) VALUES (?, 0, ?, ?, ?, ?)
+    ON CONFLICT(driver_id) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, updated_at = excluded.updated_at,
+                                         accuracy_km = excluded.accuracy_km
+    """, (driver_id, lat, lng, now, accuracy_km))
     if state["hosting"]:
         conn.execute("UPDATE driver_routes SET current_lat = ?, current_lng = ? WHERE driver_id = ? AND status = 'in_progress'",
                      (lat, lng, driver_id))
     conn.commit()
-    # Reaching the pickup does not start the ride: the rider's PIN does (see /start).
+    # Reaching the pickup does not start the ride: the rider's PIN does (see /start). It does tell
+    # the rider, once, that the driver is here.
+    if state["ride_status"] in ("matched", "arriving"):
+        ride = conn.execute("SELECT id, rider_id, pickup_lat, pickup_lng, pickup_name FROM rides "
+                            "WHERE driver_id = ? AND status IN ('matched', 'arriving')", (driver_id,)).fetchone()
+        reach = max(ARRIVED_NOTICE_KM, min(accuracy_km, MAX_LOCATION_SLACK_KM))
+        if (ride and haversine_distance_km(lat, lng, ride["pickup_lat"], ride["pickup_lng"]) <= reach
+                and shared.acquire(f"arrived:{ride['id']}", 6 * 3600)):
+            notify(ride["rider_id"], "Your driver is here",
+                   f"Your driver has reached {ride['pickup_name']}. Tell them your 4-digit ride PIN to start.",
+                   "ride", tag=f"ride-{ride['id']}")
     return jsonify({"success": True, "ride_status": state["ride_status"]})
 
 
@@ -1495,8 +1606,8 @@ def start_ride(ride_id):
     ride = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
     if ride["status"] not in ("matched", "arriving") or ride["driver_id"] != request.auth_user_id:
         raise ApiError("This ride can't be started now", 409, "NOT_STARTABLE")
-    if not driver_near(conn, ride["driver_id"], ride["pickup_lat"], ride["pickup_lng"], PICKUP_RADIUS_KM):
-        raise ApiError("Start the ride at the pickup point: your phone's live location must be there.", 409, "NOT_AT_PICKUP")
+    require_driver_near(conn, ride["driver_id"], ride["pickup_lat"], ride["pickup_lng"], PICKUP_RADIUS_KM,
+                        "pickup point", "NOT_AT_PICKUP")
     if ride["pin_attempts"] >= START_PIN_MAX_ATTEMPTS:
         raise ApiError("Too many wrong PINs. Release the ride so the rider can be picked up again.", 429, "PIN_LOCKED")
     if not hmac.compare_digest(ride["start_pin"], pin):
@@ -1506,6 +1617,8 @@ def start_ride(ride_id):
         raise ApiError("That PIN is not correct" + (f" ({left} tries left)" if left > 0 else ""), 400, "PIN_WRONG")
     conn.execute("UPDATE rides SET status = 'in_progress', started_at = ? WHERE id = ?", (time.time(), ride_id))
     conn.commit()
+    notify(ride["rider_id"], "Your ride has started",
+           f"On the way to {ride['drop_name']}. SOS and Share Trip are one tap away in the app.", "ride", tag=f"ride-{ride_id}")
     return jsonify({"success": True, "status": "in_progress"})
 
 
@@ -1524,6 +1637,10 @@ def cancel_ride(ride_id):
         if refunded is None:
             raise ApiError("This ride can no longer be cancelled", 409, "NOT_CANCELLABLE")
         conn.commit()
+        if ride["driver_id"]:
+            notify(ride["driver_id"], "Ride cancelled",
+                   f"{user_first_name(conn, ride['rider_id'], 'The rider')} cancelled the ride from {ride['pickup_name']}. "
+                   "You're free to take another request.", "requests", tag=f"ride-{ride_id}")
         return jsonify({"success": True, "status": "cancelled", "refunded": refunded,
                         "wallet_balance": round(wallet_balance(conn, ride["rider_id"]), 2)})
 
@@ -1535,6 +1652,9 @@ def cancel_ride(ride_id):
     if cur.rowcount != 1:
         raise ApiError("This ride can no longer be released", 409, "NOT_CANCELLABLE")
     conn.commit()
+    notify(ride["rider_id"], "Finding you another driver",
+           "Your driver had to drop the ride. It's back in the queue; your fare is still held and refundable if you cancel.",
+           "activity", tag=f"ride-{ride_id}")
     return jsonify({"success": True, "status": "queued"})
 
 
@@ -1550,13 +1670,21 @@ def complete_ride(ride_id):
     now = time.time()
     # The rider can always confirm arrival. The driver can only finish the trip once their own
     # phone has reported a position at the drop-off, so a fare can't be collected without driving.
-    if request.auth_user_id == ride["driver_id"] and not driver_near(conn, ride["driver_id"], ride["drop_lat"], ride["drop_lng"], DROP_RADIUS_KM):
-        raise ApiError("You can complete the ride once your phone shows you at the drop-off point "
-                       "(or the rider confirms arrival).", 409, "NOT_AT_DESTINATION")
+    if request.auth_user_id == ride["driver_id"]:
+        require_driver_near(conn, ride["driver_id"], ride["drop_lat"], ride["drop_lng"], DROP_RADIUS_KM,
+                            "drop-off point", "NOT_AT_DESTINATION")
     payout = settle_ride(conn, ride, now)
     if payout is None:
         raise ApiError("A ride can only be completed after the driver has picked you up.", 409, "NOT_IN_PROGRESS")
     conn.commit()
+    if request.auth_user_id == ride["driver_id"]:
+        notify(ride["rider_id"], "You've arrived",
+               f"Ride to {ride['drop_name']} completed and ₹{ride['fare']:.0f} paid. Rate your driver in the app.",
+               "activity", tag=f"ride-{ride_id}")
+    else:
+        notify(ride["driver_id"], "Ride completed",
+               f"The rider confirmed arrival at {ride['drop_name']}. ₹{payout:.0f} added to your earnings.",
+               "requests", tag=f"ride-{ride_id}")
 
     return jsonify({
         "success": True,
@@ -1734,17 +1862,19 @@ def toggle_driver_online():
 
     has_fix = data.get("lat") is not None and data.get("lng") is not None
     lat, lng = get_coordinates(data) if has_fix else LPU_CENTER
+    accuracy_km = get_accuracy_km(data) if has_fix else 0.0
     # Only a real position report refreshes the location timestamp; going online alone doesn't,
-    # so a driver whose phone stops reporting drops out of matching after a couple of minutes.
+    # so a driver who has never shared a position isn't shown to riders.
     conn.execute("""
-    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at)
-    VALUES (:driver, :online, :lat, :lng, :now)
+    INSERT INTO driver_locations (driver_id, is_online, lat, lng, updated_at, accuracy_km)
+    VALUES (:driver, :online, :lat, :lng, :now, :acc)
     ON CONFLICT(driver_id) DO UPDATE SET
         is_online = excluded.is_online,
         lat = CASE WHEN :fix = 1 THEN excluded.lat ELSE driver_locations.lat END,
         lng = CASE WHEN :fix = 1 THEN excluded.lng ELSE driver_locations.lng END,
-        updated_at = CASE WHEN :fix = 1 THEN excluded.updated_at ELSE driver_locations.updated_at END
-    """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng,
+        updated_at = CASE WHEN :fix = 1 THEN excluded.updated_at ELSE driver_locations.updated_at END,
+        accuracy_km = CASE WHEN :fix = 1 THEN excluded.accuracy_km ELSE driver_locations.accuracy_km END
+    """, {"driver": driver_id, "online": is_online, "lat": lat, "lng": lng, "acc": accuracy_km,
           "now": time.time() if has_fix else 0.0, "fix": 1 if has_fix else 0})
     conn.commit()
     return jsonify({"success": True, "is_online": bool(is_online)})
@@ -1815,6 +1945,10 @@ def driver_accept_request():
         raise ApiError("This request is no longer available for your vehicle", 409, "NOT_AVAILABLE")
 
     conn.commit()
+    ride = conn.execute("SELECT rider_id, pickup_name FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    notify(ride["rider_id"], "Your driver is on the way",
+           f"{user_first_name(conn, driver_id, 'Your driver')} accepted your ride and is coming to {ride['pickup_name']} "
+           f"on a {vehicle['model']} ({vehicle['plate_number']}).", "ride", tag=f"ride-{ride_id}")
     return jsonify({"success": True, "ride_id": ride_id, "status": "arriving"})
 
 
@@ -1913,7 +2047,7 @@ def get_scheduled_routes():
 
     passengers = {r["id"]: [] for r in routes}
     for p in conn.execute("""
-    SELECT rb.route_id, rb.seats, rb.rider_id, u.name FROM route_bookings rb
+    SELECT rb.id, rb.route_id, rb.seats, rb.rider_id, u.name FROM route_bookings rb
     JOIN users u ON rb.rider_id = u.id
     JOIN driver_routes dr ON dr.id = rb.route_id AND dr.status IN ('open', 'pinned', 'in_progress')
     WHERE rb.status IN ('confirmed', 'in_progress')
@@ -1925,7 +2059,9 @@ def get_scheduled_routes():
         r["is_host"] = r.pop("driver_id") == user_id
         r["has_joined"] = any(p["rider_id"] == user_id for p in booked)
         r["driver_name"] = first_name(r["driver_name"])
-        r["passengers"] = [{"passenger_name": first_name(p["name"]), "seats": p["seats"]} for p in booked]
+        # The host gets each booking's id: it's what an in-app call to that passenger is placed with.
+        r["passengers"] = [{"passenger_name": first_name(p["name"]), "seats": p["seats"],
+                            **({"booking_id": p["id"]} if r["is_host"] else {})} for p in booked]
     return jsonify({"routes": routes})
 
 
@@ -2015,6 +2151,9 @@ def join_route(route_id):
     """, (booking_id, route_id, rider_id, seats, fare, time.time()))
     updated = conn.execute("SELECT available_seats, status FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
     conn.commit()
+    notify(route["driver_id"], "New carpool booking",
+           f"{user_first_name(conn, rider_id, 'A passenger')} booked {seats} seat{'s' if seats > 1 else ''} on your "
+           f"{route['origin']} → {route['destination']} trip ({route['departure_time'].replace('T', ' ')}).", "citylink")
 
     return jsonify({
         "success": True,
@@ -2035,7 +2174,7 @@ def leave_route(route_id):
     rider_id = request.auth_user_id
     conn = get_db()
     begin_write(conn)
-    route = conn.execute("SELECT id, status FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
+    route = conn.execute("SELECT id, status, driver_id, origin, destination FROM driver_routes WHERE id = ?", (route_id,)).fetchone()
     if not route or route["status"] not in ("open", "pinned"):
         raise ApiError("This trip has already started or ended", 409)
     booking = conn.execute(
@@ -2049,6 +2188,9 @@ def leave_route(route_id):
                  (booking["seats"], route_id))
     new_bal = credit_wallet(conn, rider_id, booking["fare_paid"], "refund", booking["id"], "Refund for cancelled carpool seat")
     conn.commit()
+    notify(route["driver_id"], "Carpool booking cancelled",
+           f"{user_first_name(conn, rider_id, 'A passenger')} cancelled {booking['seats']} seat{'s' if booking['seats'] > 1 else ''} "
+           f"on your {route['origin']} → {route['destination']} trip. The seats are open again.", "citylink")
     return jsonify({"success": True, "refunded": booking["fare_paid"], "wallet_balance": round(new_bal, 2)})
 
 
@@ -2063,10 +2205,14 @@ def cancel_route(route_id):
         raise ApiError("Route not found", 404)
     if route["driver_id"] != request.auth_user_id:
         raise ApiError("Only the route host can cancel this trip", 403)
+    passengers = route_passenger_ids(conn, route_id, ("confirmed",))
     refunded = cancel_route_with_refunds(conn, route, "host cancelled trip")
     if refunded is None:
         raise ApiError("This trip has already started or ended", 409)
     conn.commit()
+    notify(passengers, "Carpool cancelled",
+           f"{user_first_name(conn, route['driver_id'], 'The host')} cancelled the {route['origin']} → {route['destination']} trip. "
+           "Your fare was refunded to your wallet.", "citylink")
     return jsonify({"success": True, "status": "cancelled", "refunded_bookings": refunded})
 
 
@@ -2084,9 +2230,8 @@ def start_scheduled_route(route_id):
         raise ApiError("No passengers have booked this route yet")
     if driver_is_busy(conn, route["driver_id"]):
         raise ApiError("Finish the ride you are driving before starting this trip.", 409, "DRIVER_BUSY")
-    if not driver_near(conn, route["driver_id"], route["origin_lat"], route["origin_lng"], ROUTE_ORIGIN_RADIUS_KM):
-        raise ApiError("Start the trip from the pickup point: your phone's live location must be near it.",
-                       409, "NOT_AT_ORIGIN")
+    require_driver_near(conn, route["driver_id"], route["origin_lat"], route["origin_lng"], ROUTE_ORIGIN_RADIUS_KM,
+                        "pickup point", "NOT_AT_ORIGIN")
 
     now = time.time()
     cur = conn.execute(
@@ -2097,6 +2242,9 @@ def start_scheduled_route(route_id):
         raise ApiError("This trip has already started or ended", 409)
     conn.execute("UPDATE route_bookings SET status = 'in_progress' WHERE route_id = ? AND status = 'confirmed'", (route_id,))
     conn.commit()
+    notify(route_passenger_ids(conn, route_id, ("in_progress",)), "Your carpool has started",
+           f"{user_first_name(conn, route['driver_id'], 'Your host')} started the trip from {route['origin']} to "
+           f"{route['destination']}. Follow it live in the app.", "ride", tag=f"route-{route_id}")
     return jsonify({"success": True, "route_id": route_id, "status": "in_progress"})
 
 
@@ -2105,7 +2253,7 @@ def start_scheduled_route(route_id):
 def get_live_cockpit(route_id):
     conn = get_db()
     route = conn.execute("""
-    SELECT dr.*, u.name AS driver_name, u.phone AS driver_phone,
+    SELECT dr.*, u.name AS driver_name,
            v.model AS vehicle_model, v.plate_number AS vehicle_plate, v.category AS vehicle_category
     FROM driver_routes dr
     JOIN users u ON dr.driver_id = u.id
@@ -2121,15 +2269,11 @@ def get_live_cockpit(route_id):
     route_dict["is_host"] = is_host
     route_dict["passengers"] = [dict(p) for p in conn.execute("""
     SELECT rb.id AS booking_id, rb.seats, rb.fare_paid, rb.status AS booking_status,
-           u.name AS passenger_name, u.phone AS passenger_phone
+           u.name AS passenger_name
     FROM route_bookings rb JOIN users u ON rb.rider_id = u.id
     WHERE rb.route_id = ? AND rb.status IN ('confirmed', 'in_progress', 'completed')
     """, (route_id,)).fetchall()]
 
-    if not is_host:
-        # Fellow passengers get names only; contact numbers are for the host.
-        for p in route_dict["passengers"]:
-            p.pop("passenger_phone", None)
     c_lat = route_dict["current_lat"] or route_dict["origin_lat"]
     c_lng = route_dict["current_lng"] or route_dict["origin_lng"]
     dist = haversine_distance_km(c_lat, c_lng, route_dict["destination_lat"], route_dict["destination_lng"])
@@ -2148,14 +2292,17 @@ def complete_scheduled_route(route_id):
         raise ApiError("Route not found", 404)
     if route["driver_id"] != request.auth_user_id:
         raise ApiError("Only the route host can complete this trip", 403)
-    if not driver_near(conn, route["driver_id"], route["destination_lat"], route["destination_lng"], ROUTE_DEST_RADIUS_KM):
-        raise ApiError("Complete the trip once your phone shows you at the destination.", 409, "NOT_AT_DESTINATION")
+    require_driver_near(conn, route["driver_id"], route["destination_lat"], route["destination_lng"], ROUTE_DEST_RADIUS_KM,
+                        "drop-off point", "NOT_AT_DESTINATION")
 
     settled = settle_route(conn, route, time.time())
     if settled is None:
         raise ApiError("Only a trip that is in progress can be completed", 409, "NOT_IN_PROGRESS")
     total_revenue, payout = settled
     conn.commit()
+    notify(route_passenger_ids(conn, route_id, ("completed",)), "You've arrived",
+           f"Your carpool reached {route['destination']}. Thanks for riding with "
+           f"{user_first_name(conn, route['driver_id'], 'your host')}!", "activity", tag=f"route-{route_id}")
     return jsonify({"success": True, "status": "completed", "total_revenue": total_revenue, "driver_payout": payout})
 
 
@@ -2171,6 +2318,176 @@ def get_active_route():
     ORDER BY started_at DESC LIMIT 1
     """, (user_id, user_id)).fetchone()
     return jsonify({"route_id": route["id"] if route else None})
+
+
+# --- In-app calls -------------------------------------------------------------------------------
+# The two sides of an accepted ride, or a carpool host and a booked passenger, can call each other
+# inside the app without either seeing the other's number. The phones talk directly (WebRTC); the
+# server only passes the call setup between them (offer and answer, with network candidates).
+CALL_RING_SECONDS = 45
+MAX_SDP_CHARS = 20000
+
+
+def _sdp(data, key):
+    value = data.get(key)
+    if not isinstance(value, str) or not value.startswith("v=0") or len(value) > MAX_SDP_CHARS:
+        raise ApiError("Invalid call setup")
+    return value
+
+
+def _callee_for(conn, user_id, context_type, context_id, booking_id=None):
+    """Who this user would be calling, if they may call about this ride or carpool."""
+    if context_type == "ride":
+        ride = conn.execute("SELECT rider_id, driver_id, status FROM rides WHERE id = ?", (context_id,)).fetchone()
+        if not ride or user_id not in (ride["rider_id"], ride["driver_id"]):
+            raise ApiError("You are not part of this ride", 403)
+        if ride["status"] not in ("matched", "arriving", "in_progress") or not ride["driver_id"]:
+            raise ApiError("Calls are available once a driver accepts the ride", 409, "CALL_NOT_AVAILABLE")
+        return ride["driver_id"] if user_id == ride["rider_id"] else ride["rider_id"]
+    if context_type == "route":
+        route = conn.execute("SELECT driver_id, status FROM driver_routes WHERE id = ?", (context_id,)).fetchone()
+        if not route or route["status"] not in ("open", "pinned", "in_progress"):
+            raise ApiError("This carpool is not running", 409, "CALL_NOT_AVAILABLE")
+        if user_id == route["driver_id"]:
+            booking = conn.execute("SELECT rider_id FROM route_bookings WHERE id = ? AND route_id = ? "
+                                   "AND status IN ('confirmed', 'in_progress')", (str(booking_id or ""), context_id)).fetchone()
+            if not booking:
+                raise ApiError("That passenger is not booked on this carpool", 404)
+            return booking["rider_id"]
+        if not conn.execute("SELECT 1 FROM route_bookings WHERE route_id = ? AND rider_id = ? "
+                            "AND status IN ('confirmed', 'in_progress')", (context_id, user_id)).fetchone():
+            raise ApiError("You are not booked on this carpool", 403)
+        return route["driver_id"]
+    raise ApiError("Invalid call")
+
+
+def _caller_role(conn, call):
+    """How the person being called knows the caller: "your driver", "your carpool host"..."""
+    if call["context_type"] == "ride":
+        ride = conn.execute("SELECT rider_id FROM rides WHERE id = ?", (call["context_id"],)).fetchone()
+        return "your rider" if ride and ride["rider_id"] == call["caller_id"] else "your driver"
+    route = conn.execute("SELECT driver_id FROM driver_routes WHERE id = ?", (call["context_id"],)).fetchone()
+    return "your carpool host" if route and route["driver_id"] == call["caller_id"] else "your carpool passenger"
+
+
+def _notify_missed(conn, call):
+    notify(call["callee_id"], "Missed call",
+           f"You missed a call from {user_first_name(conn, call['caller_id'], 'CampusGo')} ({_caller_role(conn, call)}). "
+           "Open the app to call back.", "ride", tag=f"call-{call['id']}")
+
+
+def _expire_call(conn, call):
+    """A call nobody answered in time becomes a missed call (once), and the callee is told."""
+    if call["status"] != "ringing" or time.time() - call["created_at"] <= CALL_RING_SECONDS:
+        return call
+    cur = conn.execute("UPDATE calls SET status = 'missed', ended_at = ? WHERE id = ? AND status = 'ringing'",
+                       (time.time(), call["id"]))
+    conn.commit()
+    if cur.rowcount == 1:
+        _notify_missed(conn, call)
+    return conn.execute("SELECT * FROM calls WHERE id = ?", (call["id"],)).fetchone()
+
+
+def _load_call(conn, call_id):
+    call = conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+    if not call or request.auth_user_id not in (call["caller_id"], call["callee_id"]):
+        raise ApiError("Call not found", 404)
+    return _expire_call(conn, call)
+
+
+@app.route("/api/calls", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=10, window_seconds=60)
+def start_call():
+    data = body()
+    caller_id = request.auth_user_id
+    context_type = data.get("context_type")
+    context_id = str(data.get("context_id") or "")
+    offer = _sdp(data, "offer")
+    conn = get_db()
+    callee_id = _callee_for(conn, caller_id, context_type, context_id, data.get("booking_id"))
+    now = time.time()
+    begin_write(conn)
+    # Calling again replaces this caller's own earlier calls.
+    conn.execute("UPDATE calls SET status = 'ended', ended_at = ? WHERE caller_id = ? AND status IN ('ringing', 'connected')",
+                 (now, caller_id))
+    busy = conn.execute("""
+    SELECT 1 FROM calls
+    WHERE (status = 'connected' AND (caller_id = ? OR callee_id = ?))
+       OR (status = 'ringing' AND callee_id = ? AND created_at > ?)
+    """, (callee_id, callee_id, callee_id, now - CALL_RING_SECONDS)).fetchone()
+    if busy:
+        conn.commit()
+        raise ApiError("They are on another call. Try again in a minute.", 409, "CALLEE_BUSY")
+    call_id = f"call_{uuid.uuid4().hex[:12]}"
+    conn.execute("""
+    INSERT INTO calls (id, caller_id, callee_id, context_type, context_id, status, offer, created_at)
+    VALUES (?, ?, ?, ?, ?, 'ringing', ?, ?)
+    """, (call_id, caller_id, callee_id, context_type, context_id, offer, now))
+    conn.commit()
+    call = conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+    notify(callee_id, "Incoming call",
+           f"{user_first_name(conn, caller_id, 'Someone')} ({_caller_role(conn, call)}) is calling you. Open CampusGo to answer.",
+           "call", tag=f"call-{call_id}")
+    return jsonify({"call_id": call_id, "callee_name": user_first_name(conn, callee_id, "them")})
+
+
+@app.route("/api/calls/incoming", methods=["GET"])
+@require_auth
+def incoming_call():
+    """The call ringing for this user right now, if any. The app checks every few seconds."""
+    conn = get_db()
+    call = conn.execute("SELECT * FROM calls WHERE callee_id = ? AND status = 'ringing' ORDER BY created_at DESC LIMIT 1",
+                        (request.auth_user_id,)).fetchone()
+    call = call and _expire_call(conn, call)
+    if not call or call["status"] != "ringing":
+        return jsonify({"call": None})
+    return jsonify({"call": {"id": call["id"], "offer": call["offer"], "caller_role": _caller_role(conn, call),
+                             "caller_name": user_first_name(conn, call["caller_id"], "Someone")}})
+
+
+@app.route("/api/calls/<call_id>", methods=["GET"])
+@require_auth
+def call_status(call_id):
+    call = _load_call(get_db(), call_id)
+    return jsonify({"status": call["status"],
+                    "answer": call["answer"] if request.auth_user_id == call["caller_id"] else None})
+
+
+@app.route("/api/calls/<call_id>/answer", methods=["POST"])
+@require_auth
+def answer_call(call_id):
+    answer = _sdp(body(), "answer")
+    conn = get_db()
+    call = _load_call(conn, call_id)
+    if call["callee_id"] != request.auth_user_id:
+        raise ApiError("Only the person being called can answer", 403)
+    cur = conn.execute("UPDATE calls SET status = 'connected', answer = ?, answered_at = ? WHERE id = ? AND status = 'ringing'",
+                       (answer, time.time(), call_id))
+    conn.commit()
+    if cur.rowcount != 1:
+        raise ApiError("This call has ended", 409, "CALL_ENDED")
+    return jsonify({"success": True})
+
+
+@app.route("/api/calls/<call_id>/end", methods=["POST"])
+@require_auth
+def end_call(call_id):
+    """Hang up, decline, or give up before it was answered (the callee then sees a missed call)."""
+    conn = get_db()
+    call = _load_call(conn, call_id)
+    if call["status"] not in ("ringing", "connected"):
+        return jsonify({"success": True, "status": call["status"]})
+    if call["status"] == "connected":
+        status = "ended"
+    else:
+        status = "declined" if request.auth_user_id == call["callee_id"] else "missed"
+    cur = conn.execute("UPDATE calls SET status = ?, ended_at = ? WHERE id = ? AND status = ?",
+                       (status, time.time(), call_id, call["status"]))
+    conn.commit()
+    if cur.rowcount == 1 and status == "missed":
+        _notify_missed(conn, call)
+    return jsonify({"success": True, "status": status})
 
 
 # --- Wallet & payments -----------------------------------------------------------------------
@@ -2406,11 +2723,12 @@ def admin_approve_payment(order_id):
     """Call after matching the UPI reference against the bank statement."""
     conn = get_db()
     begin_write(conn)
-    order = conn.execute("SELECT id FROM payment_orders WHERE id = ? AND provider = 'upi'", (order_id,)).fetchone()
+    order = conn.execute("SELECT id, user_id, amount FROM payment_orders WHERE id = ? AND provider = 'upi'", (order_id,)).fetchone()
     if not order:
         raise ApiError("Payment order not found", 404)
     result = payments.credit_order(conn, order_id, "upi")
     conn.commit()
+    notify(order["user_id"], "Wallet topped up", f"₹{order['amount']:.0f} was added to your CampusGo wallet.", "ride")
     return jsonify(result)
 
 
@@ -2467,6 +2785,8 @@ def admin_mark_payout_paid(payout_id):
     if cur.rowcount != 1:
         raise ApiError("Payout request not found or already settled", 404)
     conn.commit()
+    payout = conn.execute("SELECT driver_id, amount, upi_id FROM driver_payouts WHERE id = ?", (payout_id,)).fetchone()
+    notify(payout["driver_id"], "Payout sent", f"₹{payout['amount']:.0f} was sent to {payout['upi_id']} (UTR {utr}).", "requests")
     return jsonify({"success": True, "status": "paid"})
 
 
@@ -2484,6 +2804,9 @@ def admin_reject_payout(payout_id):
     # Booked as a reversed withdrawal so the amount counts as withdrawable earnings again.
     credit_wallet(conn, payout["driver_id"], payout["amount"], "withdrawal", payout_id, "Payout request returned to wallet")
     conn.commit()
+    notify(payout["driver_id"], "Payout returned to wallet",
+           f"Your ₹{payout['amount']:.0f} payout couldn't be sent" + (f": {note}" if note else ".") + " Check your UPI ID and try again.",
+           "requests")
     return jsonify({"success": True, "status": "rejected"})
 
 
@@ -2499,6 +2822,9 @@ def admin_reject_payment(order_id):
     if cur.rowcount != 1:
         raise ApiError("Payment order not found or already processed", 404)
     conn.commit()
+    order = conn.execute("SELECT user_id, amount FROM payment_orders WHERE id = ?", (order_id,)).fetchone()
+    notify(order["user_id"], "Top-up not received",
+           f"We couldn't find your ₹{order['amount']:.0f} UPI payment. If money left your account, contact support.", "ride")
     return jsonify({"success": True, "status": "rejected"})
 
 

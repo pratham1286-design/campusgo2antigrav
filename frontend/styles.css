@@ -143,6 +143,12 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+/* No pull-down-to-refresh: a swipe down at the top of a list reloaded the whole app. */
+html,
+body {
+  overscroll-behavior-y: none;
+}
+
 body {
   font-family: var(--font-sans);
   background-color: #E2E8F0;
@@ -329,6 +335,7 @@ body {
   display: none;
   flex-direction: column;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
   background-color: var(--bg-canvas);
 }
 
@@ -1914,6 +1921,220 @@ body {
   text-decoration: none;
 }
 
+
+/* --- Ongoing ride bar (above the bottom nav, on every tab while a ride is going) --- */
+.ongoing-ride-bar {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 800;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  padding: 10px 16px;
+  background-color: var(--primary-orange);
+  color: #fff;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 800;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ongoing-ride-bar.hidden {
+  display: none;
+}
+
+.ongoing-ride-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  background-color: #fff;
+  animation: pulseAnimation 2s infinite;
+}
+
+.ongoing-ride-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.ongoing-ride-open {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
+/* --- Call / WhatsApp the other person once a ride is accepted --- */
+.ride-contacts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.ride-contacts.hidden {
+  display: none;
+}
+
+.ride-contact {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ride-contact-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contact-btn {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-radius: var(--radius-full);
+  background-color: var(--status-success);
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 800;
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.chip-call-btn {
+  border: 0;
+  margin-left: 4px;
+  padding: 2px 6px;
+  border-radius: var(--radius-full);
+  background-color: var(--status-success);
+  color: #fff;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.call-host-btn {
+  margin-top: 6px;
+}
+
+/* --- In-app call screen --- */
+.call-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 3500;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 24px;
+  background: linear-gradient(180deg, #111827 0%, #0B1220 100%);
+  color: #fff;
+  text-align: center;
+}
+
+.call-screen.hidden {
+  display: none;
+}
+
+.call-avatar img {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  border: 3px solid var(--primary-orange);
+}
+
+.call-name {
+  font-size: 1.4rem;
+  font-weight: 800;
+}
+
+.call-status {
+  min-height: 1.4em;
+  font-size: 0.9rem;
+  color: #CBD5E1;
+  font-variant-numeric: tabular-nums;
+}
+
+.call-actions {
+  display: flex;
+  gap: 18px;
+  margin-top: 40px;
+}
+
+.call-btn {
+  width: 76px;
+  height: 76px;
+  border: 0;
+  border-radius: 50%;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 800;
+  color: #fff;
+  cursor: pointer;
+}
+
+.call-btn.hidden {
+  display: none;
+}
+
+.call-hangup { background-color: #DC2626; }
+.call-accept { background-color: #16A34A; }
+.call-mute { background-color: #334155; }
+.call-mute[aria-pressed="true"] { background-color: #F8FAFC; color: #111827; }
+
+.call-privacy {
+  margin-top: 24px;
+  font-size: 0.72rem;
+  color: #94A3B8;
+}
+
+/* --- Pull down to refresh: a pill that slides in at the top of the screen --- */
+.pull-refresh {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  background-color: var(--bg-card);
+  color: var(--text-main);
+  box-shadow: var(--shadow-md);
+  font-size: 0.75rem;
+  font-weight: 700;
+  transform: translate(-50%, -50px);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 160ms ease, opacity 160ms ease;
+}
+
+.pull-refresh.visible {
+  opacity: 1;
+}
+
+.pull-refresh-icon {
+  display: inline-block;
+  color: var(--primary-orange);
+  font-size: 1rem;
+}
+
+.pull-refresh.spinning .pull-refresh-icon {
+  animation: pullSpin 0.8s linear infinite;
+}
+
+@keyframes pullSpin {
+  to { transform: rotate(360deg); }
+}
 
 /* --- Bottom Navigation Bar --- */
 .bottom-nav-bar {

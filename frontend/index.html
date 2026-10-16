@@ -247,7 +247,9 @@
 
     <!-- Main Views Container -->
     <main class="main-content">
-      
+      <!-- Pull down at the top of any screen: reloads that screen's information, not the whole app -->
+      <div id="pull-refresh" class="pull-refresh" aria-live="polite"><span class="pull-refresh-icon">↻</span><span id="pull-refresh-text">Pull to refresh</span></div>
+
       <!-- ================= VIEW 1: RIDE (HOME) ================= -->
       <section id="view-ride" class="app-view active-view">
         <!-- Live Half-Screen Campus Map -->
@@ -531,6 +533,9 @@
               </div>
             </div>
 
+            <!-- Once a ride is accepted, rider and driver can call or WhatsApp each other -->
+            <div id="ride-contacts" class="ride-contacts hidden"></div>
+
             <!-- Passenger Manifest Section (Shows all booked passengers) -->
             <div class="cockpit-manifest-box">
               <div class="manifest-header">
@@ -778,6 +783,18 @@
             </div>
           </div>
 
+          <div class="setting-card">
+            <div class="theme-toggle-row">
+              <div>
+                <h4 class="setting-title">Notifications</h4>
+                <p class="setting-sub" id="notify-setting-sub">Know when your driver arrives, a ride request comes in, or someone calls you.</p>
+              </div>
+              <button id="notify-toggle-btn" class="theme-toggle-btn" type="button" role="switch" aria-checked="false">
+                <span id="notify-toggle-state">Off</span>
+              </button>
+            </div>
+          </div>
+
           <!-- Keep installation available after the signup prompt has been dismissed. -->
           <div class="setting-card" id="profile-install-card">
             <h4 class="setting-title">Add CampusGo to your home screen</h4>
@@ -787,6 +804,27 @@
         </div>
       </section>
     </main>
+
+    <!-- In-app call (rider and driver, or carpool host and passenger): numbers stay private -->
+    <div id="call-screen" class="call-screen hidden" role="dialog" aria-modal="true" aria-labelledby="call-name">
+      <div class="call-avatar"><img src="avatar-default.svg" alt=""></div>
+      <div id="call-name" class="call-name"></div>
+      <div id="call-status" class="call-status"></div>
+      <div class="call-actions">
+        <button id="call-mute-btn" class="call-btn call-mute" type="button" aria-pressed="false">Mute</button>
+        <button id="call-hangup-btn" class="call-btn call-hangup" type="button">End</button>
+        <button id="call-accept-btn" class="call-btn call-accept" type="button">Answer</button>
+      </div>
+      <p class="call-privacy">Calls go through CampusGo. Your phone number stays private.</p>
+      <audio id="call-remote-audio" autoplay playsinline></audio>
+    </div>
+
+    <!-- Shown on every tab while the user has a ride going, so it can always be reopened -->
+    <button id="ongoing-ride-bar" class="ongoing-ride-bar hidden" type="button">
+      <span class="ongoing-ride-dot"></span>
+      <span id="ongoing-ride-text" class="ongoing-ride-text"></span>
+      <span class="ongoing-ride-open">Open ›</span>
+    </button>
 
     <!-- Bottom Navigation Bar -->
     <nav class="bottom-nav-bar">
@@ -1182,5 +1220,6 @@
   <script src="protomaps-leaflet.js"></script>
   <script src="campus-map.js"></script>
   <script src="app.js"></script>
+  <script src="calls.js"></script>
 </body>
 </html>

@@ -392,16 +392,20 @@ function handleLogout() {
   AppState.activeRide = null;
   AppState.activeCockpitRouteId = null;
   AppState.ratingRideId = null;
+  updateOngoingRideBar();
   storeToken(null);
   showLoginScreen();
 }
 
 async function onLoginSuccess() {
   hideLoginScreen();
+  const saved = restoreUiState();
+  const linked = linkedScreen();
   updateUserUI();
   await loadEmergencyContacts();
   await loadDriverEarnings();
   if (AppState.userPosition) applyUserPosition((t) => { $('auto-detected-badge').textContent = t; });
+  else if (saved) populateLocationDropdowns();  // the restored ride type has its own list of places
   else fetchFareQuotes();
   refreshNearbyDrivers();
   clearInterval(AppState.timers.drivers);
@@ -412,6 +416,10 @@ async function onLoginSuccess() {
   AppState.timers.driverPoll = setInterval(pollDriverWork, 10000);
   await checkActiveRide();
   syncRazorpayPayments();
+  // Back to where the user was, unless a ride in progress took over the screen.
+  if (linked) openScreen(linked);
+  else if (saved && RESTORABLE_VIEWS.includes(saved.view) && currentViewId() === 'view-ride') switchView(saved.view);
+  setupPush();
 }
 
 // --- Driver polling ---
@@ -849,6 +857,7 @@ function currentViewId() {
 
 document.addEventListener('visibilitychange', () => {
   if (appHidden() || !AppState.currentUser) return;
+  reportDriverLocation();  // the phone slept: tell the server where the driver is right away
   refreshNearbyDrivers();
   if (AppState.activeRide && AppState.timers.track) trackActiveRide();
   else if (AppState.timers.queue) checkActiveRide();
@@ -885,6 +894,12 @@ function pickupCoords(key) {
   return { pickup_lat: AppState.userPosition.lat, pickup_lng: AppState.userPosition.lng };
 }
 
+// "On campus" means within 2 km of a campus point, widened by how far off the phone says its
+// position may be (approximate location is ~2 km), so a rider on campus isn't told they're outside.
+function campusReachKm(pos) {
+  return 2 + Math.min((pos.accuracy || 0) / 1000, 2);
+}
+
 // Mirrors the server: "My current location" is a campus pickup only near campus.
 function registerCurrentLocation() {
   const pos = AppState.userPosition;
@@ -894,7 +909,7 @@ function registerCurrentLocation() {
     if (key === CURRENT_LOCATION_KEY || loc.zone.startsWith('CityLink')) return;
     near = Math.min(near, distanceKm(pos.lat, pos.lng, loc.lat, loc.lng));
   });
-  if (near <= 2) {
+  if (near <= campusReachKm(pos)) {
     delete AppState.landmarks[CURRENT_LOCATION_KEY];
     return;
   }
@@ -915,10 +930,14 @@ function distanceKm(lat1, lng1, lat2, lng2) {
   return 6371 * 2 * Math.asin(Math.sqrt(a));
 }
 
+function toFix(pos) {
+  return { lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy || 0, at: Date.now() };
+}
+
 function requestPosition(highAccuracy, timeoutMs) {
   return new Promise((resolve) => {
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ pos: { lat: pos.coords.latitude, lng: pos.coords.longitude } }),
+      (pos) => resolve({ pos: toFix(pos) }),
       (err) => resolve({ error: err }),
       { enableHighAccuracy: highAccuracy, timeout: timeoutMs, maximumAge: 60000 }
     );
@@ -1000,11 +1019,12 @@ function applyUserPosition(setBadge) {
 
   drawUserMarker();
   registerCurrentLocation();
-  const onCampus = nearestKey !== null && nearest <= 2;
+  const onCampus = nearestKey !== null && nearest <= campusReachKm(pos);
   AppState.offCampus = !onCampus;
   if (onCampus) {
     // Inside the campus: the pickup is the nearest campus point.
-    AppState.pickupKey = nearestKey;
+    if (AppState.keepPickup) AppState.keepPickup = false;
+    else AppState.pickupKey = nearestKey;
   } else {
     // Outside: Campus Hop keeps showing "Not in campus"; CityLink uses the real position.
     AppState.pickupKey = AppState.selectedScope === 'campus_hop' ? NOT_IN_CAMPUS_KEY : CURRENT_LOCATION_KEY;
@@ -1028,7 +1048,7 @@ function startLocationWatch() {
   if (AppState.locationWatchId != null) return;
   AppState.locationWatchId = navigator.geolocation.watchPosition(
     (p) => {
-      AppState.userPosition = { lat: p.coords.latitude, lng: p.coords.longitude };
+      AppState.userPosition = toFix(p);
       const wasOff = AppState.offCampus;
       registerCurrentLocation();
       drawUserMarker();
@@ -1195,7 +1215,7 @@ function populateLocationDropdowns() {
   const isHop = AppState.selectedScope === 'campus_hop';
   const lockedOut = isHop && AppState.offCampus;
   $('app-root').dataset.scope = AppState.selectedScope;
-  if (isHop) AppState.customDrop = null;
+  if (isHop && AppState.customDrop && AppState.customDrop.key === CUSTOM_PLACE_KEY) AppState.customDrop = null;
 
   if (AppState.offCampus) {
     // Away from campus: Campus Hop is locked to "Not in campus"; CityLink starts from the real position.
@@ -1885,6 +1905,8 @@ async function checkActiveRide() {
     }
   } catch (err) {
     console.error('Failed to check active ride:', err);
+  } finally {
+    updateOngoingRideBar();
   }
 }
 
@@ -1945,6 +1967,54 @@ Your fare is held and fully refunded if you cancel.`);
     btn.disabled = false;
     $('find-ride-text').textContent = 'Find Ride';
   }
+}
+
+// --- Contact during a ride ---
+// A Call button for each person this user can reach: an in-app call (calls.js), so nobody's
+// phone number is shown. people: [{ label, name, target: { context_type, context_id, booking_id? } }]
+function renderRideContacts(people) {
+  const box = $('ride-contacts');
+  box.replaceChildren(...people.map((p) => {
+    const row = document.createElement('div');
+    row.className = 'ride-contact';
+    const label = document.createElement('span');
+    label.className = 'ride-contact-name';
+    label.textContent = p.label;
+    const call = document.createElement('button');
+    call.type = 'button';
+    call.className = 'contact-btn';
+    call.textContent = '📞 Call';
+    call.addEventListener('click', () => startCall(p.target, p.name));
+    row.append(label, call);
+    return row;
+  }));
+  box.classList.toggle('hidden', !people.length);
+}
+
+// --- Ongoing ride bar ---
+// A ride's fare is held from the moment it is booked, so the ride must never be out of sight
+// (after a refresh, or on another tab): the bar shows everywhere except the screen showing it.
+const ONGOING_LABELS = {
+  queued: 'Ride requested: waiting for a driver',
+  matched: 'Your driver is on the way',
+  arriving: 'Your driver is on the way',
+  in_progress: 'Ride in progress'
+};
+
+function ongoingRideView() {
+  const ride = AppState.activeRide;
+  return !AppState.activeCockpitRouteId && ride && ride.status === 'queued' ? 'view-activity' : 'view-active-ride';
+}
+
+function updateOngoingRideBar() {
+  const ride = AppState.activeRide;
+  let text = '';
+  if (AppState.activeCockpitRouteId) text = 'Your carpool is in progress';
+  else if (ride && ride.is_rider === false) text = ride.status === 'in_progress' ? 'You are driving a ride' : 'Go to your pickup: the rider is waiting';
+  else if (ride) text = ONGOING_LABELS[ride.status] || 'Ride in progress';
+  if (currentViewId() === ongoingRideView()) text = '';
+  $('ongoing-ride-text').textContent = text;
+  $('ongoing-ride-bar').classList.toggle('hidden', !text);
 }
 
 // --- Queue card (Activity tab) ---
@@ -2062,6 +2132,7 @@ async function handleStartRide() {
   const btn = $('start-ride-btn');
   btn.disabled = true;
   try {
+    await reportDriverLocation();  // the server checks the driver is at the pickup: send where we are now
     const { ok, data } = await apiPost(`/api/rides/${encodeURIComponent(ride.id)}/start`, { pin });
     if (!ok) {
       showAlert(data.error || 'Could not start the ride');
@@ -2097,6 +2168,9 @@ function renderActiveRide(ride) {
 
   updateRideControls(ride.status, ride.is_rider !== false);
   $('share-live-btn').classList.toggle('hidden', !ride.share_token);
+  const other = ride.is_rider !== false ? ride.driver_name || 'your driver' : ride.rider_name || 'your rider';
+  renderRideContacts([{ label: `${ride.is_rider !== false ? 'Driver' : 'Rider'}: ${other}`, name: other,
+    target: { context_type: 'ride', context_id: ride.id } }]);
 
   if (AppState.activeMap) {
     setTimeout(() => AppState.activeMap.invalidateSize(), 200);
@@ -2108,7 +2182,7 @@ function renderActiveRide(ride) {
 
     AppState.activeMarkers.pickup = L.marker(pCoords, { icon: pinIcon('#059669', 'P', 30) }).addTo(AppState.activeMap);
     AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#F97316', 'D', 30) }).addTo(AppState.activeMap);
-    AppState.activeMarkers.driver = L.marker(drCoords, { icon: vehicleIcon(ride.service_type, 32) }).addTo(AppState.activeMap);
+    AppState.activeMarkers.driver = L.marker(drCoords, { icon: vehicleIcon(ride.service_type, 32), zIndexOffset: 1000 }).addTo(AppState.activeMap);
     AppState.activePolyline = L.polyline([pCoords, dCoords], { color: '#FF7C00', weight: 5, opacity: 0.8, dashArray: '8, 8' })
       .addTo(AppState.activeMap);
     fitActiveMap(ride);
@@ -2246,6 +2320,7 @@ async function trackActiveRide() {
 
 // --- Completing trips ---
 async function handleCompleteRide() {
+  await reportDriverLocation();  // a driver may only complete at the drop: send where we are now
   if (AppState.activeCockpitRouteId) {
     const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(AppState.activeCockpitRouteId)}/complete`);
     if (!ok) {
@@ -2309,20 +2384,30 @@ async function submitRating() {
   closeModal('modal-rating');
 }
 
-// --- SOS ---
-function getBrowserPosition(timeoutMs = 5000) {
+// The position sent to the server: accuracy (metres) lets it allow for approximate location.
+function positionPayload(fix) {
+  return { lat: fix.lat, lng: fix.lng, accuracy: Math.round(fix.accuracy || 0) };
+}
+
+// Any fix the phone can give, approximate location included: asking for precise GPS often timed
+// out indoors, so drivers stopped reporting. A fresh position from the location watch is reused.
+function getBrowserPosition(timeoutMs = 10000) {
+  const known = AppState.userPosition;
+  if (known && Date.now() - known.at < 30000) return Promise.resolve(positionPayload(known));
   return new Promise((resolve) => {
     if (!navigator.geolocation) {
       resolve(null);
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      (pos) => resolve(positionPayload(toFix(pos))),
       () => resolve(null),
-      { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 30000 }
+      { enableHighAccuracy: false, timeout: timeoutMs, maximumAge: 60000 }
     );
   });
 }
+
+// --- SOS ---
 
 async function resolveSosLocation() {
   // 1. The phone's real position, named after the closest landmark.
@@ -2740,6 +2825,8 @@ function routeCardHtml(r, pinned) {
           <img src="${AVATAR}" alt="">
           <span class="passenger-chip-name">${esc(p.passenger_name)}</span>
           <span class="passenger-chip-seats">(${Number(p.seats)} seat${p.seats > 1 ? 's' : ''})</span>
+          ${p.booking_id ? `<button class="chip-call-btn" data-action="call-passenger" data-id="${esc(r.id)}" data-booking="${esc(p.booking_id)}"
+            data-name="${esc(p.passenger_name)}" aria-label="Call ${esc(p.passenger_name)}">📞</button>` : ''}
         </span>`).join('')
     : '<span style="font-size:0.68rem; color:var(--text-muted);">No passengers yet</span>';
 
@@ -2764,6 +2851,11 @@ function routeCardHtml(r, pinned) {
       </div>`;
   } else {
     actions = '<div class="route-note">🔒 Ride is fully booked</div>';
+  }
+
+  // Booked passengers can ring the host before and during the trip (in-app: no numbers shown).
+  if (r.has_joined && !r.is_host) {
+    actions += `<button class="btn-sm-outline call-host-btn" data-action="call-host" data-id="${id}" data-name="${esc(r.driver_name)}">📞 Call host</button>`;
   }
 
   return `
@@ -2849,6 +2941,10 @@ async function handleRouteAction(event) {
   } else if (action === 'cancel-route') {
     if (!(await showConfirm('Cancel this trip? Every passenger will be refunded.'))) return;
     await routeSimpleAction(routeId, 'cancel', (d) => `Trip cancelled. ${d.refunded_bookings} booking(s) refunded.`);
+  } else if (action === 'call-host') {
+    startCall({ context_type: 'route', context_id: routeId }, btn.dataset.name);
+  } else if (action === 'call-passenger') {
+    startCall({ context_type: 'route', context_id: routeId, booking_id: btn.dataset.booking }, btn.dataset.name);
   }
 }
 
@@ -2925,6 +3021,8 @@ async function postCityLinkRoute() {
 
 // --- During-ride cockpit for carpools ---
 async function startConfirmedRoute(routeId) {
+  const pos = await getBrowserPosition();  // the host must be at the start point: send where we are now
+  if (pos) await apiPost('/api/driver/location', pos);
   const { ok, data } = await apiPost(`/api/routes/${encodeURIComponent(routeId)}/start`);
   if (!ok) {
     showAlert(data.error || 'Could not start the trip');
@@ -2958,6 +3056,11 @@ async function openDuringRideCockpit(routeId) {
     manifestBox.replaceChildren(...cockpit.passengers.map((p) =>
       passengerChip(p.passenger_name, `(${p.seats} seat${p.seats > 1 ? 's' : ''})`)));
     $('manifest-count-badge').textContent = `${cockpit.passengers.length} Passenger${cockpit.passengers.length === 1 ? '' : 's'}`;
+    // The host can reach every passenger; passengers can reach the host (not each other).
+    renderRideContacts(cockpit.is_host
+      ? cockpit.passengers.map((p) => ({ label: p.passenger_name, name: p.passenger_name,
+        target: { context_type: 'route', context_id: routeId, booking_id: p.booking_id } }))
+      : [{ label: `Host: ${cockpit.driver_name}`, name: cockpit.driver_name, target: { context_type: 'route', context_id: routeId } }]);
 
     $('cancel-ride-btn').classList.add('hidden');
     $('share-live-btn').classList.add('hidden');
@@ -2974,7 +3077,7 @@ async function openDuringRideCockpit(routeId) {
       const vCoords = [cockpit.current_lat || cockpit.origin_lat, cockpit.current_lng || cockpit.origin_lng];
       AppState.activeMarkers.origin = L.marker(oCoords, { icon: pinIcon('#059669', 'P', 30) }).addTo(AppState.activeMap);
       AppState.activeMarkers.drop = L.marker(dCoords, { icon: pinIcon('#F97316', 'D', 30) }).addTo(AppState.activeMap);
-      AppState.activeMarkers.car = L.marker(vCoords, { icon: vehicleIcon(cockpit.vehicle_category || 'car', 34, '#F59E0B') }).addTo(AppState.activeMap);
+      AppState.activeMarkers.car = L.marker(vCoords, { icon: vehicleIcon(cockpit.vehicle_category || 'car', 34, '#F59E0B'), zIndexOffset: 1000 }).addTo(AppState.activeMap);
       AppState.activePolyline = L.polyline([oCoords, dCoords], { color: '#F59E0B', weight: 5, opacity: 0.85, dashArray: '8, 8' })
         .addTo(AppState.activeMap);
       AppState.activeFit = [oCoords, dCoords];
@@ -2998,7 +3101,15 @@ function initNavigation() {
   document.querySelectorAll('.nav-tab').forEach((tab) => {
     tab.addEventListener('click', () => switchView(tab.dataset.view));
   });
+  $('ongoing-ride-bar').addEventListener('click', () => switchView(ongoingRideView()));
+  window.addEventListener('pagehide', saveUiState);
+  $('notify-toggle-btn').addEventListener('click', () => {
+    if ($('notify-toggle-btn').getAttribute('aria-checked') === 'true') turnOffNotifications();
+    else turnOnNotifications();
+  });
+  document.addEventListener('visibilitychange', () => { if (appHidden()) saveUiState(); });
   initRideSheet();
+  initPullToRefresh();
 }
 
 // The booking sheet slides over the map: drag the handle (the sheet follows the finger) or tap it.
@@ -3065,6 +3176,8 @@ function switchView(viewId) {
   document.querySelectorAll('.nav-tab').forEach((t) => {
     t.classList.toggle('active', t.dataset.view === viewId);
   });
+  updateOngoingRideBar();
+  saveUiState();
 
   if (viewId === 'view-citylink') {
     loadCityLinkRoutes();
@@ -3082,6 +3195,255 @@ function switchView(viewId) {
       if (AppState.activeFit) AppState.activeMap.fitBounds(AppState.activeFit, { padding: [50, 50], maxZoom: 16 });
     }, 150);
   }
+}
+
+// --- Keep the screen and choices across a refresh ---
+// A refresh (or the phone closing the app in the background) used to drop the user back on the
+// Ride tab with default places. The tab, ride type, vehicle, places and dragged pins are kept
+// on this phone for a few hours and put back when the app opens again.
+const UI_STATE_KEY = 'campusgo-ui-state';
+const UI_STATE_MAX_AGE_MS = 6 * 3600 * 1000;
+const RESTORABLE_VIEWS = ['view-ride', 'view-citylink', 'view-activity', 'view-profile'];
+
+function saveUiState() {
+  if (!AppState.currentUser) return;
+  const state = {
+    user: AppState.currentUser.id,
+    at: Date.now(),
+    view: currentViewId(),
+    scope: AppState.selectedScope,
+    service: AppState.selectedService,
+    pickupKey: AppState.pickupKey,
+    dropKey: AppState.dropKey,
+    customPickup: AppState.customPickup,
+    customDrop: AppState.customDrop
+  };
+  try { localStorage.setItem(UI_STATE_KEY, JSON.stringify(state)); } catch (_) { /* Storage may be off. */ }
+}
+
+function savedUiState() {
+  try {
+    const state = JSON.parse(localStorage.getItem(UI_STATE_KEY) || 'null');
+    const fresh = state && AppState.currentUser && state.user === AppState.currentUser.id && Date.now() - state.at < UI_STATE_MAX_AGE_MS;
+    return fresh ? state : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Before the places are filled in: the location fix must not replace a restored pickup.
+function restoreUiState() {
+  const state = savedUiState();
+  if (!state) return null;
+  if (state.scope === 'campus_hop' || state.scope === 'citylink') {
+    AppState.selectedScope = state.scope;
+    document.querySelectorAll('.scope-tab').forEach((t) => t.classList.toggle('active', t.dataset.scope === state.scope));
+  }
+  if (['bike', 'scooty', 'car'].includes(state.service)) {
+    AppState.selectedService = state.service;
+    document.querySelectorAll('.service-card').forEach((c) => c.classList.toggle('active', c.dataset.service === state.service));
+  }
+  if (state.pickupKey) {
+    AppState.pickupKey = state.pickupKey;
+    AppState.keepPickup = true;
+  }
+  if (state.dropKey) AppState.dropKey = state.dropKey;
+  AppState.customPickup = state.customPickup || null;
+  AppState.customDrop = state.customDrop || null;
+  return state;
+}
+
+// --- Push notifications ---
+const PUSH_OFF_KEY = 'campusgo-push-off';  // the user turned notifications off on this phone
+
+function pushSupported() {
+  return Boolean('serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
+    && AppState.config && AppState.config.push_public_key);
+}
+
+function pushKeyBytes(text) {
+  const raw = atob((text + '='.repeat((4 - (text.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function subscribePush() {
+  const reg = await navigator.serviceWorker.ready;
+  const key = pushKeyBytes(AppState.config.push_public_key);
+  let sub = await reg.pushManager.getSubscription();
+  const current = sub && sub.options && sub.options.applicationServerKey;
+  if (current && new Uint8Array(current).join() !== key.join()) {
+    await sub.unsubscribe();  // made for another server key: it can't receive anything
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  const { ok } = await apiPost('/api/push/subscribe', sub.toJSON());
+  return ok;
+}
+
+function pushTurnedOff() {
+  try { return localStorage.getItem(PUSH_OFF_KEY) === '1'; } catch (_) { return false; }
+}
+
+function renderNotifySetting() {
+  const btn = $('notify-toggle-btn');
+  if (!pushSupported()) {
+    btn.disabled = true;
+    $('notify-toggle-state').textContent = 'N/A';
+    $('notify-setting-sub').textContent = "This browser can't show notifications. Install CampusGo from Chrome to get them.";
+    return;
+  }
+  const on = Notification.permission === 'granted' && !pushTurnedOff();
+  btn.setAttribute('aria-checked', String(on));
+  $('notify-toggle-state').textContent = Notification.permission === 'denied' ? 'Blocked' : (on ? 'On' : 'Off');
+}
+
+async function turnOnNotifications() {
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') {
+    renderNotifySetting();
+    if (permission === 'denied') {
+      showAlert('Notifications are blocked for CampusGo. Allow them in your phone settings (Apps → Chrome → Notifications, or the lock icon next to the address), then try again.');
+    }
+    return;
+  }
+  try { localStorage.removeItem(PUSH_OFF_KEY); } catch (_) { /* Storage may be off. */ }
+  try {
+    if (!(await subscribePush())) showAlert('Could not turn on notifications. Please try again.');
+  } catch (err) {
+    console.error('Push subscribe failed:', err);
+    showAlert('Could not turn on notifications on this phone. Please try again.');
+  }
+  renderNotifySetting();
+}
+
+async function turnOffNotifications() {
+  try { localStorage.setItem(PUSH_OFF_KEY, '1'); } catch (_) { /* Storage may be off. */ }
+  try {
+    const sub = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    if (sub) {
+      await apiPost('/api/push/unsubscribe', { endpoint: sub.endpoint });
+      await sub.unsubscribe();
+    }
+  } catch (err) {
+    console.error('Push unsubscribe failed:', err);
+  }
+  renderNotifySetting();
+}
+
+// After sign-in: keep this phone's subscription current, or offer notifications once.
+async function setupPush() {
+  renderNotifySetting();
+  if (!pushSupported() || pushTurnedOff()) return;
+  if (Notification.permission === 'granted') {
+    subscribePush().catch((err) => console.error('Push subscribe failed:', err));
+    return;
+  }
+  if (Notification.permission !== 'default') return;
+  let asked = false;
+  try { asked = localStorage.getItem('campusgo-push-asked') === '1'; localStorage.setItem('campusgo-push-asked', '1'); } catch (_) { /* Storage may be off. */ }
+  if (asked) return;
+  const yes = await showDialog({
+    message: 'Turn on notifications? We\'ll tell you when your driver accepts and arrives, when a ride request comes in, and when someone calls you, even when CampusGo is closed.',
+    confirmText: 'Turn on',
+    cancelText: 'Not now'
+  });
+  if (yes) turnOnNotifications();
+}
+
+// --- Opening the right screen from a notification ---
+// Notifications link to /?open=<screen>; a tap while the app is already open arrives as a message
+// from the service worker instead of a page load.
+function openScreen(screen) {
+  if (screen === 'call') {
+    checkIncomingCall();
+  } else if (screen === 'ride') {
+    switchView(AppState.activeRide || AppState.activeCockpitRouteId ? ongoingRideView() : 'view-ride');
+  } else if (screen === 'requests') {
+    switchView('view-profile');
+    loadDriverEarnings();
+  } else if (screen === 'activity') {
+    switchView('view-activity');
+  } else if (screen === 'citylink') {
+    switchView('view-citylink');
+  }
+}
+
+function linkedScreen() {
+  const screen = new URLSearchParams(window.location.search).get('open');
+  if (screen) history.replaceState(null, '', window.location.pathname);
+  return screen;
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (!event.data || event.data.type !== 'open' || !AppState.currentUser) return;
+    openScreen(new URL(event.data.url, window.location.origin).searchParams.get('open'));
+  });
+}
+
+// --- Pull down to refresh (one screen, not the whole app) ---
+// The browser's own pull-to-refresh is off (it reloaded everything). Pulling down at the top of any
+// screen reloads just that screen's information instead.
+const PULL_TRIGGER_PX = 70;
+
+async function refreshCurrentPage() {
+  const view = currentViewId();
+  const jobs = [refreshCurrentUser(), checkActiveRide()];
+  if (view === 'view-ride') jobs.push(refreshNearbyDrivers(), fetchFareQuotes());
+  else if (view === 'view-citylink') jobs.push(loadCityLinkRoutes());
+  else if (view === 'view-activity') jobs.push(loadActivityHistory());
+  else if (view === 'view-profile') jobs.push(loadDriverEarnings(), loadEmergencyContacts());
+  else if (view === 'view-active-ride' && AppState.activeCockpitRouteId) jobs.push(openDuringRideCockpit(AppState.activeCockpitRouteId));
+  await Promise.allSettled(jobs);
+}
+
+function initPullToRefresh() {
+  const indicator = $('pull-refresh');
+  const label = $('pull-refresh-text');
+  let pull = null;
+  let busy = false;
+  const show = (distance, text) => {
+    indicator.style.transform = `translate(-50%, ${Math.min(distance, PULL_TRIGGER_PX + 20) - 50}px)`;
+    indicator.classList.toggle('visible', distance > 10);
+    label.textContent = text;
+  };
+  const scrollerFor = (target) => {
+    const sheet = target.closest('#ride-bottom-sheet');
+    if (sheet) return $('view-ride').classList.contains('sheet-expanded') ? null : sheet;  // pulled down there, the sheet lowers
+    const view = target.closest('.app-view');
+    return view && view.id !== 'view-ride' ? view : null;
+  };
+  document.addEventListener('touchstart', (event) => {
+    const scroller = !busy && event.touches.length === 1 && scrollerFor(event.target);
+    pull = scroller && scroller.scrollTop <= 0 ? { scroller, y: event.touches[0].clientY, distance: 0 } : null;
+  }, { passive: true });
+  document.addEventListener('touchmove', (event) => {
+    if (!pull) return;
+    pull.distance = (event.touches[0].clientY - pull.y) * 0.6;
+    if (pull.scroller.scrollTop > 0 || pull.distance <= 0) {
+      show(0, '');
+      return;
+    }
+    show(pull.distance, pull.distance >= PULL_TRIGGER_PX ? 'Release to refresh' : 'Pull to refresh');
+  }, { passive: true });
+  document.addEventListener('touchend', async () => {
+    const done = pull;
+    pull = null;
+    if (!done || done.distance < PULL_TRIGGER_PX || done.scroller.scrollTop > 0) {
+      show(0, '');
+      return;
+    }
+    busy = true;
+    show(PULL_TRIGGER_PX, 'Refreshing…');
+    indicator.classList.add('spinning');
+    try {
+      await refreshCurrentPage();
+    } finally {
+      busy = false;
+      indicator.classList.remove('spinning');
+      show(0, '');
+    }
+  }, { passive: true });
 }
 
 // --- Modals ---

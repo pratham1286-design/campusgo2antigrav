@@ -50,7 +50,7 @@ class TestAccountDeletion(ClientMixin, unittest.TestCase):
         # The old LPU ID and number no longer lead anywhere, and are free for a new sign-up.
         SMS_OUTBOX.clear()
         login = self.client.post("/api/auth/login/start", json={"lpu_id": self.lpu_id, "phone": self.phone})
-        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.get_json()["code"], "ACCOUNT_NOT_FOUND")
         self.assertEqual(SMS_OUTBOX, [])
         self.db("DELETE FROM otp_challenges")
         again = self.signup(self.phone, self.lpu_id, self.username, name="Leaving Soon")
@@ -114,7 +114,7 @@ class TestStoreListingPages(ClientMixin, unittest.TestCase):
         for leftover in ("pratham1286", "Harpreet", "PB08-CR-9912", "Jalandhar City Bus Stand", "Advance Simulation", "demo"):
             self.assertNotIn(leftover, page)
         self.assertEqual(set(self.client.get("/api/config").get_json()),
-                         {"security_hotline", "razorpay_enabled", "upi_enabled"})
+                         {"security_hotline", "razorpay_enabled", "upi_enabled", "push_public_key"})
 
     def test_android_app_links_follow_the_play_console_values(self):
         self.assertEqual(self.get("/.well-known/assetlinks.json").status_code, 404)

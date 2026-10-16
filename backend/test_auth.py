@@ -87,10 +87,10 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
         shared.clear_rate_limits()
         res = self.client.post("/api/auth/login/start",
                                json={"lpu_id": LPU_IDS["usr_student_aarav"], "phone": PHONES["usr_student_kavya"]})
-        self.assertEqual(res.status_code, 200)  # looks like a real request, so accounts can't be discovered
+        # The person is told plainly (sign-up already says which numbers have accounts), and the
+        # number typed by mistake gets no text.
+        self.assertEqual((res.status_code, res.get_json()["code"]), (404, "ACCOUNT_NOT_FOUND"))
         self.assertEqual(SMS_OUTBOX, [])
-        verify = self.client.post("/api/auth/login/verify", json={"challenge_id": res.get_json()["challenge_id"], "otp": "123456"})
-        self.assertEqual(verify.status_code, 400)
 
     def test_wrong_code_locks_challenge_after_five_tries(self):
         shared.clear_rate_limits()

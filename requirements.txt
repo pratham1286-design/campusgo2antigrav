@@ -2,6 +2,7 @@ flask==3.1.3
 werkzeug==3.1.9
 itsdangerous==2.2.0
 qrcode==8.2
+cryptography==50.0.2  # push notifications (encryption and signing)
 gunicorn==26.2.0
 # Production scale: PostgreSQL (DATABASE_URL) and Redis (REDIS_URL). Unused when those aren't set.
 psycopg[binary]==3.3.6
