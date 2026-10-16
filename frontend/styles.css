@@ -43,6 +43,72 @@
   --radius-full: 9999px;
 }
 
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --text-main: #F1F5F9;
+  --text-secondary: #CBD5E1;
+  --text-muted: #94A3B8;
+  --bg-canvas: #0F172A;
+  --bg-card: #1E293B;
+  --bg-subtle: #334155;
+  --border-light: #475569;
+  --status-success-light: #064E3B;
+  --status-priority-light: #713F12;
+  --status-danger-light: #7F1D1D;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.35), 0 4px 6px -2px rgba(0, 0, 0, 0.25);
+  --shadow-sheet: 0 -8px 24px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme="dark"] body,
+:root[data-theme="dark"] .map-wrapper {
+  background-color: #020617;
+  background: #020617;
+}
+
+:root[data-theme="dark"] .app-container {
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+}
+
+:root[data-theme="dark"] .service-card:hover {
+  border-color: #64748B;
+}
+
+:root[data-theme="dark"] .warning-sub {
+  color: #FCA5A5;
+}
+
+:root[data-theme="dark"] .driver-request-card {
+  background: var(--bg-card);
+}
+
+.theme-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.theme-toggle-btn {
+  min-width: 88px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-full);
+  background: var(--bg-subtle);
+  color: var(--text-main);
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.theme-toggle-btn[aria-checked="true"] {
+  background: var(--primary-orange);
+  border-color: var(--primary-orange);
+  color: #fff;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;

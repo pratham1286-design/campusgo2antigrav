@@ -137,6 +137,34 @@ function $(id) {
   return document.getElementById(id);
 }
 
+const THEME_STORAGE_KEY = 'campusgo-theme';
+
+function setDarkMode(enabled, persist = true) {
+  const theme = enabled ? 'dark' : 'light';
+  document.documentElement.dataset.theme = theme;
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.content = enabled ? '#0F172A' : '#FF7C00';
+  const toggle = $('theme-toggle-btn');
+  if (toggle) {
+    toggle.setAttribute('aria-checked', String(enabled));
+    $('theme-toggle-state').textContent = enabled ? 'On' : 'Off';
+  }
+  if (persist) {
+    try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (_) { /* Storage may be disabled. */ }
+  }
+}
+
+function initializeThemeToggle() {
+  let isDark = false;
+  try { isDark = localStorage.getItem(THEME_STORAGE_KEY) === 'dark'; } catch (_) { /* Use light mode. */ }
+  setDarkMode(isDark, false);
+  $('theme-toggle-btn').addEventListener('click', () => {
+    setDarkMode(document.documentElement.dataset.theme !== 'dark');
+  });
+}
+
+initializeThemeToggle();
+
 // --- Add to Home Screen ---
 // Offered to every new account the moment signup finishes. Android browsers hand us an install
 // prompt to show from our own button; iPhones have none, so the sheet says which taps to make.
@@ -148,10 +176,16 @@ window.addEventListener('beforeinstallprompt', (event) => {
 window.addEventListener('appinstalled', () => {
   deferredInstallPrompt = null;
   hideInstallSheet();
+  updateProfileInstallOption();
 });
 
 function isInstalledApp() {
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function updateProfileInstallOption() {
+  const card = $('profile-install-card');
+  if (card) card.classList.toggle('hidden', isInstalledApp());
 }
 
 function offerInstall() {
@@ -202,6 +236,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('location-gate-retry').addEventListener('click', detectUserLocation);
   $('install-sheet-btn').addEventListener('click', installApp);
   $('install-sheet-later').addEventListener('click', hideInstallSheet);
+  $('profile-install-btn').addEventListener('click', offerInstall);
+  updateProfileInstallOption();
   initAuthHandlers();
   await tryResumeSession();
 });
