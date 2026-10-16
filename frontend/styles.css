@@ -170,7 +170,7 @@ body {
 
 @media (min-width: 480px) {
   .app-container {
-    height: 880px;
+    height: min(880px, 100dvh);
     border-radius: 28px;
     border: 6px solid #1E293B;
   }
@@ -441,7 +441,8 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  height: 56%;
+  top: 44%;
+  height: auto;
   min-height: 220px;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -453,12 +454,12 @@ body {
   flex-direction: column;
   padding: 0 16px calc(28px + env(safe-area-inset-bottom));
   z-index: 200;
-  transition: height 220ms ease;
+  transition: top 220ms ease;
   touch-action: pan-y;
 }
 
 #view-ride.sheet-expanded .bottom-sheet {
-  height: 100%;
+  top: 0;
 }
 
 .sheet-handle-bar {
