@@ -1,16 +1,12 @@
-import base64
 import json
 import logging
 import os
 import re
 import urllib.error
-import urllib.parse
 import urllib.request
 
-FAST2SMS_API_KEY = os.environ.get("FAST2SMS_API_KEY")
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER")
+HTTPSMS_API_KEY = os.environ.get("HTTPSMS_API_KEY")
+HTTPSMS_PHONE_NUMBER = os.environ.get("HTTPSMS_PHONE_NUMBER")
 # Single source of truth for the helpline shown in the app and in SMS alerts.
 CAMPUS_SECURITY_PHONE = os.environ.get("CAMPUS_SECURITY_PHONE", "+91 1824 517000")
 
@@ -26,7 +22,7 @@ def normalize_phone(phone):
 
 
 def sms_gateway_configured():
-    return bool(FAST2SMS_API_KEY or (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER))
+    return bool(HTTPSMS_API_KEY and normalize_phone(HTTPSMS_PHONE_NUMBER))
 
 
 def to_e164(phone):
@@ -57,11 +53,6 @@ def format_sos_message(user_name, lpu_id, location_name, lat, lng, tracking_url=
     )
 
 
-def _fast2sms_ok(body):
-    # Fast2SMS answers 200 with {"return": false, ...} for rejected messages.
-    return isinstance(body, dict) and body.get("return") is True
-
-
 def _http_error_text(exc):
     """The gateway's own error message (bad key, no balance, unverified number...) for the logs."""
     if isinstance(exc, urllib.error.HTTPError):
@@ -72,42 +63,24 @@ def _http_error_text(exc):
     return repr(exc)
 
 
-def send_fast2sms(phone, message):
-    clean_phone = re.sub(r"\D", "", phone)[-10:]
-    payload = {"route": "q", "message": message, "language": "english", "numbers": clean_phone}
+def send_httpsms(phone, message):
+    payload = {"from": to_e164(HTTPSMS_PHONE_NUMBER), "to": to_e164(phone), "content": message}
     try:
         req = urllib.request.Request(
-            "https://www.fast2sms.com/dev/bulkV2",
+            "https://api.httpsms.com/v1/messages/send",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"authorization": FAST2SMS_API_KEY, "Content-Type": "application/json"},
+            headers={"x-api-key": HTTPSMS_API_KEY, "Accept": "application/json", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        # httpSMS queues the send and may take longer than a direct SMS API.
+        with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        if not _fast2sms_ok(body):
-            log.warning("Fast2SMS rejected the SMS: %s", str(body)[:500])
-            return {"status": "failed", "gateway": "Fast2SMS"}
-        return {"status": "sent", "gateway": "Fast2SMS"}
+        if not isinstance(body, dict) or body.get("status") != "success":
+            log.warning("httpSMS rejected the SMS: %s", str(body)[:500])
+            return {"status": "failed", "gateway": "httpSMS"}
+        return {"status": "sent", "gateway": "httpSMS"}
     except Exception as exc:
-        log.warning("Fast2SMS request failed: %s", _http_error_text(exc))
-        return {"status": "failed", "gateway": "Fast2SMS"}
-
-
-def send_twilio_sms(phone, message):
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
-    data = urllib.parse.urlencode({"From": TWILIO_PHONE_NUMBER, "To": to_e164(phone), "Body": message}).encode("utf-8")
-    b64_auth = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
-    try:
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Authorization": f"Basic {b64_auth}", "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            json.loads(resp.read().decode("utf-8"))
-            return {"status": "sent", "gateway": "Twilio"}
-    except Exception as exc:
-        log.warning("Twilio request failed: %s", _http_error_text(exc))
-        return {"status": "failed", "gateway": "Twilio"}
+        log.warning("httpSMS request failed: %s", _http_error_text(exc))
+        return {"status": "failed", "gateway": "httpSMS"}
 
 
 def send_sms(phone, message):
@@ -116,10 +89,8 @@ def send_sms(phone, message):
     number = normalize_phone(phone)
     if not number:
         return {"status": "invalid_number"}
-    if FAST2SMS_API_KEY:
-        return send_fast2sms(number, message)
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER:
-        return send_twilio_sms(number, message)
+    if sms_gateway_configured():
+        return send_httpsms(number, message)
     return {"status": "not_sent", "reason": "No SMS gateway configured"}
 
 

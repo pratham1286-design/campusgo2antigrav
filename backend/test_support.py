@@ -29,7 +29,7 @@ else:
 os.environ.pop("REDIS_URL", None)
 os.environ["CAMPUSGO_NO_DOTENV"] = "1"  # tests never read the developer's .env
 os.environ["CAMPUSGO_UPI_VPA"] = "campusgo-test@okicici"
-for _var in ("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "FAST2SMS_API_KEY", "TWILIO_ACCOUNT_SID",
+for _var in ("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "RAZORPAY_WEBHOOK_SECRET", "HTTPSMS_API_KEY", "HTTPSMS_PHONE_NUMBER",
              "SECRET_KEY", "ADMIN_API_KEY", "REVIEW_LOGIN_PHONE", "REVIEW_LOGIN_CODE"):
     os.environ.pop(_var, None)
 
@@ -42,18 +42,19 @@ from app import app  # noqa: E402
 import app as _app_module  # noqa: E402
 from database import get_db_connection  # noqa: E402
 
-# Every text goes to this outbox through a fake Fast2SMS gateway, so sign-in codes and SOS
+# Every text goes to this outbox through a fake httpSMS gateway, so sign-in codes and SOS
 # alerts run their real code paths.
 SMS_OUTBOX = []
 
 
-def _fake_fast2sms(phone, message):
+def _fake_httpsms(phone, message):
     SMS_OUTBOX.append((phone, message))
-    return {"status": "sent", "gateway": "Fast2SMS"}
+    return {"status": "sent", "gateway": "httpSMS"}
 
 
-emergency_dispatch.FAST2SMS_API_KEY = "test-gateway"
-mock.patch.object(emergency_dispatch, "send_fast2sms", _fake_fast2sms).start()
+emergency_dispatch.HTTPSMS_API_KEY = "test-gateway"
+emergency_dispatch.HTTPSMS_PHONE_NUMBER = "+911824517000"
+mock.patch.object(emergency_dispatch, "send_httpsms", _fake_httpsms).start()
 
 ADMIN_KEY = "test-admin-key-" + "x" * 32
 # Razorpay test-mode credentials; tests that use them mock payments._razorpay_api.

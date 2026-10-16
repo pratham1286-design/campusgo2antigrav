@@ -41,7 +41,7 @@ campusgo2antigrav/
 │   ├── geo.py                 # Place search (local index) and trip routes (estimate, or OSRM)
 │   ├── places.db              # Place-search index built from OpenStreetMap (maintenance/)
 │   ├── payments.py            # UPI QR, Razorpay orders/signatures/webhook, one-time crediting
-│   ├── emergency_dispatch.py  # SMS gateways (Fast2SMS / Twilio) and the SOS message
+│   ├── emergency_dispatch.py  # httpSMS gateway and the SOS message
 │   ├── pricing_and_queue.py   # Landmarks, trip rules, Campus Hop and CityLink pricing
 │   ├── gunicorn.conf.py       # Production server settings
 │   ├── test_support.py        # Test fixtures: throwaway database, fake SMS gateway
@@ -71,7 +71,7 @@ cd backend
 python app.py               # http://127.0.0.1:5000
 ```
 
-- **Signing in** needs an SMS gateway (`FAST2SMS_API_KEY` or the Twilio keys). Without one, set `REVIEW_LOGIN_PHONE` and `REVIEW_LOGIN_CODE` and sign up with that number: it uses the fixed code instead of an SMS.
+- **Signing in** needs httpSMS (`HTTPSMS_API_KEY` and `HTTPSMS_PHONE_NUMBER`). The sender number must be registered in the httpSMS Android app, which needs to be online to send texts. Without a gateway, set `REVIEW_LOGIN_PHONE` and `REVIEW_LOGIN_CODE` for a fixed-code account.
 - **Payments:** use Razorpay **test** keys (`rzp_test_...`) to try top-ups with fake money.
 - **GPS on a phone:** browsers only share location over HTTPS. Run `HTTPS_DEV=1 HOST=0.0.0.0 python app.py` and open the `https://` LAN address. On a computer, Chrome DevTools → Sensors can fake a location.
 - The local database is `backend/campusgo.db`, created on first start. Delete it to start over.

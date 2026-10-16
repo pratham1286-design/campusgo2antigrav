@@ -120,7 +120,7 @@ class TestSignupAndLogin(ClientMixin, unittest.TestCase):
 
     def test_without_an_sms_gateway_no_code_is_issued(self):
         shared.clear_rate_limits()
-        with mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
+        with mock.patch.object(emergency_dispatch, "HTTPSMS_API_KEY", None):
             res = self.client.post("/api/auth/login/start",
                                    json={"lpu_id": LPU_IDS["usr_student_kavya"], "phone": PHONES["usr_student_kavya"]})
         self.assertEqual(res.status_code, 503)
@@ -133,7 +133,7 @@ class TestReviewLogin(ClientMixin, unittest.TestCase):
     """App Store / Play reviewers sign in with a fixed code on one configured number."""
 
     def test_review_number_signs_up_and_logs_in_with_the_fixed_code_and_no_sms(self):
-        with mock.patch.dict(os.environ, REVIEW_ENV), mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
+        with mock.patch.dict(os.environ, REVIEW_ENV), mock.patch.object(emergency_dispatch, "HTTPSMS_API_KEY", None):
             start = self.client.post("/api/auth/signup/start", json={
                 "name": "App Review", "username": "app.review", "user_type": "student",
                 "lpu_id": "12499999", "phone": "9123499999"})
