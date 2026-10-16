@@ -94,7 +94,7 @@ class TestCampusGo(ClientMixin, unittest.TestCase):
         self.assertEqual(data["contacts_sent"], 2)
         self.assertEqual(data["campus_security_dispatch"]["status"], "not_connected")
 
-        with mock.patch.object(emergency_dispatch, "HTTPSMS_API_KEY", None):
+        with mock.patch.object(emergency_dispatch, "FAST2SMS_API_KEY", None):
             data = self.client.post("/api/sos/trigger", headers=headers, json=sos).get_json()
         self.assertFalse(data["sms_gateway_configured"])
         self.assertEqual(data["contacts_sent"], 0)

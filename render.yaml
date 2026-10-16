@@ -62,10 +62,14 @@ services:
       # Your public address, e.g. https://campusgo.example.com (used in SOS trip links).
       - key: PUBLIC_BASE_URL
         sync: false
-      # httpSMS sends through the Android phone registered to this number.
-      - key: HTTPSMS_API_KEY
+      # Signing in needs real SMS: set FAST2SMS_API_KEY (or the three Twilio keys).
+      - key: FAST2SMS_API_KEY
         sync: false
-      - key: HTTPSMS_PHONE_NUMBER
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
         sync: false
       # App Store / Play reviewers sign in with this number and fixed 6-digit code (see README).
       - key: REVIEW_LOGIN_PHONE
